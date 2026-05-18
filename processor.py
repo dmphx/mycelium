@@ -4,10 +4,39 @@ import time
 import jellyfin
 import torbox
 import torrentio
-from config import JELLYFIN_REFRESH_DELAY_SEC
+import zilean
+from config import JELLYFIN_REFRESH_DELAY_SEC, ZILEAN_ENABLED
 from webhook_parser import MediaRequest
 
 log = logging.getLogger(__name__)
+
+
+def _rank(streams, prefer_season_pack: bool = False):
+    return torrentio.rank_streams(streams, prefer_season_pack=prefer_season_pack)
+
+
+def _fetch_movie_candidates(req: MediaRequest) -> list:
+    if ZILEAN_ENABLED:
+        streams = zilean.fetch_streams(req.title)
+        candidates = _rank(streams)
+        if candidates:
+            log.info("Zilean found %d candidate(s) for movie %s", len(candidates), req.title)
+            return candidates
+        log.info("Zilean: no candidates for %s; falling back to Torrentio", req.title)
+    streams = torrentio.fetch_streams("movie", req.imdb_id)
+    return _rank(streams)
+
+
+def _fetch_season_candidates(req: MediaRequest, season: int, episode: int, prefer_season_pack: bool = False) -> list:
+    if ZILEAN_ENABLED:
+        streams = zilean.fetch_streams(req.title, season=season, episode=episode)
+        candidates = _rank(streams, prefer_season_pack=prefer_season_pack)
+        if candidates:
+            log.info("Zilean found %d candidate(s) for %s S%02dE%02d", len(candidates), req.title, season, episode)
+            return candidates
+        log.info("Zilean: no candidates for %s S%02dE%02d; falling back to Torrentio", req.title, season, episode)
+    streams = torrentio.fetch_streams("series", req.imdb_id, season=season, episode=episode)
+    return _rank(streams, prefer_season_pack=prefer_season_pack)
 
 
 def _add_best_from(candidates: list, label: str) -> bool:
@@ -27,8 +56,7 @@ def _add_best_from(candidates: list, label: str) -> bool:
 
 
 def _process_movie(req: MediaRequest) -> bool:
-    streams = torrentio.fetch_streams("movie", req.imdb_id)
-    candidates = torrentio.rank_streams(streams)
+    candidates = _fetch_movie_candidates(req)
     if not candidates:
         log.error("No suitable stream for movie %s (%s)", req.title, req.imdb_id)
         return False
@@ -37,34 +65,28 @@ def _process_movie(req: MediaRequest) -> bool:
 
 
 def _process_season(req: MediaRequest, season: int) -> bool:
-    streams = torrentio.fetch_streams("series", req.imdb_id, season=season, episode=1)
-    pack_candidates = torrentio.rank_streams(streams, prefer_season_pack=True)
+    pack_candidates = _fetch_season_candidates(req, season, episode=1, prefer_season_pack=True)
 
     if pack_candidates and pack_candidates[0].is_season_pack:
         log.info("Trying season pack(s) for %s S%02d", req.title, season)
-        if _add_best_from(
-            [s for s in pack_candidates if s.is_season_pack],
-            f"{req.title} S{season:02d} pack",
-        ):
+        packs = [s for s in pack_candidates if s.is_season_pack]
+        if _add_best_from(packs, f"{req.title} S{season:02d} pack"):
             return True
         log.info("Season pack(s) failed; falling back to per-episode")
 
-    log.info("No season pack for %s S%02d; going per-episode", req.title, season)
+    log.info("Going per-episode for %s S%02d", req.title, season)
     added = 0
     episode = 1
     while True:
-        ep_streams = (
-            streams
-            if episode == 1
-            else torrentio.fetch_streams("series", req.imdb_id, season=season, episode=episode)
-        )
-        if not ep_streams:
+        if episode == 1:
+            candidates = [s for s in pack_candidates if not s.is_season_pack] or pack_candidates
+        else:
+            candidates = _fetch_season_candidates(req, season, episode=episode)
+        if not candidates:
             log.info("No more episodes returned at S%02dE%02d", season, episode)
             break
-        ep_candidates = torrentio.rank_streams(ep_streams)
-        if ep_candidates:
-            if _add_best_from(ep_candidates, f"{req.title} S{season:02d}E{episode:02d}"):
-                added += 1
+        if _add_best_from(candidates, f"{req.title} S{season:02d}E{episode:02d}"):
+            added += 1
         episode += 1
         if episode > 50:
             log.warning("Episode cap (50) reached for %s S%02d", req.title, season)
