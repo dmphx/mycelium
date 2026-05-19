@@ -68,14 +68,20 @@ app.secret_key = cfg.AUTH_SESSION_SECRET
 db.init()
 
 import auth
+import oidc
 auth.install_before_request(app)
+oidc.install(app)
 
 
 @app.get("/login")
 def login_view():
     return render_template("login.html",
                             error=request.args.get("error"),
-                            next=request.args.get("next", ""))
+                            next=request.args.get("next", ""),
+                            oidc_enabled=oidc.is_enabled(),
+                            oidc_provider=oidc.provider_name(),
+                            password_enabled=bool(cfg.AUTH_ENABLED or
+                                                   __import__("settings").get("AUTH_PASSWORD_HASH", "")))
 
 
 @app.post("/login")

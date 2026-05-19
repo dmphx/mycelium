@@ -60,8 +60,23 @@
     </div>
     <p class="sub">Sign in to manage your library.</p>
 
-    {% if error %}<div class="err">Invalid credentials.</div>{% endif %}
+    {% if error == 'oidc' %}
+      <div class="err">SSO sign-in failed. Try again or use password.</div>
+    {% elif error %}
+      <div class="err">Invalid credentials.</div>
+    {% endif %}
 
+    {% if oidc_enabled %}
+    <a class="btn" style="display:block;text-align:center;text-decoration:none;background:#1e293b;border:1px solid var(--border);margin-bottom:16px"
+       href="/login/oidc{% if next %}?next={{ next | urlencode }}{% endif %}">
+      Sign in with {{ oidc_provider }}
+    </a>
+    {% if password_enabled %}
+    <div style="text-align:center;color:var(--muted);font-size:11px;margin:12px 0;letter-spacing:.08em;text-transform:uppercase">or</div>
+    {% endif %}
+    {% endif %}
+
+    {% if password_enabled or not oidc_enabled %}
     <form method="post" action="/login">
       {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
       <div class="field">
@@ -74,6 +89,7 @@
       </div>
       <button class="btn" type="submit">Sign in</button>
     </form>
+    {% endif %}
   </div>
 </body>
 </html>

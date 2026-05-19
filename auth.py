@@ -37,6 +37,8 @@ _PUBLIC_PATHS = (
     "/healthz",
     "/metrics",
     "/login",
+    "/login/oidc",
+    "/oidc/callback",
     "/logout",
     "/setup",
     "/setup/",
@@ -124,7 +126,14 @@ def _proxy_user() -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_enabled() -> bool:
-    return bool(settings.get("AUTH_ENABLED", False))
+    if settings.get("AUTH_ENABLED", False):
+        return True
+    # OIDC implicitly enables auth-gating
+    try:
+        import oidc
+        return oidc.is_enabled()
+    except Exception:
+        return False
 
 
 def current_user() -> str | None:

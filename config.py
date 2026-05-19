@@ -177,6 +177,17 @@ TRUSTED_PROXY_NETWORKS = _env(
     "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
 )
 
+# ── OIDC (native single sign-on, opt-in) ──────────────────────────────────────
+# Works with Authelia, Authentik, Keycloak, Google Workspace, Auth0, Okta, etc.
+# Register a redirect URI of <public-url>/oidc/callback at your provider.
+OIDC_ENABLED = _env("OIDC_ENABLED", "false").lower() in ("1", "true", "yes")
+OIDC_ISSUER_URL = _env("OIDC_ISSUER_URL", "")
+OIDC_CLIENT_ID = _env("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET = _env("OIDC_CLIENT_SECRET", "")
+OIDC_SCOPES = _env("OIDC_SCOPES", "openid email profile")
+OIDC_USER_CLAIM = _env("OIDC_USER_CLAIM", "preferred_username")
+OIDC_PROVIDER_NAME = _env("OIDC_PROVIDER_NAME", "SSO")
+
 
 def configure_logging() -> None:
     logging.basicConfig(

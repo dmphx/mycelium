@@ -412,8 +412,8 @@ If the DB itself is corrupted: Overview → **🚑 Recovery wizard** rebuilds th
 - [x] ~~Web-based one-click installer~~. Visit `/ui` on first run.
 - [x] ~~Light official theme~~. Toggle from the topbar icon.
 - [x] ~~Per-episode RealDebrid fallback~~. Movies, season packs and per-episode all go through RD when TorBox misses.
-- [x] ~~Optional auth for the dashboard~~. Session login or trusted-proxy headers.
-- [ ] Native OIDC support (today: reverse-proxy header trust covers most OIDC stacks).
+- [x] ~~Optional auth for the dashboard~~. Password login, trusted-proxy headers, or native OIDC.
+- [x] ~~Native OIDC support~~. Works with Authelia, Authentik, Keycloak, Google, Auth0, Okta. Opt-in.
 
 ---
 
