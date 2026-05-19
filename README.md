@@ -234,7 +234,7 @@ The full reference lives in [`.env.example`](.env.example). Key knobs:
 
 ## 🩺 Healthcheck
 
-The container exposes two endpoints:
+The container exposes three endpoints:
 
 | Endpoint | Used for |
 |---|---|
@@ -243,6 +243,23 @@ The container exposes two endpoints:
 | `GET /metrics` | Prometheus exposition. ~20 metrics covering throughput, latency, library size, retry depth, TorBox usage, Catbox state, service health. Scrape interval `30s` works well. |
 
 In **Synology Container Manager** the healthcheck is picked up automatically; a red badge means the container will be auto-restarted within ~3 minutes.
+
+### Grafana dashboard
+
+A ready-made dashboard lives at [`assets/grafana-dashboard.json`](assets/grafana-dashboard.json). It includes:
+
+- 24-hour KPIs (request count, success rate, p95 latency, last-success age, TorBox usage)
+- Request rate stack (success vs failed)
+- Latency p50 / p95 / p99 lines
+- Source win-rate donut (Zilean vs Torrentio)
+- Quality distribution bargauge
+- Service-health stat tiles
+- Library size trend (movies / series)
+- Catbox virtual vs materialised gauge
+- Retry queue + blacklist + wanted-episodes ops row
+- Catbox stream-resolution rate (ok / rematerialized / failed)
+
+To import: **Dashboards → New → Import → Upload JSON file**, then pick your Prometheus datasource.
 
 ---
 
