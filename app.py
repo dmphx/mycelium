@@ -603,6 +603,13 @@ def ui_repair_all():
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
+@app.post("/ui/refresh-images")
+def ui_refresh_images():
+    threading.Thread(target=jellyfin.refresh_missing_images, name="jf-images", daemon=True).start()
+    flash("Jellyfin image refresh started — missing posters will be fetched", "ok")
+    return redirect(url_for("ui_dashboard") + "#repair")
+
+
 # ── New JSON APIs ─────────────────────────────────────────────────────────────
 
 @app.get("/ui/api/health")

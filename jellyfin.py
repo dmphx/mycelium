@@ -82,3 +82,59 @@ def merge_duplicate_versions(timeout: int = 60) -> bool:
 
     log.info("Jellyfin MergeVersions: merged %d duplicate group(s)", merged)
     return True
+
+
+def refresh_missing_images(timeout: int = 10) -> int:
+    """Find movies and series in Jellyfin without a primary image and trigger a refresh."""
+    if not JELLYFIN_URL:
+        log.warning("JELLYFIN_URL not set; skipping refresh_missing_images")
+        return 0
+
+    base = JELLYFIN_URL.rstrip("/")
+    headers = _jf_headers()
+
+    try:
+        resp = requests.get(
+            f"{base}/Items",
+            headers=headers,
+            params={
+                "Recursive": "true",
+                "IncludeItemTypes": "Movie,Series",
+                "Fields": "ImageTags",
+                "Limit": 5000,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items") or []
+    except Exception as exc:
+        log.error("refresh_missing_images: could not fetch items: %s", exc)
+        return 0
+
+    count = 0
+    for item in items:
+        if "Primary" in (item.get("ImageTags") or {}):
+            continue
+        item_id = item["Id"]
+        try:
+            r = requests.post(
+                f"{base}/Items/{item_id}/Refresh",
+                headers=headers,
+                params={
+                    "MetadataRefreshMode": "Default",
+                    "ImageRefreshMode": "FullRefresh",
+                    "ReplaceAllMetadata": "false",
+                    "ReplaceAllImages": "false",
+                },
+                timeout=timeout,
+            )
+            if r.status_code < 400:
+                log.info("Triggered image refresh for: %s", item.get("Name"))
+                count += 1
+            else:
+                log.debug("Image refresh failed for %s: %s", item.get("Name"), r.status_code)
+        except Exception as exc:
+            log.debug("Image refresh error for %s: %s", item.get("Name"), exc)
+
+    log.info("refresh_missing_images: triggered refresh for %d item(s) without poster", count)
+    return count

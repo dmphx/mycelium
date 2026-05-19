@@ -20,6 +20,7 @@ _YEAR_RE = re.compile(r"\((\d{4})\)$")
 _TORRENT_ID_RE = re.compile(r"torrent_id[=:](\d+)", re.IGNORECASE)
 _FILE_ID_RE = re.compile(r"file_id[=:](\d+)", re.IGNORECASE)
 _EP_FILENAME_RE = re.compile(r"S(\d{1,2})E(\d{1,2})", re.IGNORECASE)
+_QUALITY_TIER_RE = re.compile(r'\b(2160[pi]?|4[Kk]|UHD|1080[pi]?|720[pi]?|480[pi]?)\b', re.IGNORECASE)
 
 
 def _extract_file_id(strm_url: str) -> str | None:
@@ -74,6 +75,24 @@ def _is_available_in_mylist(torrent_id: str, mylist: list[dict]) -> bool:
 
 
 _TITLE_TRAIL_RE = re.compile(r"[\[\(\{\s\-]+$")
+
+
+def _quality_tier(path: Path) -> int:
+    """Return quality rank from folder/filename. Higher = better. 0 = unknown."""
+    text = f"{path.parent.name} {path.stem}"
+    m = _QUALITY_TIER_RE.search(text)
+    if not m:
+        return 0
+    label = m.group(1).upper()
+    if label in ('2160P', '2160I', '2160', '4K', 'UHD'):
+        return 4
+    if label in ('1080P', '1080I', '1080'):
+        return 3
+    if label in ('720P', '720I', '720'):
+        return 2
+    if label in ('480P', '480I', '480'):
+        return 1
+    return 0
 
 
 def _resolve_imdb(title: str, year: int | None, media_type: str) -> str | None:
@@ -231,21 +250,41 @@ def _remove_duplicates(strm_files: list[Path], run_id: int) -> tuple[int, list[P
         if len(paths) == 1:
             survivors.append(paths[0])
             continue
-        # Keep the path with a year (more metadata) or longest folder name
-        paths_sorted = sorted(paths, key=lambda p: (len(str(p)), str(p)), reverse=True)
-        keeper = paths_sorted[0]
-        survivors.append(keeper)
-        for dup in paths_sorted[1:]:
+
+        # Quality-aware selection:
+        # For movies: keep up to one 4K file AND one non-4K (1080p/720p) file.
+        # For episodes: keep highest quality only.
+        tiers = {p: _quality_tier(p) for p in paths}
+        best_sort = sorted(paths, key=lambda p: (tiers[p], len(str(p)), str(p)), reverse=True)
+
+        if key[0] == "movie":
+            keepers: list[Path] = []
+            best_4k = next((p for p in best_sort if tiers[p] >= 4), None)
+            best_hd = next((p for p in best_sort if 1 <= tiers[p] <= 3), None)
+            if best_4k:
+                keepers.append(best_4k)
+            if best_hd and best_hd not in keepers:
+                keepers.append(best_hd)
+            if not keepers:
+                keepers.append(best_sort[0])
+        else:
+            keepers = [best_sort[0]]
+
+        survivors.extend(keepers)
+        keeper_names = ", ".join(k.name for k in keepers)
+        for dup in paths:
+            if dup in keepers:
+                continue
             try:
                 dup.unlink()
-                log.info("Duplicate removed: %s (kept %s)", dup, keeper.name)
+                log.info("Duplicate removed: %s (kept %s)", dup, keeper_names)
                 try:
                     dup.parent.rmdir()
                 except OSError:
                     pass
                 db.insert_repair_item(
-                    run_id, str(dup), keeper.parent.name, key[0], None, None,
-                    "deleted", f"duplicate of {keeper.name}",
+                    run_id, str(dup), keepers[0].parent.name, key[0], None, None,
+                    "deleted", f"duplicate of {keeper_names}",
                 )
                 removed += 1
             except Exception as exc:
