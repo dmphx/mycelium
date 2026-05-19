@@ -23,10 +23,31 @@ _JUNK_RE = re.compile(
     re.IGNORECASE,
 )
 _SAFE_RE = re.compile(r'[/\\:*?"<>|]')
+_TRAILER_RE = re.compile(
+    r'\b(trailer|sample|extras?|featurette|bonus|deleted[. _-]?scenes?|'
+    r'behind[. _-]the[. _-]scenes|making[. _-]of|promo|teaser)\b',
+    re.IGNORECASE,
+)
+_MIN_MOVIE_SIZE = 200 * 1024 * 1024  # 200 MB — anything smaller is likely a trailer/sample
 
 
 def _is_video(name: str) -> bool:
     return Path(name).suffix.lower() in _VIDEO_EXTS
+
+
+def _is_trailer(file: dict) -> bool:
+    return bool(_TRAILER_RE.search(file.get('name') or ''))
+
+
+def _pick_main_movie_file(files: list[dict]) -> dict | None:
+    """Return the best video file for a movie torrent: largest non-trailer file."""
+    videos = [f for f in files if _is_video(f.get('name') or '')]
+    if not videos:
+        return None
+    non_trailer = [f for f in videos if not _is_trailer(f)]
+    pool = non_trailer or videos
+    big = [f for f in pool if (f.get('size') or 0) >= _MIN_MOVIE_SIZE]
+    return max(big or pool, key=lambda f: f.get('size') or 0)
 
 
 def _clean(s: str) -> str:
@@ -119,16 +140,17 @@ def process_torrent(item: dict) -> int:
     if not torbox_mod._is_ready(item):
         return 0
 
-    video_files = [f for f in files if _is_video(f.get('name') or '')]
-    if not video_files:
-        log.debug("No video files in torrent %s (%s)", torrent_id, torrent_name)
-        return 0
-
-    # For movies with multiple files: use only the largest (main feature)
     is_series = bool(_EP_RE.search(_clean(torrent_name)) or
                      re.search(r'\bS\d{1,2}\b', torrent_name, re.IGNORECASE))
-    if not is_series and len(video_files) > 1:
-        video_files = [max(video_files, key=lambda f: f.get('size') or 0)]
+    if is_series:
+        video_files = [f for f in files if _is_video(f.get('name') or '') and not _is_trailer(f)]
+    else:
+        main_file = _pick_main_movie_file(files)
+        video_files = [main_file] if main_file else []
+
+    if not video_files:
+        log.debug("No suitable video files in torrent %s (%s)", torrent_id, torrent_name)
+        return 0
 
     written = 0
     for f in video_files:
@@ -157,10 +179,18 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str) -> int
     For series: fetches the torrent's file list from mylist and creates per-episode .strm files.
     Returns count of new files written.
     """
+    item = torbox_mod.find_by_id(torrent_id)
+    if not item:
+        log.warning("Torrent %s not found in mylist for strm creation", torrent_id)
+        return 0
+
     if media_type == 'movie':
-        url = _get_stream_url(torrent_id, 0)
+        main_file = _pick_main_movie_file(item.get('files') or [])
+        if not main_file:
+            log.warning("No suitable video file in torrent %s", torrent_id)
+            return 0
+        url = _get_stream_url(torrent_id, main_file['id'])
         if not url:
-            log.warning("No stream URL for torrent_id=%s", torrent_id)
             return 0
         yr = _YEAR_RE.search(title)
         year = int(yr.group(1)) if yr else None
@@ -169,12 +199,7 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str) -> int
         path = Path(MEDIA_PATH) / 'movies' / folder / f"{folder}.strm"
         return 1 if _write_strm(path, url) else 0
 
-    # Series: look up the torrent in mylist to get individual file list
-    item = torbox_mod.find_by_id(torrent_id)
-    if item:
-        return process_torrent(item)
-    log.warning("Torrent %s not found in mylist for strm creation", torrent_id)
-    return 0
+    return process_torrent(item)
 
 
 def run_once() -> int:
