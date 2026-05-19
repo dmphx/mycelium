@@ -235,14 +235,23 @@ def _start_scheduler() -> BackgroundScheduler:
         )
         log.info("Scheduled season-pack consolidation every %dh", SEASON_PACK_CHECK_INTERVAL_HOURS)
 
-    if TRENDING_PRECACHE_COUNT > 0 and TRENDING_CHECK_INTERVAL_HOURS > 0:
+    _auto_add_total = (
+        TRENDING_PRECACHE_COUNT
+        + getattr(cfg, "TRENDING_TV_COUNT", 0)
+        + getattr(cfg, "POPULAR_MOVIE_COUNT", 0)
+        + getattr(cfg, "POPULAR_TV_COUNT", 0)
+        + getattr(cfg, "NETFLIX_NL_TOP_COUNT", 0)
+        + getattr(cfg, "PRIME_NL_TOP_COUNT", 0)
+        + getattr(cfg, "DISNEY_NL_TOP_COUNT", 0)
+    )
+    if _auto_add_total > 0 and TRENDING_CHECK_INTERVAL_HOURS > 0:
         scheduler.add_job(
             trending.run,
             trigger="interval", hours=TRENDING_CHECK_INTERVAL_HOURS,
             id="trending_precache", next_run_time=None,
         )
-        log.info("Scheduled trending pre-cache every %dh (top %d)",
-                 TRENDING_CHECK_INTERVAL_HOURS, TRENDING_PRECACHE_COUNT)
+        log.info("Scheduled auto-add every %dh (total slots: %d)",
+                 TRENDING_CHECK_INTERVAL_HOURS, _auto_add_total)
 
     if CONTINUE_WATCHING_INTERVAL_MINUTES > 0:
         scheduler.add_job(
@@ -1126,14 +1135,17 @@ def _kick_off_processing(title: str, imdb_id: str, media_type: str,
                           tmdb_id: int | None = None) -> None:
     from webhook_parser import MediaRequest
     if media_type == "tv":
+        seasons: list[int] = []
         try:
             show = tmdb.get_show_info(tmdb_id) if tmdb_id else None
             n_seasons = (show or {}).get("number_of_seasons") or 1
-            db.upsert_monitored_series(imdb_id, tmdb_id, title,
-                                         list(range(1, n_seasons + 1)))
+            seasons = list(range(1, n_seasons + 1))
+            db.upsert_monitored_series(imdb_id, tmdb_id, title, seasons)
         except Exception as exc:
             log.warning("upsert_monitored_series failed: %s", exc)
-        req = MediaRequest(title=title, media_type="series", imdb_id=imdb_id, seasons=[])
+            seasons = seasons or [1]
+        req = MediaRequest(title=title, media_type="series",
+                            imdb_id=imdb_id, seasons=seasons)
     else:
         req = MediaRequest(title=title, media_type="movie", imdb_id=imdb_id, seasons=[])
     threading.Thread(
@@ -1228,6 +1240,19 @@ def ui_api_users():
 
 @app.post("/ui/api/users/create")
 def ui_api_users_create():
+    # Bootstrap: if no users exist yet, allow creating the first one (forced to admin)
+    if db.user_count() == 0:
+        p = request.get_json(silent=True) or {}
+        username = (p.get("username") or "").strip()
+        password = p.get("password") or ""
+        if not username or len(password) < 4:
+            return jsonify(error="username + password (≥4 chars) required"), 400
+        try:
+            uid = auth.create_user_account(username, password, role="admin",
+                                            auto_approve=True)
+            return jsonify(ok=True, user_id=uid, message="first admin created")
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
     p = request.get_json(silent=True) or {}

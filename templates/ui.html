@@ -1639,19 +1639,25 @@
 
   function posterUrl(p) { return p ? (TMDB_IMG + p) : null; }
   function logoUrl(p) { return p ? (TMDB_LOGO + p) : null; }
+  // JSON-encode a JS value AND escape single quotes for safe use in onclick='...'
+  function jsAttr(v) { return JSON.stringify(v == null ? '' : v).replace(/'/g, '&#39;'); }
+  function htmlEsc(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
 
   function renderPosterCard(item) {
     const poster = posterUrl(item.poster_path);
     const isTV = item.media_type === 'tv';
+    const titleEsc = htmlEsc(item.title);
     return `
-      <div class="poster-card" onclick='dscOpenDetails(${JSON.stringify(item.tmdb_id)}, "${item.media_type}")'>
-        ${poster ? `<img loading="lazy" src="${poster}" alt="${item.title}">` :
-                    `<div class="poster-placeholder">${item.title}</div>`}
+      <div class="poster-card" onclick='dscOpenDetails(${jsAttr(item.tmdb_id)}, ${jsAttr(item.media_type)})'>
+        ${poster ? `<img loading="lazy" src="${poster}" alt="${titleEsc}">` :
+                    `<div class="poster-placeholder">${titleEsc}</div>`}
         <div class="poster-badge ${isTV ? 'tv' : ''}">${isTV ? 'TV' : 'Movie'}</div>
         <div class="poster-overlay">
-          <div class="poster-title">${item.title}</div>
+          <div class="poster-title">${titleEsc}</div>
           <div class="poster-meta">
-            ${item.year ? `<span>${item.year}</span>` : ''}
+            ${item.year ? `<span>${htmlEsc(item.year)}</span>` : ''}
             ${item.rating ? `<span class="poster-rating">★ ${item.rating}</span>` : ''}
           </div>
         </div>
@@ -1780,23 +1786,23 @@
             ${poster ? `<img src="${poster}">` : '<div class="poster-placeholder">No poster</div>'}
           </div>
           <div class="modal-info">
-            <h2>${d.title} ${d.year ? `<span style="color:var(--muted);font-weight:400">(${d.year})</span>` : ''}</h2>
-            ${d.tagline ? `<div class="tagline">${d.tagline}</div>` : ''}
+            <h2>${htmlEsc(d.title)} ${d.year ? `<span style="color:var(--muted);font-weight:400">(${htmlEsc(d.year)})</span>` : ''}</h2>
+            ${d.tagline ? `<div class="tagline">${htmlEsc(d.tagline)}</div>` : ''}
             <div class="meta-line">
               ${d.rating ? `<span class="badge">★ ${d.rating} (${d.votes} votes)</span>` : ''}
               ${d.runtime ? `<span class="badge">${d.runtime} min</span>` : ''}
-              ${(d.genres || []).map(g => `<span class="badge">${g}</span>`).join(' ')}
-              ${d.status ? `<span class="badge">${d.status}</span>` : ''}
+              ${(d.genres || []).map(g => `<span class="badge">${htmlEsc(g)}</span>`).join(' ')}
+              ${d.status ? `<span class="badge">${htmlEsc(d.status)}</span>` : ''}
               ${mediaType === 'tv' && d.number_of_seasons ? `<span class="badge">${d.number_of_seasons} seasons / ${d.number_of_episodes} eps</span>` : ''}
             </div>
-            <div class="overview">${d.overview || 'No overview available.'}</div>
+            <div class="overview">${htmlEsc(d.overview || 'No overview available.')}</div>
             <div class="modal-actions">
-              <button class="btn btn-primary" onclick='dscAddToLibrary(${tmdbId}, "${mediaType}", ${JSON.stringify(d.title)})'>+ Add to library</button>
-              <button class="btn btn-secondary" onclick='dscToggleWatchlist("${d.imdb_id || ''}", ${tmdbId}, "${mediaType}", ${JSON.stringify(d.title)}, ${JSON.stringify(d.poster_path || '')}, this)'>
+              <button class="btn btn-primary" onclick='dscAddToLibrary(${tmdbId}, ${jsAttr(mediaType)}, ${jsAttr(d.title)})'>+ Add to library</button>
+              <button class="btn btn-secondary" onclick='dscToggleWatchlist(${jsAttr(d.imdb_id || '')}, ${tmdbId}, ${jsAttr(mediaType)}, ${jsAttr(d.title)}, ${jsAttr(d.poster_path || '')}, this)'>
                 ${inWatchlist ? '★ In watchlist' : '☆ Add to watchlist'}
               </button>
-              ${trailer ? `<a class="btn btn-secondary" target="_blank" href="https://www.youtube.com/watch?v=${trailer.key}">▶ Trailer</a>` : ''}
-              ${d.imdb_id ? `<a class="btn btn-secondary" target="_blank" href="https://www.imdb.com/title/${d.imdb_id}/">IMDB</a>` : ''}
+              ${trailer ? `<a class="btn btn-secondary" target="_blank" href="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}">▶ Trailer</a>` : ''}
+              ${d.imdb_id ? `<a class="btn btn-secondary" target="_blank" href="https://www.imdb.com/title/${encodeURIComponent(d.imdb_id)}/">IMDB</a>` : ''}
             </div>
             ${(d.providers && d.providers.flatrate && d.providers.flatrate.length) ? `
               <div class="modal-section">
@@ -1826,8 +1832,8 @@
               ${d.cast.map(c => `
                 <div class="cast-item">
                   ${c.profile_path ? `<img src="${TMDB_PROFILE}${c.profile_path}">` : '<div style="width:90px;height:90px;background:var(--bg);border-radius:50%"></div>'}
-                  <div class="name">${c.name}</div>
-                  <div class="role">${c.character || ''}</div>
+                  <div class="name">${htmlEsc(c.name)}</div>
+                  <div class="role">${htmlEsc(c.character || '')}</div>
                 </div>`).join('')}
             </div>
           </div>` : ''}
@@ -1931,11 +1937,11 @@
         '<tr><td colspan="6" class="dim">No pending requests</td></tr>' :
         (reqs.items || []).map(r => `
           <tr>
-            <td>${r.username}</td>
-            <td>${r.title}</td>
-            <td>${r.media_type}</td>
-            <td><a href="https://www.imdb.com/title/${r.imdb_id}/" target="_blank">${r.imdb_id}</a></td>
-            <td>${r.created_at}</td>
+            <td>${htmlEsc(r.username)}</td>
+            <td>${htmlEsc(r.title)}</td>
+            <td>${htmlEsc(r.media_type)}</td>
+            <td><a href="https://www.imdb.com/title/${encodeURIComponent(r.imdb_id)}/" target="_blank">${htmlEsc(r.imdb_id)}</a></td>
+            <td>${htmlEsc(r.created_at)}</td>
             <td>
               <button class="btn btn-primary btn-sm" onclick="approveReq(${r.id})">✓ Approve</button>
               <button class="btn btn-secondary btn-sm" onclick="denyReq(${r.id})">✗ Deny</button>
@@ -1943,15 +1949,15 @@
           </tr>`).join('');
       usersTbody.innerHTML = (users.users || []).map(u => `
         <tr>
-          <td>${u.username}</td>
-          <td>${u.role}</td>
+          <td>${htmlEsc(u.username)}</td>
+          <td>${htmlEsc(u.role)}</td>
           <td>${u.auto_approve ? '✓' : '—'}</td>
           <td>${u.enabled ? '✓' : '✗'}</td>
-          <td>${u.last_login || '—'}</td>
+          <td>${htmlEsc(u.last_login || '—')}</td>
           <td>
             <button class="btn btn-secondary btn-sm" onclick="toggleAutoApprove(${u.id}, ${u.auto_approve ? 0 : 1})">${u.auto_approve ? 'Disable auto' : 'Enable auto'}</button>
             <button class="btn btn-secondary btn-sm" onclick="toggleEnabled(${u.id}, ${u.enabled ? 0 : 1})">${u.enabled ? 'Disable' : 'Enable'}</button>
-            <button class="btn btn-secondary btn-sm" onclick="deleteUser(${u.id}, ${JSON.stringify(u.username)})">Delete</button>
+            <button class="btn btn-secondary btn-sm" onclick='deleteUser(${u.id}, ${jsAttr(u.username)})'>Delete</button>
           </td>
         </tr>`).join('');
       dscUsersInitialized = true;
