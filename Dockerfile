@@ -20,4 +20,4 @@ port=os.environ.get('LISTEN_PORT','8088'); \
 r=urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=5); \
 sys.exit(0 if r.status==200 else 1)" || exit 1
 
-CMD ["sh", "-c", "gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 2 --threads 4 --access-logfile - app:app"]
+CMD ["sh", "-c", "gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 1 --threads 8 --access-logfile - app:app"]

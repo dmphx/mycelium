@@ -17,6 +17,11 @@ def is_blacklisted(info_hash: str) -> bool:
 
 def record_failure(info_hash: str, error: str | None = None) -> None:
     db.record_failed_hash(info_hash, error)
+    try:
+        import metrics_prom
+        metrics_prom.blacklist_failures_total.inc()
+    except Exception:
+        pass
     rec = db.get_failed_hash(info_hash)
     if rec and rec["fail_count"] >= _threshold():
         log.warning("Hash %s now blacklisted (%d failures)", info_hash, rec["fail_count"])

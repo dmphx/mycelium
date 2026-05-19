@@ -32,6 +32,11 @@ def run_due() -> int:
     if not due:
         return 0
     log.info("Retry: processing %d due retries", len(due))
+    try:
+        import metrics_prom
+        metrics_prom.retry_attempts_total.inc(len(due))
+    except Exception:
+        pass
     for row in due:
         seasons = [int(s) for s in (row.get("seasons") or "").split(",") if s.strip().isdigit()]
         req = MediaRequest(

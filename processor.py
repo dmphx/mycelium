@@ -286,16 +286,33 @@ def _process_locked(req: MediaRequest, _retry_attempt: int) -> bool:
         # Metrics
         elapsed = time.monotonic() - started
         db.record_metric("latency_seconds", req.media_type, value_real=elapsed)
+        try:
+            import metrics_prom
+            metrics_prom.requests_total.labels(media_type=req.media_type, status="success").inc()
+            metrics_prom.request_duration_seconds.labels(media_type=req.media_type).observe(elapsed)
+        except Exception:
+            pass
         if winner:
             db.record_metric("quality_added", winner.quality, value_int=1)
             source = (winner.name.split()[0] if winner.name else "?").lower()
             db.record_metric("source_win", source, value_int=1)
+            try:
+                import metrics_prom
+                metrics_prom.quality_added_total.labels(quality=winner.quality or "unknown").inc()
+                metrics_prom.source_wins_total.labels(source=source).inc()
+            except Exception:
+                pass
     else:
         db.update_request(row_id, "failed")
         log.warning("No content added; skipping Jellyfin refresh for %s", req.title)
         db.log_activity("failed", req.title, f"no suitable stream found for {req.imdb_id}", False)
         notify.send(f"Failed: {req.title}", f"No suitable stream found · {req.imdb_id}", False)
         db.record_metric("request_failed", req.media_type, value_int=1)
+        try:
+            import metrics_prom
+            metrics_prom.requests_total.labels(media_type=req.media_type, status="failed").inc()
+        except Exception:
+            pass
         import retry_queue
         retry_queue.schedule(req, _retry_attempt)
 

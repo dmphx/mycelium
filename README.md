@@ -240,6 +240,7 @@ The container exposes two endpoints:
 |---|---|
 | `GET /health` | DB-aware liveness — wired to the Docker `HEALTHCHECK`. Returns **503** if SQLite is unreachable. |
 | `GET /healthz` | Deep readiness — returns **503** if DB unreachable **or** both scrapers down. Useful for dashboards. |
+| `GET /metrics` | Prometheus exposition. ~20 metrics covering throughput, latency, library size, retry depth, TorBox usage, Catbox state, service health. Scrape interval `30s` works well. |
 
 In **Synology Container Manager** the healthcheck is picked up automatically; a red badge means the container will be auto-restarted within ~3 minutes.
 
@@ -297,7 +298,7 @@ If the DB itself is corrupted: Overview → **🚑 Recovery wizard** rebuilds th
 
 - [x] ~~Multi-debrid productionised (RealDebrid as actual fallback)~~ — movies + season-pack series done
 - [ ] Plex compatibility via in-container SMB/WebDAV proxy
-- [ ] Prometheus metrics export
+- [x] ~~Prometheus metrics export~~ — exposed at `/metrics`
 - [ ] Web-based one-click installer
 - [ ] Light official theme
 

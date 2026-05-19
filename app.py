@@ -235,6 +235,15 @@ def health_simple():
         return jsonify(status="degraded", error=str(exc)[:120]), 503
 
 
+@app.get("/metrics")
+def metrics_export():
+    """Prometheus scrape endpoint."""
+    import metrics_prom
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+    metrics_prom.refresh_gauges()
+    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
+
 @app.get("/healthz")
 def health_deep():
     """Real readiness probe. Returns 503 if DB unreachable OR both scrapers down."""

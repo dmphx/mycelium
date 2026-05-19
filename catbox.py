@@ -38,15 +38,23 @@ def materialize(token: str) -> str | None:
     item = db.get_virtual_item(token)
     if not item:
         log.warning("Catbox: unknown token %s", token)
+        try:
+            import metrics_prom
+            metrics_prom.catbox_stream_total.labels(result="failed").inc()
+        except Exception:
+            pass
         return None
 
     torbox_id = item["torbox_id"]
+    rematerialized = False
     if torbox_id:
         live = torbox.find_by_id(torbox_id)
         if not live or not torbox._is_ready(live):
             torbox_id = None
+            rematerialized = True
 
     if not torbox_id:
+        rematerialized = True
         log.info("Catbox: re-adding %s (%s)", item["title"], item["info_hash"])
         try:
             torbox.add_magnet(item["magnet"])
@@ -84,6 +92,19 @@ def materialize(token: str) -> str | None:
     url = strm_generator._get_stream_url(torbox_id, file_id)
     if url:
         db.touch_virtual_item(token)
+        try:
+            import metrics_prom
+            metrics_prom.catbox_stream_total.labels(
+                result="rematerialized" if rematerialized else "ok",
+            ).inc()
+        except Exception:
+            pass
+    else:
+        try:
+            import metrics_prom
+            metrics_prom.catbox_stream_total.labels(result="failed").inc()
+        except Exception:
+            pass
     return url
 
 
