@@ -688,6 +688,10 @@
         <form method="post" action="/ui/generate-nfos" style="display:inline">
           <button class="btn btn-secondary btn-sm" title="Write NFO sidecar files with IMDb IDs for Jellyfin">📄 Gen NFOs</button>
         </form>
+        <form method="post" action="/ui/merge-series" style="display:inline"
+              onsubmit="return confirm('Merge duplicate series folders? Episodes will be moved to the canonical folder and duplicates removed.')">
+          <button class="btn btn-secondary btn-sm" title="Consolidate duplicate series folders into one">🔀 Merge Series</button>
+        </form>
       </div>
     </div>
     {% if last_cleanup %}

@@ -338,6 +338,108 @@ def _regenerate_wrong_files(strm_files: list[Path], mylist: list[dict], run_id: 
     return regenerated
 
 
+_SERIES_PREFIX_RE = re.compile(
+    r'^(\[[^\]]+\]\s*|www[\s.][\w.\-]+(?:[\s.][\w.\-]+)*\s*-\s*|www\s+\w+\s+\w+\s*-\s*'
+    r'|rutor\.?\s*info\s*|\[?DEVIL-TORRENTS[^\]]*\]?\s*|\[BEST-TORRENTS[^\]]*\]\s*'
+    r'|\[XTORRENTY[^\]]*\]\s*|HIDRATORRENTS[^\s]*\s*(?:MKV)?\s*-?(?:LEGENDADO)?-?\s*'
+    r'|superseed\s+\S+\s*)+',
+    re.IGNORECASE,
+)
+_SEASON_TRAIL2_RE = re.compile(r'\s+(?:S\d{1,2}(?:E\d+)?|Season\s+\d+).*$', re.IGNORECASE)
+_YEAR_TRAIL2_RE = re.compile(r'\s+\d{4}$')
+_SEASON_DIR_RE = re.compile(r'[Ss]eason\s*(\d+)', re.IGNORECASE)
+_EP_RE2 = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
+
+
+def _series_clean_title(raw: str) -> str:
+    s = _SERIES_PREFIX_RE.sub("", raw).strip()
+    s = _SEASON_TRAIL2_RE.sub("", s).strip()
+    s = _YEAR_TRAIL2_RE.sub("", s).strip()
+    return re.sub(r"[\[\(\{\s\-]+$", "", s).strip() or raw
+
+
+def merge_series_duplicates() -> int:
+    """Find series folders with the same IMDb ID and merge them into one canonical
+    folder, moving all season/episode strm files across.  Returns number of
+    duplicate folders removed."""
+    series_base = Path(MEDIA_PATH) / "series"
+    if not series_base.is_dir():
+        return 0
+
+    items_by_title = {m["title"]: m["imdb_id"] for m in db.get_media_items()}
+    monitored = {s["imdb_id"]: s["title"] for s in db.get_all_monitored_series()}
+
+    # Group folders by resolved IMDb ID
+    groups: dict[str, list[Path]] = {}
+    for folder in series_base.iterdir():
+        if not folder.is_dir():
+            continue
+        imdb_id = items_by_title.get(folder.name)
+        if not imdb_id or imdb_id.startswith("unknown_"):
+            clean = _series_clean_title(folder.name)
+            if clean:
+                try:
+                    imdb_id = tmdb.search_tv(clean)
+                    time.sleep(0.15)
+                except Exception:
+                    imdb_id = None
+        if imdb_id and not imdb_id.startswith("unknown_"):
+            groups.setdefault(imdb_id, []).append(folder)
+
+    removed = 0
+    for imdb_id, folders in groups.items():
+        if len(folders) <= 1:
+            continue
+
+        # Canonical: prefer folder whose name matches monitored title, else
+        # the folder with the shortest cleaned name (most readable)
+        mon_title = monitored.get(imdb_id, "")
+        canonical = next((f for f in folders if f.name == mon_title), None)
+        if not canonical:
+            canonical = min(folders, key=lambda f: len(_series_clean_title(f.name)))
+
+        display_title = mon_title or _series_clean_title(canonical.name)
+        log.info("Merging series %r into canonical %r", [f.name for f in folders if f != canonical], canonical.name)
+
+        for dup in folders:
+            if dup == canonical:
+                continue
+            for item in list(dup.iterdir()):
+                if item.is_dir() and _SEASON_DIR_RE.match(item.name):
+                    dest_season = canonical / item.name
+                    dest_season.mkdir(exist_ok=True)
+                    for strm in list(item.glob("*.strm")):
+                        ep_m = _EP_RE2.search(strm.stem)
+                        if ep_m:
+                            s_n, e_n = int(ep_m.group(1)), int(ep_m.group(2))
+                            dest_name = f"{display_title} S{s_n:02d}E{e_n:02d}.strm"
+                        else:
+                            dest_name = strm.name
+                        dest = dest_season / dest_name
+                        if not dest.exists():
+                            try:
+                                dest.write_text(strm.read_text(encoding="utf-8"), encoding="utf-8")
+                            except Exception as exc:
+                                log.warning("Could not copy strm %s: %s", strm, exc)
+                                continue
+                        strm.unlink(missing_ok=True)
+                    try:
+                        item.rmdir()
+                    except OSError:
+                        pass
+                elif item.is_file():
+                    item.unlink(missing_ok=True)
+            try:
+                dup.rmdir()
+                log.info("Removed duplicate series folder: %s", dup.name)
+                removed += 1
+            except OSError as exc:
+                log.warning("Could not remove %s: %s", dup, exc)
+
+    log.info("merge_series_duplicates: removed %d duplicate folder(s)", removed)
+    return removed
+
+
 def run_cleanup() -> None:
     log.info("Cleanup: starting strm scan in %s", MEDIA_PATH)
     run_id = db.insert_cleanup_run()

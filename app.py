@@ -613,6 +613,13 @@ def ui_refresh_images():
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
+@app.post("/ui/merge-series")
+def ui_merge_series():
+    threading.Thread(target=cleanup.merge_series_duplicates, name="merge-series", daemon=True).start()
+    flash("Series merge started — duplicate folders will be consolidated", "ok")
+    return redirect(url_for("ui_dashboard") + "#repair")
+
+
 @app.post("/ui/generate-nfos")
 def ui_generate_nfos():
     threading.Thread(target=nfo_generator.generate_all, name="nfo-manual", daemon=True).start()
