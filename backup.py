@@ -41,3 +41,46 @@ def run() -> Path | None:
         except Exception:
             pass
     return dst
+
+
+def list_backups() -> list[dict]:
+    """Return available backups, newest first, with size and timestamp."""
+    if not _BACKUP_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(_BACKUP_DIR.glob("requests_*.db"), reverse=True):
+        try:
+            st = p.stat()
+            out.append({
+                "name": p.name,
+                "size_kb": round(st.st_size / 1024, 1),
+                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def restore(name: str) -> bool:
+    """Restore a named backup over the live DB. The current DB is renamed
+    to .pre-restore.<ts> so you can undo. Returns True on success."""
+    if not name or "/" in name or ".." in name:
+        log.warning("restore: rejected unsafe name %r", name)
+        return False
+    src = _BACKUP_DIR / name
+    if not src.is_file():
+        log.warning("restore: backup %s not found", name)
+        return False
+    dst = Path(DB_PATH)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safety = dst.with_suffix(f".pre-restore.{stamp}.db")
+    try:
+        if dst.exists():
+            shutil.copy2(dst, safety)
+            log.info("Restore: stashed current DB at %s", safety.name)
+        shutil.copy2(src, dst)
+        log.warning("Restore: replaced live DB with %s — restart Mycelium", name)
+        return True
+    except Exception as exc:
+        log.error("Restore failed: %s", exc)
+        return False

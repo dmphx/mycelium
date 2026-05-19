@@ -227,10 +227,10 @@
     </span>
   </h1>
   <div class="topbar-right">
-    <div id="health-dots" class="health-dots" title="Service health (click for details)"></div>
-    <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">🌓</button>
-    <button class="icon-btn" onclick="forceRescan()" title="Force strm rescan">↻</button>
-    <span class="hint">Live updates</span>
+    <div id="health-dots" class="health-dots" role="status" aria-label="Service health indicators" title="Service health (click for details)"></div>
+    <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle dark/light theme">🌓</button>
+    <button class="icon-btn" onclick="forceRescan()" title="Force strm rescan" aria-label="Force strm rescan now">↻</button>
+    <span class="hint" aria-hidden="true">Live updates</span>
   </div>
 </div>
 
@@ -292,10 +292,12 @@
         <form method="post" action="/ui/library-import" style="display:inline">
           <button class="btn btn-secondary btn-sm">📚 Import library</button>
         </form>
-        <form method="post" action="/ui/db-vacuum" style="display:inline">
+        <form method="post" action="/ui/db-vacuum" style="display:inline"
+              onsubmit="return confirm('Run VACUUM on the DB? Reads are blocked briefly.')">
           <button class="btn btn-secondary btn-sm">🧹 Vacuum DB</button>
         </form>
-        <form method="post" action="/ui/recovery" style="display:inline">
+        <form method="post" action="/ui/recovery" style="display:inline"
+              onsubmit="return confirm('Run the full recovery pipeline? Integrity check + cleanup + library import + strm scan. Safe but takes a minute or two.')">
           <button class="btn btn-primary btn-sm">🚑 Recovery wizard</button>
         </form>
       </div>
@@ -592,7 +594,13 @@
         <form method="post" action="/ui/backup-now" style="display:inline">
           <button class="btn btn-secondary btn-sm">💾 Backup DB</button>
         </form>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="toggleBackupList()">📂 Restore</button>
       </div>
+    </div>
+
+    <div id="backup-list" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px">
+      <div class="section-title" style="margin-bottom:8px">DB Backups (newest first)</div>
+      <div id="backup-list-rows"><div class="dim" style="font-size:12px">Loading…</div></div>
     </div>
     <p class="dim" style="font-size:12px;margin-bottom:12px">
       Items are virtual until you press play. Idle threshold: <b>{{ config.CATBOX_IDLE_MINUTES }} min</b> · GC interval: <b>{{ config.CATBOX_GC_INTERVAL_MINUTES }} min</b>.
@@ -717,6 +725,9 @@
         <a href="/setup" class="btn btn-secondary btn-sm" style="text-decoration:none">🧙 Re-run wizard</a>
         <span class="dim" style="font-size:11px">⚡ = hot-reload (no restart) · ⚠ = restart required · ✱ = currently overrides .env</span>
       </div>
+    </div>
+    <div id="settings-restart-banner" style="display:none;background:rgba(251,191,36,.1);border-left:3px solid var(--amber);padding:10px 14px;border-radius:6px;font-size:13px;color:var(--amber);margin-bottom:14px">
+      ⚠ You changed at least one <b>restart-required</b> setting. Run <code>docker compose restart mycelium</code> after saving for it to take effect.
     </div>
     <form method="post" action="/ui/settings" id="settings-form">
       <div id="settings-groups"><div class="dim" style="font-size:12px">Loading…</div></div>
@@ -1036,11 +1047,15 @@
   }
   async function refreshSettings() {
     const root = document.getElementById('settings-groups');
+    const banner = document.getElementById('settings-restart-banner');
     root.innerHTML = '<div class="dim" style="font-size:12px">Loading…</div>';
+    banner.style.display = 'none';
     try {
       const r = await fetch('/ui/api/settings');
       const d = await r.json();
       root.innerHTML = '';
+      // Track initial values so we can detect restart-required changes
+      const restartRequiredInitial = new Map();
       d.groups.forEach(g => {
         const card = document.createElement('div');
         card.className = 'card';
@@ -1049,6 +1064,7 @@
           <table style="width:100%;font-size:12px">`;
         g.items.forEach(it => {
           const val = _formatVal(it.value, it.kind);
+          if (!it.hot_reload) restartRequiredInitial.set(it.key, val);
           const badges = `${it.hot_reload ? '<span title="hot reload">⚡</span>' : '<span title="restart required" style="color:var(--amber)">⚠</span>'}
             ${it.overridden ? '<span title="override active" style="color:var(--accent)">✱</span>' : ''}`;
           let input;
@@ -1076,6 +1092,18 @@
         body += '</table>';
         card.innerHTML = body;
         root.appendChild(card);
+      });
+      // Live banner: show when a restart-required field changes from initial
+      const form = document.getElementById('settings-form');
+      form.addEventListener('input', () => {
+        let dirty = false;
+        for (const [key, initial] of restartRequiredInitial) {
+          const el = form.querySelector(`[name="setting_${key}"]`);
+          if (!el) continue;
+          const cur = el.type === 'checkbox' ? (el.checked ? 'true' : 'false') : el.value;
+          if (cur !== initial) { dirty = true; break; }
+        }
+        banner.style.display = dirty ? '' : 'none';
       });
     } catch(e) {
       root.innerHTML = `<div style="color:var(--red);font-size:12px">${e.message}</div>`;
@@ -1169,6 +1197,37 @@
     }
   }
 
+  // ── Backup list ──
+  async function toggleBackupList() {
+    const panel = document.getElementById('backup-list');
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : '';
+    if (open) return;
+    const rows = document.getElementById('backup-list-rows');
+    rows.innerHTML = '<div class="dim" style="font-size:12px">Loading…</div>';
+    try {
+      const r = await fetch('/ui/api/backups');
+      const d = await r.json();
+      if (!d.backups.length) {
+        rows.innerHTML = '<div class="dim" style="font-size:12px">No backups yet.</div>';
+        return;
+      }
+      rows.innerHTML = d.backups.map(b => `
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--panel2);font-size:12px">
+          <span class="mono" style="flex:1">${b.name}</span>
+          <span class="dim">${b.mtime}</span>
+          <span class="dim">${b.size_kb} KB</span>
+          <form method="post" action="/ui/backup-restore" style="margin:0"
+                onsubmit="return confirm('Restore ${b.name}? The current DB is renamed to .pre-restore. Restart required after.')">
+            <input type="hidden" name="name" value="${b.name}">
+            <button class="btn btn-sm btn-danger">Restore</button>
+          </form>
+        </div>`).join('');
+    } catch(e) {
+      rows.innerHTML = `<div style="color:var(--red);font-size:12px">${e.message}</div>`;
+    }
+  }
+
   // ── Catbox ──
   async function refreshCatbox() {
     const body = document.getElementById('catbox-body');
@@ -1212,7 +1271,8 @@
           <td class="dim" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${i.last_error||'—'}</td>
           <td class="dim">${(i.last_attempt||'').slice(0,16)}</td>
           <td>
-            <form method="post" action="/ui/blacklist-clear/${i.info_hash}" style="display:inline">
+            <form method="post" action="/ui/blacklist-clear/${i.info_hash}" style="display:inline"
+                  onsubmit="return confirm('Clear blacklist for this hash? Mycelium will try it again next time.')">
               <button class="btn btn-sm btn-secondary">Clear</button>
             </form>
           </td>

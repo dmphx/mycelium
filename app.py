@@ -786,6 +786,21 @@ def ui_backup_now():
     return redirect(url_for("ui_dashboard"))
 
 
+@app.get("/ui/api/backups")
+def ui_api_backups():
+    return jsonify(backups=backup.list_backups())
+
+
+@app.post("/ui/backup-restore")
+def ui_backup_restore():
+    name = request.form.get("name", "").strip()
+    if not backup.restore(name):
+        flash(f"Restore failed for {name}", "err")
+        return redirect(url_for("ui_dashboard") + "#catbox")
+    flash(f"Restored {name}. Restart the container to load the new DB.", "ok")
+    return redirect(url_for("ui_dashboard") + "#catbox")
+
+
 # ── Upgrader / consolidation / trending triggers ──────────────────────────────
 
 @app.post("/ui/auto-upgrade")
