@@ -332,8 +332,13 @@ def run_cleanup() -> None:
     repaired += fixed_files
 
     # 3. Repair broken .strm files (torrent no longer in TorBox mylist)
+    recently_unfixable = db.get_recently_unfixable_paths(hours=24)
     changed = False
     for path in strm_files:
+        if str(path) in recently_unfixable:
+            log.debug("Skipping recently-unfixable: %s", path.name)
+            unfixable += 1
+            continue
         result = _repair_strm(path, run_id, mylist)
         if result == "repaired":
             repaired += 1

@@ -864,3 +864,15 @@ def get_repair_items(limit: int = 200) -> list[dict]:
             "SELECT * FROM repair_items ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_recently_unfixable_paths(hours: int = 24) -> set[str]:
+    """Return paths marked unfixable within the last N hours — used to skip re-trying."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT path FROM repair_items
+               WHERE status='unfixable'
+               AND created_at > datetime('now', ?)""",
+            (f"-{hours} hours",),
+        ).fetchall()
+        return {r["path"] for r in rows}
