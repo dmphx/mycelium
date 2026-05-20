@@ -210,6 +210,10 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
         rematerialized = True
         log.info("Catbox: searching fresh cached release for %s", item["title"])
         fresh = _search_best_cached_release(item)
+        if fresh is _SEARCH_UNAVAILABLE:
+            # Could not search (no imdb_id or network error) — keep .strm, retry later.
+            _fail_put(token, _FAIL_COOLDOWN_SEC)
+            return None
         if not fresh:
             log.error("Catbox: no cached release found for %s — removing from library",
                       item["title"])
@@ -306,9 +310,17 @@ def _remove_strm(item: dict) -> None:
         log.warning("Catbox: could not remove .strm %s: %s", strm_path, exc)
 
 
-def _search_best_cached_release(item: dict) -> tuple[str, str] | None:
+_SEARCH_UNAVAILABLE = object()  # sentinel: search couldn't run (no imdb_id, network error)
+
+
+def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
     """Search Torrentio for the best currently-cached release for this item.
-    Returns (info_hash, magnet) of the top ranked cached result, or None."""
+
+    Returns:
+      (info_hash, magnet)  — found a cached release
+      None                 — searched OK, nothing cached right now
+      _SEARCH_UNAVAILABLE  — couldn't search (no imdb_id, network error) — do NOT remove .strm
+    """
     imdb_id = item.get("imdb_id")
     if not imdb_id:
         # Try to resolve imdb_id from TMDB using title + year, then persist it.
@@ -330,8 +342,9 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None:
         except Exception as exc:
             log.warning("Catbox search: TMDB lookup failed for %s: %s", item.get("title"), exc)
     if not imdb_id:
-        log.warning("Catbox search: no imdb_id for %s — cannot search", item["title"])
-        return None
+        log.warning("Catbox search: no imdb_id for %s — keeping .strm, will retry later",
+                    item["title"])
+        return _SEARCH_UNAVAILABLE
     try:
         import torrentio
         import debrid
@@ -355,8 +368,8 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None:
                 return s.info_hash.lower(), s.magnet
         return None
     except Exception as exc:
-        log.warning("Catbox search: failed for %s: %s", item["title"], exc)
-        return None
+        log.warning("Catbox search: failed for %s: %s — keeping .strm", item["title"], exc)
+        return _SEARCH_UNAVAILABLE
 
 
 def release_idle() -> int:

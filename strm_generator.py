@@ -637,6 +637,17 @@ def repair_expired_strms(media_type: str = "movie") -> dict:
         strms = list(movie_dir.glob("*.strm"))
         if strms:
             continue  # has at least one .strm — handled in pass 2
+        # Skip if a sibling folder with the same normalised title already has a .strm.
+        norm = _norm_title(movie_dir.name)
+        if any(
+            sib.is_dir() and sib != movie_dir
+            and _norm_title(sib.name) == norm
+            and any(sib.glob("*.strm"))
+            for sib in root.iterdir()
+        ):
+            log.debug("repair_strms: skipping %s — duplicate of sibling with .strm", movie_dir.name)
+            skipped += 1
+            continue
         # No .strm — check if there's a .nfo we can use to requeue
         imdb_id = _nfo_imdb(movie_dir)
         if not imdb_id:
