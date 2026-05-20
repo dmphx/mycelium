@@ -167,9 +167,14 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
                 year = int((results[0].get("release_date") or "0000")[:4]) or None
         except Exception:
             year = None
-    if strm_generator.create_lazy_movie_strm(winner.info_hash, winner.magnet, req.title, year,
-                                              imdb_id=req.imdb_id, tmdb_id=getattr(req, 'tmdb_id', None)):
-        log.info("Lazy-registered movie %s (cached) — createtorrent deferred to first play", req.title)
+    source = (winner.name.split()[0] if winner.name else None)
+    if strm_generator.create_lazy_movie_strm(
+        winner.info_hash, winner.magnet, req.title, year,
+        imdb_id=req.imdb_id, tmdb_id=getattr(req, 'tmdb_id', None),
+        quality=winner.quality, source=source, size_gb=winner.size_gb,
+    ):
+        log.info("Lazy-registered movie %s (cached, %s) — createtorrent deferred to first play",
+                 req.title, winner.quality)
         return winner
     log.info("Lazy registration skipped for %s (strm exists?)", req.title)
     return None
@@ -286,7 +291,118 @@ def _try_realdebrid_fallback(title: str, candidates: list,
     return None
 
 
+def _get_season_episode_count(imdb_id: str, season: int) -> int:
+    """Ask TMDB how many episodes a season has. Returns 0 on failure."""
+    try:
+        import tmdb
+        tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
+        if not tmdb_id:
+            return 0
+        episodes = tmdb.get_season_episodes(tmdb_id, season)
+        return len(episodes)
+    except Exception:
+        return 0
+
+
+def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optional[TorrentioStream]]:
+    """Catbox lazy mode for series. Tries a cached season pack first, then falls
+    back to per-episode cached registration. Returns (any_written, first_stream)."""
+    import debrid
+    pack_candidates = _fetch_season_candidates(req, season, episode=1, prefer_season_pack=True)
+    pack_candidates = blacklist.filter_candidates(pack_candidates)
+    if not pack_candidates:
+        log.info("Lazy series: no candidates for %s S%02d — marking wanted", req.title, season)
+        return False, None
+
+    hashes = [s.info_hash for s in pack_candidates]
+    cached_hashes = debrid.check_cached_multi(hashes).get("torbox", set())
+
+    # --- Try season pack first ---
+    packs = [s for s in pack_candidates if s.is_season_pack and s.info_hash in cached_hashes]
+    if packs:
+        pack = packs[0]
+        ep_count = _get_season_episode_count(req.imdb_id, season)
+        if ep_count == 0:
+            ep_count = 24  # safe upper bound when TMDB unavailable
+        log.info("Lazy: cached season pack for %s S%02d (%d ep), registering %d episode(s)",
+                 req.title, season, ep_count, ep_count)
+        written = 0
+        source = pack.name.split()[0] if pack.name else None
+        for ep in range(1, ep_count + 1):
+            if strm_generator.create_lazy_episode_strm(
+                pack.info_hash, pack.magnet, req.title, season, ep,
+                imdb_id=req.imdb_id,
+                quality=pack.quality,
+                source=source,
+                size_gb=pack.size_gb,
+            ):
+                written += 1
+        if written:
+            log.info("Lazy season pack: %d .strm(s) registered for %s S%02d", written, req.title, season)
+            return True, pack
+        log.info("Lazy season pack: all strms already existed for %s S%02d", req.title, season)
+        return False, None
+
+    # --- Fall back to per-episode cached registration ---
+    log.info("Lazy: no cached season pack for %s S%02d — trying per-episode", req.title, season)
+    added = 0
+    first_winner: Optional[TorrentioStream] = None
+    episode = 1
+    while True:
+        if episode == 1:
+            ep_candidates = [s for s in pack_candidates if s.info_hash in cached_hashes]
+        else:
+            ep_cands_raw = _fetch_season_candidates(req, season, episode=episode)
+            ep_cands_raw = blacklist.filter_candidates(ep_cands_raw)
+            if not ep_cands_raw:
+                break
+            ep_hashes = [s.info_hash for s in ep_cands_raw]
+            ep_cached = debrid.check_cached_multi(ep_hashes).get("torbox", set())
+            ep_candidates = [s for s in ep_cands_raw if s.info_hash in ep_cached]
+
+        if not ep_candidates:
+            if episode == 1:
+                log.info("Lazy: no cached per-episode for %s S%02dE%02d — stopping", req.title, season, episode)
+            break
+
+        winner = ep_candidates[0]
+        source = winner.name.split()[0] if winner.name else None
+        if strm_generator.create_lazy_episode_strm(
+            winner.info_hash, winner.magnet, req.title, season, episode,
+            imdb_id=req.imdb_id,
+            quality=winner.quality,
+            source=source,
+            size_gb=winner.size_gb,
+        ):
+            added += 1
+            first_winner = first_winner or winner
+
+        episode += 1
+        if episode > 50:
+            log.warning("Episode cap (50) reached for %s S%02d", req.title, season)
+            break
+
+    if added:
+        log.info("Lazy per-episode: %d .strm(s) registered for %s S%02d", added, req.title, season)
+        return True, first_winner
+
+    reason = "no cached episodes available yet — waiting for TorBox cache"
+    log.info("Catbox: %s", reason)
+    _LAST_FAIL_REASON[req.imdb_id] = reason
+    _WANTED[req.imdb_id] = reason
+    return False, None
+
+
 def _process_season(req: MediaRequest, season: int) -> tuple[bool, Optional[TorrentioStream]]:
+    if _settings.get("CATBOX_MODE", False) and _settings.get("CATBOX_LAZY_ADD", False):
+        ok, winner = _lazy_register_season(req, season)
+        if ok:
+            return True, winner
+        if req.imdb_id in _WANTED:
+            return False, None
+        # _lazy_register_season set neither ok nor _WANTED → treat as failed
+        return False, None
+
     pack_candidates = _fetch_season_candidates(req, season, episode=1, prefer_season_pack=True)
 
     if pack_candidates and pack_candidates[0].is_season_pack:

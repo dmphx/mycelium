@@ -291,12 +291,26 @@ def _migrate() -> None:
     with _connect() as conn:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(monitored_series)")}
         if "monitor_mode" not in cols:
-            # all | future | selected — controls which episodes get monitored.
             conn.execute("ALTER TABLE monitored_series ADD COLUMN monitor_mode TEXT NOT NULL DEFAULT 'all'")
             log.info("Migration: added monitored_series.monitor_mode")
         if "added_at_date" not in cols:
             conn.execute("ALTER TABLE monitored_series ADD COLUMN added_at_date TEXT")
             log.info("Migration: added monitored_series.added_at_date")
+
+        vi_cols = {r["name"] for r in conn.execute("PRAGMA table_info(virtual_items)")}
+        for col, typedef in [
+            ("imdb_id", "TEXT"),
+            ("quality", "TEXT"),
+            ("source", "TEXT"),
+            ("size_gb", "REAL"),
+            ("season", "INTEGER"),
+            ("episode", "INTEGER"),
+            ("year", "INTEGER"),
+        ]:
+            if col not in vi_cols:
+                conn.execute(f"ALTER TABLE virtual_items ADD COLUMN {col} {typedef}")
+                log.info("Migration: added virtual_items.%s", col)
+
         conn.commit()
 
 
@@ -662,16 +676,49 @@ def set_poster(imdb_id: str, poster_path: str | None) -> None:
 
 def insert_virtual_item(token: str, info_hash: str, magnet: str, title: str,
                          media_type: str, strm_path: str | None = None,
-                         torbox_id: int | None = None, file_id: int | None = None) -> int:
+                         torbox_id: int | None = None, file_id: int | None = None,
+                         imdb_id: str | None = None, quality: str | None = None,
+                         source: str | None = None, size_gb: float | None = None,
+                         season: int | None = None, episode: int | None = None,
+                         year: int | None = None) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO virtual_items (token, info_hash, magnet, title, media_type,
-                                          strm_path, torbox_id, file_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id),
+            """INSERT INTO virtual_items
+               (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
+                imdb_id, quality, source, size_gb, season, episode, year)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
+             imdb_id, quality, source, size_gb, season, episode, year),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
+
+
+def update_virtual_item_upgrade(token: str, info_hash: str, magnet: str,
+                                 quality: str | None, source: str | None) -> None:
+    """Swap in a better torrent for an existing virtual item (upgrade). Clears the
+    cached torbox_id and file_id so next playback re-materializes with new hash."""
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE virtual_items
+               SET info_hash=?, magnet=?, quality=?, source=?,
+                   torbox_id=NULL, file_id=NULL
+               WHERE token=?""",
+            (info_hash, magnet, quality, source, token),
+        )
+        conn.commit()
+
+
+def get_upgradeable_virtual_items() -> list[dict]:
+    """Return movie virtual items that have a stored quality below 2160p."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM virtual_items
+               WHERE imdb_id IS NOT NULL AND media_type='movie'
+               ORDER BY created_at DESC"""
+        ).fetchall()
+    ranks = {"2160p": 4, "1080p": 3, "720p": 2, "480p": 1}
+    return [dict(r) for r in rows if ranks.get((r["quality"] or "?"), 0) < 4]
 
 
 def get_virtual_item(token: str) -> dict | None:

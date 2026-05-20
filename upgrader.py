@@ -66,10 +66,52 @@ def _better_cached(candidates: list, current_quality: str, current_hash: str) ->
     return None
 
 
+def _run_auto_upgrade_catbox() -> int:
+    """Catbox variant: scan virtual_items for better cached releases.
+    Upgrade = swap magnet/hash/quality in DB only; .strm stays identical."""
+    import catbox
+    import debrid
+    upgraded = 0
+    items = db.get_upgradeable_virtual_items()
+    log.info("Auto-upgrade (catbox): checking %d upgradeable virtual item(s)", len(items))
+    for item in items:
+        try:
+            candidates = _fetch_movie_candidates(item["imdb_id"])
+            if not candidates:
+                continue
+            hashes = [c.info_hash for c in candidates[:20]]
+            cached = debrid.check_cached_multi(hashes).get("torbox", set())
+            current_score = _quality_score(item.get("quality"))
+            better = next(
+                (c for c in candidates
+                 if c.info_hash in cached
+                 and c.info_hash.lower() != (item.get("info_hash") or "").lower()
+                 and _quality_score(c.quality) > current_score),
+                None,
+            )
+            if not better:
+                continue
+            log.info("Catbox upgrade: %s  %s → %s", item["title"], item.get("quality"), better.quality)
+            source = better.name.split()[0] if better.name else None
+            db.update_virtual_item_upgrade(item["token"], better.info_hash, better.magnet,
+                                            better.quality, source)
+            catbox.invalidate_url_cache(item["token"])
+            db.log_activity("upgraded", item["title"],
+                            f"{item.get('quality')} → {better.quality}", True)
+            upgraded += 1
+        except Exception as exc:
+            log.warning("Catbox upgrade failed for %s: %s", item.get("title"), exc)
+    if upgraded:
+        log.info("Auto-upgrade (catbox): %d title(s) upgraded", upgraded)
+    return upgraded
+
+
 def run_auto_upgrade() -> int:
     """Scan recent successful requests for better cached releases."""
     if not _settings.get("AUTO_UPGRADE_ENABLED", True):
         return 0
+    if _settings.get("CATBOX_MODE", False):
+        return _run_auto_upgrade_catbox()
     log.info("Auto-upgrade: scanning")
     upgraded = 0
     successes = [r for r in db.get_recent(500) if r["status"] == "success" and r.get("info_hash")]

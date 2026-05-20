@@ -97,10 +97,15 @@ def proxy_url(token: str) -> str:
 
 def register(info_hash: str, magnet: str, title: str, media_type: str,
              strm_path: str | None = None, torbox_id: int | None = None,
-             file_id: int | None = None) -> str:
+             file_id: int | None = None, imdb_id: str | None = None,
+             quality: str | None = None, source: str | None = None,
+             size_gb: float | None = None, season: int | None = None,
+             episode: int | None = None, year: int | None = None) -> str:
     token = uuid.uuid4().hex[:16]
     db.insert_virtual_item(token, info_hash, magnet, title, media_type,
-                            strm_path=strm_path, torbox_id=torbox_id, file_id=file_id)
+                            strm_path=strm_path, torbox_id=torbox_id, file_id=file_id,
+                            imdb_id=imdb_id, quality=quality, source=source,
+                            size_gb=size_gb, season=season, episode=episode, year=year)
     return token
 
 
@@ -191,6 +196,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
     if not file_id:
         live = torbox.find_by_id(torbox_id)
         if live:
+            import re as _re
             import strm_generator
             if item["media_type"] == "movie":
                 main = strm_generator._pick_main_movie_file(live.get("files") or [])
@@ -198,7 +204,16 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 videos = [f for f in (live.get("files") or [])
                           if strm_generator._is_video(f.get("name") or "")
                           and not strm_generator._is_trailer(f)]
-                main = max(videos, key=lambda f: f.get("size") or 0) if videos else None
+                s_num = item.get("season")
+                e_num = item.get("episode")
+                if s_num and e_num:
+                    ep_re = _re.compile(rf'[Ss]0?{s_num}[Ee]0?{e_num}\b', _re.IGNORECASE)
+                    matched = [f for f in videos if ep_re.search(f.get("name") or "")]
+                    main = matched[0] if matched else (
+                        max(videos, key=lambda f: f.get("size") or 0) if videos else None
+                    )
+                else:
+                    main = max(videos, key=lambda f: f.get("size") or 0) if videos else None
             if main:
                 file_id = main["id"]
                 db.update_virtual_file_id(token, file_id)

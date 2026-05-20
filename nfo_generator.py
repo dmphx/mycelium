@@ -203,6 +203,22 @@ def generate_all() -> dict:
     return {"movies": movies, "series": series}
 
 
+def fetch_images_for_folder(folder: Path, imdb_id: str, media_type: str = "movie") -> None:
+    """Download poster.jpg + fanart.jpg for a single folder. Called atomically at creation."""
+    poster = folder / "poster.jpg"
+    fanart = folder / "fanart.jpg"
+    if poster.exists() and fanart.exists():
+        return
+    try:
+        p, b = tmdb.get_images(imdb_id, "movie" if media_type == "movie" else "tv")
+        if p and not poster.exists():
+            _download_image(f"{_IMAGE_BASE_POSTER}{p}", poster)
+        if b and not fanart.exists():
+            _download_image(f"{_IMAGE_BASE_BACKDROP}{b}", fanart)
+    except Exception as exc:
+        log.debug("fetch_images_for_folder %s: %s", folder.name, exc)
+
+
 def fetch_local_images() -> dict:
     """Download poster.jpg, fanart.jpg, and episode stills from TMDB for all media folders.
 

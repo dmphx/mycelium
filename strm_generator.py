@@ -146,13 +146,12 @@ def _extract_year(name: str) -> int | None:
 
 
 def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
-               media_type: str = "movie") -> None:
-    """Write a Kodi/Jellyfin NFO sidecar next to a .strm file.
-    Jellyfin reads the IMDb/TMDB uniqueid to fetch metadata + posters directly,
-    bypassing unreliable name-matching against the folder name."""
+               media_type: str = "movie", nfo_path: Path | None = None) -> None:
+    """Write a Kodi/Jellyfin NFO sidecar. nfo_path overrides the default
+    (strm_path.with_suffix('.nfo')) so callers can write tvshow.nfo anywhere."""
     if not imdb_id and not tmdb_id:
         return
-    nfo_path = strm_path.with_suffix(".nfo")
+    nfo_path = nfo_path or strm_path.with_suffix(".nfo")
     if nfo_path.exists():
         return
     m = _YEAR_RE.search(strm_path.parent.name)
@@ -189,27 +188,97 @@ def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
 
 def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                             year: int | None, imdb_id: str | None = None,
-                            tmdb_id: int | None = None) -> bool:
+                            tmdb_id: int | None = None, quality: str | None = None,
+                            source: str | None = None, size_gb: float | None = None) -> bool:
     """Write a Catbox virtual movie .strm WITHOUT adding the torrent to TorBox.
     createtorrent is deferred until first playback (see catbox.materialize).
+    Atomically writes .nfo, poster.jpg, fanart.jpg, and requests subtitles.
     Returns True if a new .strm was written."""
     import catbox
     folder = _safe(f"{title} ({year})") if year else _safe(title)
     if not folder:
         return False
     path = Path(MEDIA_PATH) / "movies" / folder / f"{folder}.strm"
+    if path.exists():
+        return False
     token = catbox.register(
         info_hash=(info_hash or "").lower(),
         magnet=magnet,
         title=folder,
         media_type="movie",
-        torbox_id=None,   # ← deferred: no createtorrent yet
+        torbox_id=None,
         file_id=None,
         strm_path=str(path),
+        imdb_id=imdb_id,
+        quality=quality,
+        source=source,
+        size_gb=size_gb,
+        year=year,
     )
     written = _write_strm(path, catbox.proxy_url(token))
-    if written and (imdb_id or tmdb_id):
-        _write_nfo(path, imdb_id, tmdb_id)
+    if written:
+        if imdb_id or tmdb_id:
+            _write_nfo(path, imdb_id, tmdb_id)
+        if imdb_id:
+            try:
+                import nfo_generator
+                nfo_generator.fetch_images_for_folder(path.parent, imdb_id, "movie")
+            except Exception as exc:
+                log.debug("Image fetch skipped for %s: %s", folder, exc)
+            try:
+                import subtitles
+                subtitles.fetch_for(path, imdb_id, "movie")
+            except Exception as exc:
+                log.debug("Subtitle fetch skipped for %s: %s", folder, exc)
+    return written
+
+
+def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
+                               season: int, episode: int,
+                               imdb_id: str | None = None,
+                               quality: str | None = None,
+                               source: str | None = None,
+                               size_gb: float | None = None) -> bool:
+    """Write a Catbox virtual episode .strm WITHOUT adding to TorBox.
+    For season packs: multiple episodes share the same info_hash/magnet;
+    catbox.materialize picks the right file by SxxExx at playback time.
+    Atomically writes tvshow.nfo and series poster/fanart on first episode.
+    Returns True if a new .strm was written."""
+    import catbox
+    safe_title = _safe(title)
+    if not safe_title:
+        return False
+    season_dir = f"Season {season:02d}"
+    ep_name = f"{safe_title} S{season:02d}E{episode:02d}"
+    path = Path(MEDIA_PATH) / "series" / safe_title / season_dir / f"{ep_name}.strm"
+    if path.exists():
+        return False
+    token = catbox.register(
+        info_hash=(info_hash or "").lower(),
+        magnet=magnet,
+        title=ep_name,
+        media_type="series",
+        torbox_id=None,
+        file_id=None,
+        strm_path=str(path),
+        imdb_id=imdb_id,
+        quality=quality,
+        source=source,
+        size_gb=size_gb,
+        season=season,
+        episode=episode,
+    )
+    written = _write_strm(path, catbox.proxy_url(token))
+    if written and imdb_id:
+        series_root = path.parent.parent
+        tvshow_nfo = series_root / "tvshow.nfo"
+        if not tvshow_nfo.exists():
+            _write_nfo(path, imdb_id, nfo_path=tvshow_nfo, media_type="series")
+        try:
+            import nfo_generator
+            nfo_generator.fetch_images_for_folder(series_root, imdb_id, "tv")
+        except Exception as exc:
+            log.debug("Image fetch skipped for %s: %s", safe_title, exc)
     return written
 
 
