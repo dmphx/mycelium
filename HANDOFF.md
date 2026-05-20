@@ -21,8 +21,7 @@ Docker container on a Synology NAS.
 
 ## Current state (end of session 2026-05-20)
 
-Everything is on `main`. The NAS needs a `git pull + rebuild` to pick up recent
-changes.
+Everything is on `main`. The NAS needs a `git pull + rebuild` to pick up recent changes.
 
 ### What to do right now on the NAS
 
@@ -31,11 +30,13 @@ git pull origin main
 docker compose up -d --build
 ```
 
-Then in order:
-1. **Admin → Repair broken strm files** — fixes movies with expired direct TorBox CDN URLs
-2. **Dashboard → Generate NFOs** — refreshes posters/metadata for any new folders
-3. **Dashboard → Run Cleanup** — merges duplicate series/movie folders, renames messy names
-4. Jellyfin **Scan All Libraries**
+After rebuild:
+1. **Admin → Maintenance → Migrate to canonical names** — renames all movie folders to
+   TMDB canonical names, merges duplicates. Run once. *(Already ran once this session —
+   only run again if new duplicate folders appear.)*
+2. Jellyfin: **remove and re-add the Movies library** to clear stale DB entries from
+   renamed folders (normal scan adds new entries but doesn't remove old ones).
+3. Jellyfin **Scan All Libraries**
 
 ---
 
@@ -44,48 +45,62 @@ Then in order:
 ```
 User → SPA (/app/) or Seerr webhook → processor.py
   → Zilean (local) + Torrentio (fallback, with browser User-Agent)
-  → debrid.check_cached_multi() → pick best cached release
-  → TorBox add_magnet() (or catbox lazy register)
-  → strm_generator.py writes .strm + .nfo + poster.jpg + fanart.jpg
+  → debrid.check_cached_multi() → pick best CACHED release only
+  → catbox.register() → write .strm + .nfo + poster.jpg + fanart.jpg
   → Jellyfin refresh
 
 On play (catbox mode):
-  Jellyfin → /stream/<token> → catbox.materialize()
-    → find/re-add torrent in TorBox → requestdl → 302 redirect → TorBox CDN
+  Jellyfin reads .strm → opens http://10.0.0.10:8088/stream/<token>
+  → catbox.materialize(token):
+      1. torbox_id in DB still live? → requestdl → 302 redirect (fast path)
+      2. Not live? → fresh Torrentio search → pick best cached release
+         → add_magnet → wait_until_ready → requestdl → 302 redirect
+      3. Nothing found? → remove .strm → film verdwijnt uit Jellyfin
 ```
 
-**Two modes for .strm files:**
-- **Catbox mode** (`CATBOX_MODE=true` + `CATBOX_LAZY_ADD=true`): `.strm` contains
-  `http://10.0.0.10:8088/stream/<token>`. Proxy URL, always fetches a fresh CDN URL
-  on play. Recommended — works forever.
-- **Direct mode**: `.strm` contains a TorBox `requestdl` CDN URL. Expires after ~24h.
-  The Admin → Repair button fixes these by relinking to a catbox token.
+**Core invariant (imdb_id is leading):**
+- 1 imdb_id = 1 movie folder = 1 .strm — structurally enforced
+- Folder name = TMDB canonical title + year (not torrent name)
+- No imdb_id → not added to library
+
+**Catbox mode** (`CATBOX_MODE=true` + `CATBOX_LAZY_ADD=true`):
+- `.strm` contains `http://10.0.0.10:8088/stream/<token>`
+- Token maps to `virtual_items` row (imdb_id + last known torbox_id as shortcut)
+- On play: TorBox shortcut first, else fresh Torrentio search — always finds a playable
+  release or removes the .strm
+- Stored magnet is no longer re-added blindly; Torrentio is always the fallback
 
 ---
 
-## All changes shipped (this + previous session — all on `main`)
+## Key design decisions made this session
 
-### Most recent (this session)
+| Decision | Reason |
+|----------|--------|
+| **No stored-magnet replay** | Dead magnets caused 45s waits → "Playback Failed". Fresh Torrentio search always finds a cached release or removes the film. |
+| **imdb_id as primary key** | Folder names from torrent titles caused Cyrillic duplicates, fuzzy dedup failures. TMDB canonical name is deterministic. |
+| **_SEARCH_UNAVAILABLE sentinel** | Distinguishes "searched and found nothing" (→ remove .strm) from "couldn't search" (→ keep .strm, retry later). |
+| **Shared maintenance lock** | `migrate_to_canonical_names` and `repair_expired_strms` cannot run simultaneously — rename + repair would conflict. |
+| **Auto repair every 6h** | Scheduled job recreates missing .strm files automatically; no manual repair needed. |
+| **Dead .strm removal** | If materialize fails definitively, .strm is deleted so Jellyfin stops showing an unplayable film. |
+| **Jellyfin NFO saver = OFF** | Mycelium writes .nfo with imdb_id. Jellyfin NFO saver would overwrite them. |
+
+---
+
+## All changes shipped this session (all on `main`)
+
 | Commit | Change |
 |--------|--------|
-| `abea902` | **Repair broken .strm files**: `repair_expired_strms()` in `strm_generator.py` + `POST /ui/api/repair-strms` + Admin → Maintenance panel button. Detects expired direct CDN URLs in .strm files, relinks to catbox token or deletes + requeues. |
-| `7f79956` | **Failed requests UI**: `GET /ui/api/requests/failed` + `POST /ui/api/requests/<id>/retry`. Requests page now shows a "Failed requests" section with per-row ↺ Retry button. |
-| `46de8f0` | **Torrentio 403 fix**: Added browser `User-Agent` + `Accept` headers to all Torrentio requests (`_HTTP_HEADERS` in `torrentio.py`). Cloudflare was blocking plain Python requests from NAS/datacenter IPs. |
-| `b10e8ef` | **Radarr/Sonarr import progress**: Admin page shows live progress bar, done/total/%, added/skipped/errors during bulk import. Auto-polls at 1 s while running, 5 s idle. |
-| `f22104e` | **Radarr/Sonarr settings fix**: Import + test endpoints now read from settings DB (`settings.get("RADARR_URL", ...)`) instead of startup-time env constants. Fixes "url + api_key required" error. |
-| `831e9b3` | **Auth fix**: `is_admin()` now returns `True` when auth is disabled (single-user mode). Fixes "admin required" on Radarr/Sonarr test when `AUTH_ENABLED=false`. |
-| `4e3b3e9` | **Movie folder cleanup**: `rename_messy_movie_folders()` + `merge_movie_duplicates()` in `cleanup.py`. Reads title/year/imdb_id from .nfo, renames folder + .strm + .nfo to `Title (Year)` format. Merges duplicate folders with same IMDb ID. |
-| `02c9496` | **Library episode drilldown**: Series panel in Library tab shows expandable rows per series with season numbers and episode badges. Uses new `GET /ui/api/library/series-episodes` endpoint. |
-| `c858165` | TMDB fallback in series folder rename: if series not in `monitored_series` DB, looks up canonical title via `tmdb.find_by_imdb` + `get_show_info`. |
-| `c4702d5` | **Series folder rename**: `rename_messy_series_folders()` reads IMDb from `tvshow.nfo`, looks up canonical title in DB/TMDB, renames folder. Fixes `www UIndex org - Show` → `Show (year)`. |
-
-### Previous session
-| Commit | Change |
-|--------|--------|
-| `238b3d2` | Complete catbox + clean architecture refactor: `processor.py` lazy series registration, `upgrader.py` catbox-aware auto-upgrade. |
-| `a66fa2a` | Local image fetcher: `nfo_generator.fetch_local_images()` downloads poster.jpg + fanart.jpg (TMDB) and episode stills. Hooked into startup, `/ui/generate-nfos`, and library import. |
-| `2795439` | `merge_series_duplicates()` in `cleanup.py`: groups series folders by IMDb ID from tvshow.nfo, merges .strm files, removes duplicates. |
-| `335cf40` | `EXCLUDE_LANGUAGES` setting: detects Russian (keywords + Cyrillic) and blocks them. |
+| `a709735` | Maintenance lock: migrate + repair cannot run simultaneously |
+| `b11a71e` | **imdb_id as primary key**: `_canonical_movie_folder()`, `_find_movie_folder_by_imdb()`, update `create_lazy_movie_strm()`, `migrate_to_canonical_names()`, `db.update_virtual_strm_path_prefix()`, Admin "Migrate to canonical names" button |
+| `a4ecf65` | Fix aggressive .strm removal (keep .strm when search unavailable); repair Pass 1 dedup skips Cyrillic sibling that already has .strm |
+| `45559e8` | Resolve missing imdb_id via TMDB before Torrentio search; `db.update_virtual_item_imdb()` |
+| `47b7b7a` | **Rebuild materialize**: live Torrentio search replaces stored-magnet replay; `_search_best_cached_release()` replaces `_find_fresh_cached_release()` |
+| `b61b998` | Fix dedup: only skip folder if sibling already has .strm (fixes Cyrillic duplicate getting .strm instead of English folder) |
+| `c515215` | Schedule automatic .strm repair every 6h in catbox mode |
+| `8bd90cb` | Remove dead .strm from library when no playable release found |
+| `ebc346a` | Auto-fallback to fresh Torrentio release when stored magnet is dead |
+| `b6b731a` | Failure cooldown in catbox materialize (30s standard / 120s for 429) stops burst retries |
+| `bc71df7` | Repair missing .strm files (folders with NFO but no .strm) |
 
 ---
 
@@ -93,32 +108,52 @@ On play (catbox mode):
 
 | File | Purpose |
 |------|---------|
-| `processor.py` | Request → search → cache-check → add to TorBox (or catbox lazy register) |
-| `strm_generator.py` | Write `.strm`/`.nfo`/images; `repair_expired_strms()` for broken links |
-| `catbox.py` | Lazy TorBox materialization for `/stream/<token>` |
-| `cleanup.py` | Dedup `.strm`, merge series/movie folders, rename messy folder names |
-| `upgrader.py` | Auto-upgrade quality + season-pack consolidation (catbox-aware) |
+| `processor.py` | Request → search → cache-check → catbox lazy register |
+| `strm_generator.py` | Write `.strm`/`.nfo`/images; `_canonical_movie_folder()`; `migrate_to_canonical_names()`; `repair_expired_strms()` |
+| `catbox.py` | Lazy materialization: TorBox shortcut → Torrentio search → redirect or remove .strm |
+| `cleanup.py` | Dedup `.strm`, merge series folders, rename messy names |
+| `upgrader.py` | Auto-upgrade quality + season-pack consolidation |
 | `torrentio.py` | Torrent candidate fetch + ranking + language filtering |
-| `arr_import.py` | Radarr/Sonarr bulk import (reads settings from DB, not env) |
+| `arr_import.py` | Radarr/Sonarr bulk import |
 | `auth.py` | Session login, proxy-auth trust, multi-user roles |
-| `db.py` | SQLite access: requests, virtual_items, monitored_series, retry_queue, … |
+| `db.py` | SQLite access: requests, virtual_items, monitored_series, retry_queue |
 | `tmdb.py` | TMDB API: search, images, episode stills, IMDb↔TMDB ID mapping |
 | `settings.py` | Runtime-editable settings (reads DB first, `.env` fallback) |
 | `nfo_generator.py` | Write `.nfo` sidecars + fetch local images |
 | `app.py` | Flask app, scheduler, all UI/API endpoints |
-| `retry_queue.py` | Exponential backoff retry scheduler (60m / 6h / 24h) |
+| `retry_queue.py` | Exponential backoff retry scheduler |
+
+---
+
+## virtual_items table (catbox mode source of truth)
+
+| Column | Role |
+|--------|------|
+| `token` | Primary key — goes into .strm URL |
+| `imdb_id` | **Leading key** — used for Torrentio search on play |
+| `torbox_id` | Cache/shortcut — checked first on play, skips Torrentio if still live |
+| `info_hash` | Last known hash — secondary shortcut via `find_by_hash` |
+| `magnet` | Stored but no longer blindly re-added (only used if torbox_id/hash shortcut works) |
+| `strm_path` | Path on disk — updated by `update_virtual_strm_path_prefix()` on rename |
+| `last_played` | Used by idle GC (`release_idle()`) |
 
 ---
 
 ## Known remaining issues / next steps
 
-- **Series duplicates** in Jellyfin: still need cleanup run on NAS with latest code.
-  Most should merge automatically via `rename_messy_series_folders` + `merge_series_duplicates`.
-- **Missing episodes**: user asked "hoe vullen we gemiste afleveringen aan?" — not yet
-  implemented. Options: scan Library episode view → detect gaps → re-run monitor for
-  those seasons; or a "fill missing" button per series in the Library tab.
-- **Radarr/Sonarr import verification**: needs a test run after the settings fix.
-- **Torrentio 403 fix**: deployed in code, not yet tested on NAS (needs rebuild).
+- **Jellyfin duplicates after migration**: user needs to remove + re-add Movies library
+  in Jellyfin to clear stale DB entries from renamed folders.
+- **The Amateur (2025)**: has no imdb_id in virtual_items (`tt14961434` is the correct
+  one). Set manually: `UPDATE virtual_items SET imdb_id='tt14961434' WHERE token='227a6d344f04441c'`
+  Then run Admin → Repair broken strm files.
+- **Highlander folder**: has imdb_id `tt1235529` in .nfo but that may be wrong. The 1986
+  film is `tt0091203`. Folder is named "Highlander" (no year) as a result.
+- **Series in Mycelium**: Sonarr import added 31 series to `monitored_series` DB. Episodes
+  appear in Wanted → Episodes tab when found. Series folders appear in Jellyfin once
+  episodes are found via Torrentio and .strm files are written.
+- **Missing episodes**: "hoe vullen we gemiste afleveringen aan?" — not yet implemented.
+- **CATBOX_IDLE_MINUTES**: currently aggressive (60 min default). Recommend setting to
+  720 or 1440 in Settings to reduce Torrentio search frequency on play.
 
 ---
 
@@ -128,16 +163,15 @@ On play (catbox mode):
 - `data/` is gitignored — can't inspect DB or media from a cloud session.
   Ask user to run `find`/`ls`/`sqlite3` on the NAS when needed.
 - POST endpoints are CSRF-protected by default → trigger via dashboard buttons, not curl.
-  CSRF-exempt endpoints: `/api/run-cleanup`, `/api/generate-nfos`, `/ui/api/repair-strms`,
-  `/ui/api/requests/<id>/retry`, `/ui/api/requests/failed` (GET, no CSRF needed).
-- Single gunicorn worker, 8 threads → in-process state (catbox URL cache, scan-burst
-  detector, retry queue) is shared and safe.
-- Scheduler intervals need a container restart to change; most settings are hot-reloadable
-  via Settings tab without restart.
+  CSRF-exempt: `/ui/api/repair-strms`, `/ui/api/migrate-canonical`,
+  `/ui/api/requests/<id>/retry`, `/ui/api/arr-import/*`.
+- Single gunicorn worker, 8 threads → in-process state is shared and safe.
 - `settings.get("KEY", default)` reads settings DB first, then falls back to env/config.py.
-  Always use `settings.get()` in endpoints — never `config.KEY` directly — or settings
-  changes in the UI won't take effect.
-- Jellyfin compose: `/volume1/docker/jellyfin/docker-compose.yml` (separate from the app
+  Always use `settings.get()` in endpoints — never `config.KEY` directly.
+- Jellyfin compose: `/volume1/docker/jellyfin/docker-compose.yml` (separate from app
   compose at `/volume1/docker/jelly-stack/webhook/`).
-- CATBOX_HOST must be the externally reachable URL that Jellyfin can reach
+- CATBOX_HOST must be the externally reachable URL Jellyfin can reach
   (currently `http://10.0.0.10:8088`). This goes into the .strm file itself.
+- Jellyfin NFO metadata saver must stay **OFF** — Mycelium owns the .nfo files.
+- Media path inside container: `/data/media/movies` and `/data/media/series`.
+  On NAS: `/volume1/docker/jelly-stack/webhook/data/media/`.
