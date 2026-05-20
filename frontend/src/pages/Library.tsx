@@ -59,32 +59,64 @@ function MoviesPanel() {
 }
 
 function SeriesPanel() {
-  const { data, isLoading } = useQuery({ queryKey: ['stats'], queryFn: api.stats });
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const { data, isLoading } = useQuery({
+    queryKey: ['library-series-episodes'],
+    queryFn: () => fetch('/ui/api/library/series-episodes').then(r => r.json()),
+  });
   if (isLoading) return <div className="text-muted">Loading…</div>;
-  const items = data?.monitored || [];
+  const series: any[] = data?.series || [];
+
+  const toggle = (title: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      next.has(title) ? next.delete(title) : next.add(title);
+      return next;
+    });
+  };
+
   return (
     <div>
-      <p className="text-muted text-sm mb-4">{items.length} series monitored</p>
-      <table className="w-full text-sm">
-        <thead className="text-xs text-muted uppercase border-b border-border">
-          <tr>
-            <th className="text-left py-2 px-3">Title</th>
-            <th className="text-left py-2 px-3">Seasons</th>
-            <th className="text-left py-2 px-3">Status</th>
-            <th className="text-left py-2 px-3">Last check</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((s: any, i: number) => (
-            <tr key={i} className="border-b border-border/50 hover:bg-card">
-              <td className="py-2 px-3">{s.title}</td>
-              <td className="py-2 px-3 text-muted">{s.seasons || '—'}</td>
-              <td className="py-2 px-3 text-muted">{s.status || '—'}</td>
-              <td className="py-2 px-3 text-muted text-xs">{s.last_checked || '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <p className="text-muted text-sm mb-4">{series.length} series in library</p>
+      <div className="space-y-1">
+        {series.map((s: any) => {
+          const isOpen = expanded.has(s.title);
+          const totalEps = s.seasons.reduce((n: number, se: any) => n + se.episodes.length, 0);
+          return (
+            <div key={s.title} className="border border-border rounded">
+              <button
+                type="button"
+                onClick={() => toggle(s.title)}
+                className="w-full flex items-center justify-between px-4 py-3 text-sm hover:bg-card transition text-left"
+              >
+                <span className="font-medium">{s.title}</span>
+                <span className="text-muted text-xs">
+                  {s.seasons.length} season{s.seasons.length !== 1 ? 's' : ''} · {totalEps} episodes
+                  <span className="ml-2">{isOpen ? '▲' : '▼'}</span>
+                </span>
+              </button>
+              {isOpen && (
+                <div className="border-t border-border px-4 py-3 space-y-2 bg-card/50">
+                  {s.seasons.map((se: any) => (
+                    <div key={se.season}>
+                      <div className="text-xs text-muted mb-1">
+                        Season {String(se.season).padStart(2, '0')} — {se.episodes.length} episode{se.episodes.length !== 1 ? 's' : ''}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {se.episodes.map((ep: number) => (
+                          <span key={ep} className="text-xs bg-accent/20 text-accent px-2 py-0.5 rounded">
+                            E{String(ep).padStart(2, '0')}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

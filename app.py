@@ -1306,6 +1306,39 @@ def ui_api_wanted_episodes():
     return jsonify(items=db.get_all_wanted_episodes())
 
 
+@app.get("/ui/api/library/series-episodes")
+def ui_api_library_series_episodes():
+    """Return available episodes per series by scanning the media folder."""
+    import re as _re
+    from pathlib import Path as _Path
+    _EP_RE = _re.compile(r'[Ss](\d{1,2})[Ee](\d{1,3})')
+    series_dir = _Path(cfg.MEDIA_PATH) / "series"
+    out = []
+    if not series_dir.is_dir():
+        return jsonify(series=[])
+    for show in sorted(series_dir.iterdir()):
+        if not show.is_dir():
+            continue
+        seasons = []
+        for season_dir in sorted(show.iterdir()):
+            if not season_dir.is_dir():
+                continue
+            try:
+                s_num = int("".join(c for c in season_dir.name if c.isdigit()))
+            except ValueError:
+                continue
+            episodes = []
+            for strm in sorted(season_dir.glob("*.strm")):
+                m = _EP_RE.search(strm.stem)
+                if m:
+                    episodes.append(int(m.group(2)))
+            if episodes:
+                seasons.append({"season": s_num, "episodes": sorted(set(episodes))})
+        if seasons:
+            out.append({"title": show.name, "seasons": seasons})
+    return jsonify(series=out)
+
+
 @app.get("/ui/api/torbox-quota")
 def ui_api_torbox_quota():
     """createtorrent usage in the last hour, broken down by reason — explains
