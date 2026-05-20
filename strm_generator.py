@@ -16,6 +16,16 @@ _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.ts', '.
 
 _EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
+# Strip leading site/group prefixes from torrent names before parsing:
+#   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
+_SITE_PREFIX_RE = re.compile(
+    r'^(?:\[[^\]]*\]\s*|(?:www\.|https?://)\S+\s*|'
+    r'(?:rutor|hidratorrents|warmachine|xtorrenty|superseed|byethost\d*|'
+    r'uindex|devil-torrents)\s*[\.\-]?\s*(?:info|org|pl|com|net)?\s*[-–—\s]*)+'
+    , re.IGNORECASE,
+)
+# Strip leading Cyrillic block (keeps Latin title when torrent has both)
+_CYRILLIC_PREFIX_RE = re.compile(r'^[Ѐ-ӿ\s\(\)\[\]\.,\-–—«»]+')
 _JUNK_RE = re.compile(
     r'\s*\b(?:2160[pi]?|4K|UHD|1080[pi]?|720[pi]?|480[pi]?|HDTV|WEB[-.]?DL|WEBRip|WEB\b|'
     r'BluRay|BDRip|DVDRip|REMUX|HEVC|x\.?265|x\.?264|AVC|H\.?26[45]|'
@@ -53,6 +63,15 @@ def _pick_main_movie_file(files: list[dict]) -> dict | None:
     return max(big or non_trailer, key=lambda f: f.get('size') or 0)
 
 
+def _clean_torrent_name(name: str) -> str:
+    """Strip site prefixes and Cyrillic blocks from a raw torrent name."""
+    s = _SITE_PREFIX_RE.sub('', name).strip()
+    s = _CYRILLIC_PREFIX_RE.sub('', s).strip()
+    # Also strip anything left in leading square brackets
+    s = re.sub(r'^\[[^\]]*\]\s*', '', s).strip()
+    return s or name  # fall back to original if everything got stripped
+
+
 def _clean(s: str) -> str:
     return re.sub(r'[._]', ' ', s).strip()
 
@@ -67,6 +86,7 @@ def _safe(s: str) -> str:
 
 def _parse_info(torrent_name: str, file_name: str) -> dict | None:
     """Extract title/year/season/episode from torrent and file names."""
+    torrent_name = _clean_torrent_name(torrent_name)
     file_base = re.sub(r'\.[a-zA-Z0-9]{2,5}$', '', file_name)
 
     # Episode: try file name first (most reliable for season packs)
@@ -203,7 +223,7 @@ def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_typ
 def process_torrent(item: dict) -> int:
     """Create .strm files for all video files in a ready torrent. Returns new file count."""
     torrent_id = item.get('id')
-    torrent_name = item.get('name') or ''
+    torrent_name = _clean_torrent_name(item.get('name') or '')
     files = item.get('files') or []
 
     if not torbox_mod._is_ready(item):

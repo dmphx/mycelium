@@ -271,23 +271,91 @@ def resolve_unknowns() -> dict:
     return {"resolved": resolved, "failed": failed}
 
 
+# Patterns to strip before normalizing a folder name for dedup
+_DEDUP_SITE_RE = re.compile(
+    r'^\s*(?:\[[^\]]*\]\s*|'                              # [GROUP] prefix
+    r'(?:www[\.\s]\S+)\s*|'                               # www.site.org OR www site org
+    r'(?:https?://)\S+\s*|'                               # https://...
+    r'(?:rutor|hidratorrents|xtorrenty|superseed|'
+    r'byethost\d*|uindex|devil.torrents)'
+    r'\s*[\.\-\s]?\s*(?:info|org|pl|com|net)?\s*[-–\s]*)+',
+    re.IGNORECASE,
+)
+_DEDUP_CYRILLIC_RE = re.compile(r'[Ѐ-ӿ]+[\s\S]*?(?=[A-Za-z])')  # Cyrillic run up to first Latin char
+_DEDUP_TRAILING_BRACKET_RE = re.compile(r'[\(\[\{]\s*$')          # trailing open bracket
+
+
 def _norm(s: str) -> str:
-    """Normalize a folder name for fuzzy dedup: strip year, leading article, keep alphanumeric."""
-    s = re.sub(r'\(\d{4}\)', '', s)
+    """Aggressive normalization for duplicate detection.
+    Strips site prefixes, Cyrillic, year, leading article, punctuation."""
+    # Strip site/group prefixes
+    s = _DEDUP_SITE_RE.sub('', s).strip()
+    # Strip leftover TLD word after www stripping (e.g. "org - " after "www UIndex" was consumed)
+    s = re.sub(r'^(?:org|com|net|info|pl)\s*[-–]+\s*', '', s, flags=re.IGNORECASE).strip()
+    # Strip leading Cyrillic (torrent sites prepend Russian title)
+    s = _DEDUP_CYRILLIC_RE.sub('', s).strip()
+    # Strip anything left in leading brackets
+    s = re.sub(r'^\[[^\]]*\]\s*', '', s).strip()
+    # Strip common torrent language/format tags at the start (e.g. "MKV -LEGENDADO-")
+    s = re.sub(r'^(?:MKV|AVI|MP4|HEVC|x265|x264)\s*[-–]?\s*(?:LEGENDADO|DUBBED|SUB|MULTI)?\s*[-–]?\s*',
+               '', s, flags=re.IGNORECASE).strip()
+    # Strip parenthesised blocks that contain Cyrillic (e.g. director names in Russian)
+    s = re.sub(r'\([^)]*[Ѐ-ӿ][^)]*\)', '', s).strip()
+    # Strip year in parens at end
+    s = re.sub(r'\s*\(\d{4}\)\s*$', '', s).strip()
+    # Strip all remaining parenthesised content — in folder names this is always
+    # torrent metadata (director name, translator, etc.), never part of the actual title
+    s = re.sub(r'\([^)]*\)', '', s).strip()
+    # Strip trailing open bracket (malformed names like "Absolution (")
+    s = _DEDUP_TRAILING_BRACKET_RE.sub('', s).strip()
+    # Strip trailing square bracket junk
+    s = re.sub(r'\s*\[.*$', '', s).strip()
+    # Strip leading article
     s = re.sub(r'^(the|a|an)\s+', '', s, flags=re.IGNORECASE)
+    # Alphanumeric only, lowercase
     return re.sub(r'[^a-z0-9]', '', s.lower())
 
 
+_SCORE_SITE_RE = re.compile(
+    r'\b(rutor|xtorrenty|uindex|hidratorrents|superseed|byethost|devil.torrents|warmachine\.)\b',
+    re.IGNORECASE,
+)
+
+
+def _folder_score(name: str) -> int:
+    """Score a folder name — higher = better (prefer clean TMDB-style names)."""
+    score = 0
+    # Heavy penalty for known torrent-site prefixes embedded in the name
+    if _SCORE_SITE_RE.search(name):
+        score -= 150
+    if re.match(r'^[A-Za-z]', name):          # starts with Latin letter (not bracket/Cyrillic/digit)
+        score += 100
+    if not re.search(r'[\[\]\{\}]', name):    # no square/curly brackets
+        score += 50
+    if re.search(r'\(\d{4}\)$', name):        # ends with (year) — proper TMDB format
+        score += 30
+    if not re.search(r'[Ѐ-ӿ]', name):        # no Cyrillic
+        score += 20
+    # Penalize stray parens/brackets in the title part (before the year)
+    title_part = re.sub(r'\s*\(\d{4}\)\s*$', '', name)
+    if not re.search(r'[\(\)\[\]]', title_part):  # clean title, no stray brackets
+        score += 15
+    if "'" in name or re.search(r"[A-Z][a-z]", name):  # proper casing
+        score += 10
+    score -= len(name) // 20                  # slight penalty for very long names
+    return score
+
+
 def dedup_movie_folders() -> dict:
-    """Find movie folders that are duplicates (same normalized title + year) and delete the
-    shorter/worse-named one, keeping the folder whose name best matches the TMDB style.
+    """Find and remove duplicate movie folders, keeping the best-named one.
+    Handles: site prefixes, Cyrillic, trailing brackets, case differences, article order.
     Returns {"checked": N, "removed": M}."""
     import shutil
     movies_dir = Path(MEDIA_PATH) / "movies"
     if not movies_dir.is_dir():
         return {"checked": 0, "removed": 0}
 
-    # Group folders by (norm_title, year)
+    # Group folders by (normalized_title, year)
     groups: dict[tuple, list[Path]] = {}
     for folder in movies_dir.iterdir():
         if not folder.is_dir():
@@ -302,17 +370,20 @@ def dedup_movie_folders() -> dict:
     for key, folders in groups.items():
         if len(folders) < 2:
             continue
-        # Keep the folder with the longest name (usually the TMDB one with proper title),
-        # delete the shorter/malformed ones.
-        folders.sort(key=lambda p: -len(p.name))
+        norm_key, year = key
+        if not norm_key:          # skip if normalization ate everything
+            continue
+        # Sort: highest score first = the one we keep
+        folders.sort(key=lambda p: -_folder_score(p.name))
         keeper = folders[0]
         for dupe in folders[1:]:
-            log.info("dedup_movie_folders: removing duplicate %s (keeping %s)", dupe.name, keeper.name)
+            log.info("dedup: removing %r  →  keeping %r", dupe.name, keeper.name)
             try:
                 shutil.rmtree(dupe)
                 removed += 1
             except Exception as exc:
-                log.warning("dedup_movie_folders: could not remove %s: %s", dupe, exc)
+                log.warning("dedup: could not remove %s: %s", dupe, exc)
 
-    log.info("dedup_movie_folders: checked %d title groups, removed %d duplicate folders", checked, removed)
+    log.info("dedup_movie_folders: %d title groups checked, %d duplicate folders removed",
+             checked, removed)
     return {"checked": checked, "removed": removed}
