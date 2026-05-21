@@ -1409,9 +1409,21 @@ def ui_api_wanted_movies():
 
 @app.post("/ui/api/wanted-recheck")
 def ui_api_wanted_recheck():
-    threading.Thread(target=upgrader.recheck_wanted, name="wanted-recheck-manual",
-                     daemon=True).start()
+    def _run():
+        upgrader.recheck_wanted()
+        monitor.run_series_check()
+    threading.Thread(target=_run, name="wanted-recheck-manual", daemon=True).start()
     return jsonify(ok=True, message="wanted recheck started")
+
+
+@app.post("/ui/search-all-wanted")
+def ui_search_all_wanted():
+    def _run():
+        upgrader.recheck_wanted()
+        monitor.run_series_check()
+    threading.Thread(target=_run, name="wanted-search-all", daemon=True).start()
+    flash("Search all wanted started — this may take a while.", "info")
+    return redirect(url_for("ui_dashboard") + "#wanted")
 
 
 @app.get("/ui/api/wanted-episodes")

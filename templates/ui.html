@@ -342,7 +342,7 @@
     <button class="tab-btn" data-tab="requests">Requests <span class="badge-count">{{ requests | length }}</span></button>
     <button class="tab-btn" data-tab="movies">Movies <span class="badge-count">{{ movies | length }}</span></button>
     <button class="tab-btn" data-tab="series">Series <span class="badge-count">{{ monitored | length }}</span></button>
-    <button class="tab-btn" data-tab="wanted">Wanted <span class="badge-count">{{ wanted | length }}</span></button>
+    <button class="tab-btn" data-tab="wanted">Wanted <span class="badge-count">{{ wanted | selectattr('status', 'equalto', 'wanted') | list | length }}</span></button>
     <button class="tab-btn" data-tab="search">Search</button>
     <button class="tab-btn" data-tab="users">Users</button>
     <button class="tab-btn" data-tab="torbox">TorBox</button>
@@ -722,6 +722,9 @@
     <div class="section-hdr">
       <span class="section-title">Wanted Episodes</span>
       <span class="dim" style="font-size:11px">Retries every {{ config.MONITOR_INTERVAL_HOURS }}h · max {{ config.MAX_RETRY_ATTEMPTS }} attempts</span>
+      <form method="post" action="/ui/search-all-wanted" style="display:inline;margin-left:auto">
+        <button class="btn btn-secondary btn-sm">Search all wanted</button>
+      </form>
     </div>
     <input type="text" class="search-bar" placeholder="Search episodes…" data-filter="wanted-table">
     <div class="table-wrap">
