@@ -15,8 +15,8 @@
 <p>
   Self-hosted automation that turns watchlist clicks into Jellyfin-ready streams via
   <a href="https://torbox.app">TorBox</a> in about 30 seconds, with zero local storage.
-  Comes with a modern <strong>in-app discovery + request UI</strong> — no Seerr needed,
-  but Seerr/Jellyseerr webhooks still work if you want them.
+  Comes with a modern <strong>in-app discovery + request UI</strong> (no Seerr needed,
+  but Seerr/Jellyseerr webhooks still work if you want them).
 </p>
 
 <p>
@@ -34,14 +34,14 @@
 ---
 
 > [!WARNING]
-> **🚧 Work in progress — early days.** Mycelium is actively developed and not yet
+> **🚧 Work in progress (early days).** Mycelium is actively developed and not yet
 > battle-tested. Expect rough edges, breaking changes, and bugs. It's built and
 > primarily tested against one specific home setup (Synology NAS + Jellyfin + TorBox),
 > so things may not work out of the box in your environment yet. Defaults like server
-> IPs **must** be set via the setup wizard or `.env` — don't assume any value is
+> IPs **must** be set via the setup wizard or `.env`. Don't assume any value is
 > production-safe. Try it, kick the tires, and please
-> [open an issue](https://github.com/corveck79/mycelium/issues) if something breaks —
-> feedback at this stage is hugely helpful. Not recommended for unattended/critical use.
+> [open an issue](https://github.com/corveck79/mycelium/issues) if something breaks.
+> Feedback at this stage is hugely helpful. Not recommended for unattended/critical use.
 
 ---
 
@@ -68,7 +68,7 @@ Built for the **Jellyfin + TorBox + Synology NAS** stack. No FUSE, no rclone, no
 | | Path | Purpose |
 |--|--|--|
 | **Modern SPA** | `/app/` | Netflix-style poster grids, per-service browsing (Netflix/Prime/Disney+/…), multi-user, watchlist, request approval, Radarr/Sonarr bulk import |
-| **Classic dashboard** | `/ui` | Full operations console: repair, blacklist, settings, logs, overrides — keep this for power-user maintenance |
+| **Classic dashboard** | `/ui` | Full operations console: repair, blacklist, settings, logs, overrides. Keep this for power-user maintenance |
 
 ---
 
@@ -121,7 +121,7 @@ The name felt right. Mycelium.
 <details>
 <summary><b>📥 Auto-add + bulk import</b></summary>
 
-- **Auto-add categories**: trending (day/week), popular, top-rated, per-service top lists (Netflix NL Top 10, Prime NL, Disney NL) — configurable count per category, min rating, min votes
+- **Auto-add categories**: trending (day/week), popular, top-rated, per-service top lists (Netflix NL Top 10, Prime NL, Disney NL), configurable count per category, min rating, min votes
 - **Radarr / Sonarr bulk import**: point at an existing Radarr/Sonarr instance, pull all monitored movies/series in one click with live progress bar (added/skipped/errors)
 
 </details>
@@ -171,7 +171,7 @@ sequenceDiagram
 - **Daily DB backup**, 14 retained.
 - **Recovery wizard**: one-button repair pipeline.
 - **Library import**: rebuild DB from `.strm` files after disaster.
-- **Repair broken strm**: Admin → Maintenance → one-click repair for `.strm` files containing expired direct TorBox CDN URLs — relinks to catbox proxy or requeues for reprocessing.
+- **Repair broken strm**: Admin → Maintenance → one-click repair for `.strm` files containing expired direct TorBox CDN URLs. Relinks to catbox proxy or requeues for reprocessing.
 - **Failed request retry**: Requests page shows failed processing attempts with per-row manual retry button.
 - **Docker healthcheck** wired to `/health` so Synology auto-restarts on issues.
 
@@ -438,7 +438,7 @@ Most people should enable Catbox mode once they trust the setup.
 
 Yes, for **bulk migration**. Admin → Radarr/Sonarr import pulls your entire monitored library in one click and adds everything to Mycelium. Configure `RADARR_URL` + `RADARR_API_KEY` (and the Sonarr equivalents) in Settings, then use the import panel.
 
-For ongoing new-content requests Mycelium's built-in SPA or Seerr webhook is the primary path — it doesn't act as a download client for Radarr's automation loop.
+For ongoing new-content requests Mycelium's built-in SPA or Seerr webhook is the primary path. It doesn't act as a download client for Radarr's automation loop.
 </details>
 
 <details>
