@@ -7,6 +7,7 @@ import requests
 from config import (
     ALLOW_4K,
     AUDIO_LANGUAGE_PREFERENCE,
+    EXCLUDE_BLURAY,
     EXCLUDE_CAM,
     EXCLUDE_DV_P5,
     EXCLUDE_LANGUAGES,
@@ -36,6 +37,7 @@ _QUALITY_PATTERNS = {
 }
 
 _REMUX_RE = re.compile(r"\b(remux|bdremux)\b", re.IGNORECASE)
+_BLURAY_RE = re.compile(r"\b(bluray|blu-ray|bdrip|brrip)\b", re.IGNORECASE)
 _CAM_RE = re.compile(r"\b(cam|camrip|hdcam|ts|telesync|hdts|scr|screener|dvdscr|workprint|r5)\b", re.IGNORECASE)
 _WEBDL_RE = re.compile(r"\b(web-?dl|webrip|web)\b", re.IGNORECASE)
 _HEVC_RE  = re.compile(r"\b(hevc|x265|h\.?265)\b", re.IGNORECASE)
@@ -200,6 +202,7 @@ def rank_streams(
     allow_4k = _settings.get("ALLOW_4K", ALLOW_4K) if override.get("allow_4k") is None else bool(override["allow_4k"])
     prefer_hevc = _settings.get("PREFER_HEVC", PREFER_HEVC) if override.get("prefer_hevc") is None else bool(override["prefer_hevc"])
     exclude_remux = _settings.get("EXCLUDE_REMUX", EXCLUDE_REMUX)
+    exclude_bluray = _settings.get("EXCLUDE_BLURAY", EXCLUDE_BLURAY)
     exclude_dv_p5 = _settings.get("EXCLUDE_DV_P5", EXCLUDE_DV_P5)
     exclude_cam = _settings.get("EXCLUDE_CAM", EXCLUDE_CAM)
     strict_cam = _settings.get("STRICT_NO_CAM", False)
@@ -228,7 +231,14 @@ def rank_streams(
         if filtered:
             candidates = filtered
         else:
-            log.warning("Only remux/bluray candidates available; allowing them")
+            log.warning("Only remux candidates available; allowing them")
+
+    if exclude_bluray:
+        filtered = [s for s in candidates if not _BLURAY_RE.search(f"{s.name} {s.title}")]
+        if filtered:
+            candidates = filtered
+        else:
+            log.warning("Only BluRay candidates available; allowing them")
 
     if exclude_cam:
         filtered = [s for s in candidates if not _CAM_RE.search(f"{s.name} {s.title}")]

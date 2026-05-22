@@ -43,6 +43,7 @@ LISTEN_PORT = _env_int("LISTEN_PORT", 8088)
 QUALITY_PREFERENCE = [q.strip() for q in _env("QUALITY_PREFERENCE", "1080p,2160p,720p").split(",") if q.strip()]
 ALLOW_4K = _env("ALLOW_4K", "true").lower() in ("1", "true", "yes")
 EXCLUDE_REMUX = _env("EXCLUDE_REMUX", "true").lower() in ("1", "true", "yes")
+EXCLUDE_BLURAY = _env("EXCLUDE_BLURAY", "false").lower() in ("1", "true", "yes")
 EXCLUDE_CAM = _env("EXCLUDE_CAM", "true").lower() in ("1", "true", "yes")
 # Exclude Dolby Vision Profile 5 (single-layer, no HDR10 fallback). Profile 5
 # releases have DV/DoVi in the name but no HDR10 alongside — they fail direct
