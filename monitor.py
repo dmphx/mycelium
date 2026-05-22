@@ -155,13 +155,17 @@ def run_series_check() -> None:
             continue
         if not catbox_mode:
             usage = torbox.createtorrent_usage()
-            if usage["count"] >= torbox._CREATETORRENT_LIMIT - 2:
+            if usage["count"] >= torbox._CREATETORRENT_LIMIT_HOUR - 2:
                 log.info("Monitor: createtorrent budget low (%d/%d) — pausing episode retries",
-                         usage["count"], torbox._CREATETORRENT_LIMIT)
+                         usage["count"], torbox._CREATETORRENT_LIMIT_HOUR)
                 break
         try:
             _retry_episode(ep)
         except processor.RateLimited:
+            if catbox_mode:
+                log.info("Monitor: checkcached rate limited — waiting 60s then continuing")
+                import time; time.sleep(60)
+                continue
             log.info("Monitor: rate limited — pausing episode retries until next run")
             break
 
