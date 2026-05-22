@@ -144,6 +144,9 @@ def list_torrents(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
     for _ in range(20):  # max 20 pages = 20 000 items; guards against infinite loop
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"limit": limit, "offset": offset})
+        if resp.status_code == 403:
+            log.warning("TorBox mylist returned 403 - API key invalid or plan restriction")
+            return all_items
         resp.raise_for_status()
         payload = resp.json() or {}
         page = payload.get("data", []) or []
