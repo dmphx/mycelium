@@ -282,6 +282,8 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.warning("TorBox checkcached failed: %s", exc)
+        if "429" in str(exc):
+            raise RateLimited("checkcached 429")
         return set()
     data = (resp.json() or {}).get("data") or {}
     cached = {h.lower() for h in data.keys()}
