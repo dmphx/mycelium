@@ -123,7 +123,7 @@ The existing debrid-to-media-server toolchain kept breaking: Real-Debrid purged 
 <details>
 <summary><b>🪤 Catbox mode (lazy materialization) -- recommended, opt-in</b></summary>
 
-Inspired by [elfhosted's CatBox](https://docs.elfhosted.com/app/catbox/). Each `.strm` file contains a proxy URL (`/stream/<token>`) instead of a direct CDN link. When `CATBOX_PRELOAD=true` (default), the torrent is pre-warmed in TorBox in the background as soon as you add something — so first play is instant. The torrent is automatically released after `CATBOX_IDLE_MINUTES` of idle time (default 30 days). This means your Jellyfin library can be effectively unlimited without hitting TorBox storage limits.
+Inspired by [elfhosted's CatBox](https://docs.elfhosted.com/app/catbox/). Each `.strm` file contains a proxy URL (`/stream/<token>`) instead of a direct CDN link. When `CATBOX_PRELOAD=true` (default), Mycelium pre-warms the entry point in TorBox as soon as you add something: movies immediately, series starting from the first episode of what you requested. For series, each time you watch an episode the next one is automatically preloaded in the background (waterfall) so every episode starts instantly. The torrent is automatically released after `CATBOX_IDLE_MINUTES` of idle time (default 30 days). This means your Jellyfin library can be effectively unlimited without hitting TorBox storage limits.
 
 ```mermaid
 sequenceDiagram
@@ -444,7 +444,7 @@ Plex doesn't support `.strm` natively, but the optional WebDAV server (see above
 
 In **fixed strm** mode, each `.strm` contains a direct TorBox CDN URL. Simple, works even when Mycelium is down, but URLs expire after about 24 hours.
 
-In **Catbox mode** (`CATBOX_MODE=true`), each `.strm` contains a proxy URL (`/stream/<token>`). With `CATBOX_PRELOAD=true` the torrent is pre-warmed in TorBox in the background at add-time, so first play is instant. On playback Mycelium fetches a fresh CDN URL on demand, re-adding the torrent if needed. No URL rot, library size effectively unlimited, but playback requires Mycelium to be running.
+In **Catbox mode** (`CATBOX_MODE=true`), each `.strm` contains a proxy URL (`/stream/<token>`). With `CATBOX_PRELOAD=true` Mycelium pre-warms the entry point (movie or first episode of the requested season) at add-time so first play is instant. For series, each episode play triggers a background preload of the next episode (waterfall). On playback Mycelium fetches a fresh CDN URL on demand, re-adding the torrent if needed. No URL rot, library size effectively unlimited, but playback requires Mycelium to be running.
 
 Catbox mode is the recommended mode. Enable it via the Settings tab or setup wizard.
 </details>
