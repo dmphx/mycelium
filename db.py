@@ -1231,9 +1231,12 @@ def create_user(username: str, password_hash: str, role: str = "user",
                  quota_monthly: int = 0, auto_approve: bool = False) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO users (username, password_hash, role, quota_monthly, auto_approve)
-               VALUES (?, ?, ?, ?, ?)""",
-            (username, password_hash, role, quota_monthly, 1 if auto_approve else 0),
+            """INSERT INTO users
+               (username, password_hash, role, quota_monthly, auto_approve, webplayer_enabled)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (username, password_hash, role, quota_monthly,
+             1 if auto_approve else 0,
+             1 if role == "admin" else 0),
         )
         return cur.lastrowid
 
@@ -1252,14 +1255,14 @@ def get_user(user_id: int) -> dict | None:
 
 def list_users() -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute("SELECT id, username, role, quota_monthly, auto_approve, enabled, region, created_at, last_login FROM users ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id, username, role, quota_monthly, auto_approve, enabled, region, webplayer_enabled, created_at, last_login FROM users ORDER BY id").fetchall()
         return [dict(r) for r in rows]
 
 
 def update_user(user_id: int, **fields) -> None:
     if not fields:
         return
-    allowed = {"password_hash", "role", "quota_monthly", "auto_approve", "enabled", "region"}
+    allowed = {"password_hash", "role", "quota_monthly", "auto_approve", "enabled", "region", "webplayer_enabled"}
     cols = [k for k in fields if k in allowed]
     if not cols:
         return
