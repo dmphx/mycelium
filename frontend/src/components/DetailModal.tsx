@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, lazy, Suspense } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, tmdbImg } from '../api';
 import type { MediaType, TmdbItem, WatchlistItem } from '../types';
 import TrailerModal from './TrailerModal';
+import { usePlugins } from '../hooks/usePlugins';
+
+const PlayerModal = lazy(() => import('./PlayerModal'));
 
 export default function DetailModal({
   tmdbId,
@@ -36,10 +39,14 @@ export default function DetailModal({
     );
 
   const libStatus = detail?.library_status as string | undefined;
+  const { isLoaded } = usePlugins();
+  const { data: session } = useQuery({ queryKey: ['session'], queryFn: api.session });
+  const canPlay = isLoaded('webplayer') && (session?.user as any)?.webplayer_enabled;
 
   const [addStatus, setAddStatus] = useState<'idle' | 'adding' | 'added' | 'pending' | 'error'>(
     'idle',
   );
+  const [showPlayer, setShowPlayer] = useState(false);
 
   // TV monitoring scope
   const [showTrailer, setShowTrailer] = useState(false);
@@ -243,6 +250,16 @@ export default function DetailModal({
                     }
                     onAdd={() => addMutation.mutate()}
                   />
+                  {canPlay && (libStatus === 'available' || libStatus === 'success') && (
+                    <button
+                      type="button"
+                      onClick={() => setShowPlayer(true)}
+                      className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500
+                                 text-white font-semibold text-sm transition-colors"
+                    >
+                      ▶ Afspelen
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => watchlistMutation.mutate()}
@@ -374,6 +391,16 @@ export default function DetailModal({
       title={detail?.title || ''}
       onClose={() => setShowTrailer(false)}
     />
+    {showPlayer && detail?.imdb_id && (
+      <Suspense fallback={null}>
+        <PlayerModal
+          imdb_id={detail.imdb_id}
+          media_type={detail.media_type}
+          title={detail.title}
+          onClose={() => setShowPlayer(false)}
+        />
+      </Suspense>
+    )}
     </>
   );
 }

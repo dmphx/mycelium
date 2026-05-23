@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
+import { usePlugins } from '../hooks/usePlugins';
 
 export default function Admin() {
   const qc = useQueryClient();
@@ -11,6 +12,7 @@ export default function Admin() {
   const { data: users } = useQuery({ queryKey: ['users'], queryFn: api.users });
   const { data: session } = useQuery({ queryKey: ['session'], queryFn: api.session });
 
+  const { isLoaded } = usePlugins();
   const isBootstrap = !users?.users || users.users.length === 0;
 
   const approveMut = useMutation({
@@ -97,6 +99,7 @@ export default function Admin() {
                 <th className="text-left py-2 px-3">Role</th>
                 <th className="text-left py-2 px-3">Auto-approve</th>
                 <th className="text-left py-2 px-3">Enabled</th>
+                {isLoaded('webplayer') && <th className="text-left py-2 px-3">Web Player</th>}
                 <th className="text-left py-2 px-3">Last login</th>
                 <th className="text-right py-2 px-3">Action</th>
               </tr>
@@ -118,6 +121,14 @@ export default function Admin() {
                       onClick={() => updateMut.mutate({ id: u.id, fields: { enabled: !u.enabled } })}
                     />
                   </td>
+                  {isLoaded('webplayer') && (
+                    <td className="py-2 px-3">
+                      <Toggle
+                        on={u.webplayer_enabled}
+                        onClick={() => updateMut.mutate({ id: u.id, fields: { webplayer_enabled: !u.webplayer_enabled } })}
+                      />
+                    </td>
+                  )}
                   <td className="py-2 px-3 text-muted text-xs">{u.last_login || '—'}</td>
                   <td className="py-2 px-3 text-right">
                     {session?.user?.id !== u.id && (
