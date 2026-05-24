@@ -26,6 +26,8 @@
   <a href="#-why-mycelium">Why</a> ·
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-features">Features</a> ·
+  <a href="#-web-player">Web Player</a> ·
+  <a href="#-trakt">Trakt</a> ·
   <a href="#-architecture">Architecture</a> ·
   <a href="#-configuration">Configuration</a> ·
   <a href="#-plex-compatibility-opt-in">Plex</a> ·
@@ -170,6 +172,35 @@ sequenceDiagram
 
 </details>
 
+<details open>
+<summary><b>🎬 Web Player</b></summary>
+
+Stream directly in the browser — no Jellyfin required for quick playback.
+
+- Works in Chrome, Firefox, Safari, Edge and Android browsers
+- **Remux-only**: video is always copied (`-c:v copy`), zero NAS CPU
+- **Direct TorBox pipeline**: plays from your library or any cached torrent — no download wait
+- HEVC content served as fMP4 HLS (hardware decode in Chrome/Edge, native in Safari)
+- H.264 content served as mpegts HLS (universally supported)
+- Audio: AAC copy or automatic transcode from AC3 / DTS / TrueHD to AAC stereo
+- **Multi-audio**: language switching dropdown in the player
+- **4K SDR** allowed — same remux cost as 1080p, often smaller with HEVC
+- **HDR filtering**: blocked by release name and confirmed by ffprobe — automatically falls back to the next SDR candidate
+- **Seek-to-minute**: jump to any position even before FFmpeg has generated segments that far
+- **Subtitles**: extracts embedded text subs + OpenSubtitles fallback, loaded in parallel during startup *(experimental)*
+- Per-user opt-in via Admin → Users
+
+</details>
+
+<details>
+<summary><b>⭐ Trakt</b></summary>
+
+- Watched badges on posters in Discover and Library
+- Automatic scrobble on playback via the Web Player
+- Connect via Settings → Trakt (OAuth device flow, no redirect URI needed)
+
+</details>
+
 <details>
 <summary><b>🖥 UX</b></summary>
 
@@ -192,6 +223,8 @@ sequenceDiagram
 | `POST /webhook` | Jellyseerr / Overseerr request notifications |
 | `POST /torbox-webhook` | TorBox push notifications (skip polling) |
 | `GET /dav/...` | Optional read-only WebDAV server for Plex / Emby |
+| Web Player | Browser-native HLS streaming, zero NAS CPU (remux-only) |
+| Trakt | Watched state sync + scrobble via Web Player |
 | OpenSubtitles | Auto `.srt` per language (optional) |
 | Continue Watching | Prioritize next episodes via Jellyfin Resume API |
 | RealDebrid | Multi-debrid fallback for movies and season packs |
@@ -316,6 +349,7 @@ The full reference lives in [`.env.example`](.env.example). Key knobs:
 | `DISCORD_WEBHOOK_URL` | *(empty)* | Optional notification target |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(empty)* | Optional notification target |
 | `OPENSUBTITLES_API_KEY` | *(empty)* | Optional subtitle download |
+| `WEB_PLAYER_MAX_SIZE_GB` | `15` | Max release size for web player candidate selection |
 
 ---
 
@@ -455,6 +489,12 @@ Catbox mode is the recommended mode. Enable it via the Settings tab or setup wiz
 Yes, for **bulk migration**. Admin → Radarr/Sonarr import pulls your entire monitored library in one click and adds everything to Mycelium. Configure `RADARR_URL` + `RADARR_API_KEY` (and the Sonarr equivalents) in Settings, then use the import panel.
 
 For ongoing new-content requests Mycelium's built-in SPA or Seerr webhook is the primary path. It doesn't act as a download client for Radarr's automation loop.
+</details>
+
+<details>
+<summary><b>How does the Web Player differ from Jellyfin playback?</b></summary>
+
+The Web Player streams directly in your browser without going through Jellyfin. It picks a TorBox-cached or library release, remuxes it on-the-fly into HLS segments (video always copied, never transcoded), and plays it in an in-page video player. Useful for quick playback on a machine without the Jellyfin app, or for sharing with users who don't have Jellyfin access. HDR content is automatically skipped since browsers can't tone-map; it falls back to the best available SDR release.
 </details>
 
 <details>
