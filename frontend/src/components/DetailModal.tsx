@@ -85,6 +85,7 @@ export default function DetailModal({
 
   // TV monitoring scope
   const [showTrailer, setShowTrailer] = useState(false);
+  const [showPlayer, setShowPlayer] = useState(false);
   const [monitorMode, setMonitorMode] = useState<'all' | 'future' | 'selected'>('all');
   const [selectedSeasons, setSelectedSeasons] = useState<number[]>([]);
 

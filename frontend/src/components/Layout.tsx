@@ -10,6 +10,7 @@ const navItems = [
   { to: '/search', label: 'Search', icon: '🔍' },
   { to: '/requests', label: 'My Requests', icon: '📋' },
   { to: '/wanted', label: 'Wanted', icon: '⏳' },
+  { to: '/settings', label: 'Settings', icon: '🔌' },
 ];
 
 const adminItems = [
@@ -268,6 +269,7 @@ function Breadcrumb({ path }: { path: string }) {
     '/search': 'Search',
     '/requests': 'My Requests',
     '/wanted': 'Wanted',
+    '/settings': 'Settings',
     '/admin': 'Admin',
     '/manual': 'Manual',
     '/login': 'Sign in',
