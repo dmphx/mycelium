@@ -144,25 +144,29 @@ def get_job(job_id: str) -> PrepareJob | None:
 def _get_cdn_url(stream: torrentio.TorrentioStream) -> str | None:
     """Resolve a TorrentioStream to a TorBox CDN URL.
 
-    1. Check if TorBox already has the hash (instant).
-    2. If not, add the magnet and wait until ready.
-    Returns None on failure.
+    The caller guarantees that either:
+    - the hash is already in the user's TorBox library, OR
+    - TorBox has it cached (instant add).
+
+    We never wait for a full download here.
     """
     item = torbox.find_by_hash(stream.info_hash)
+
     if item is None:
-        log.info("web_player: adding magnet to TorBox hash=%s", stream.info_hash)
+        # Not in library yet — add it (instant because caller verified cache).
+        log.info("web_player: adding cached magnet hash=%s", stream.info_hash)
         try:
-            result = torbox.add_magnet(stream.magnet, reason="web_player")
+            result     = torbox.add_magnet(stream.magnet, reason="web_player")
+            torrent_id = (result or {}).get("torrent_id") or (result or {}).get("id")
         except torbox.RateLimited:
             log.warning("web_player: TorBox rate-limited on add_magnet")
             return None
-        torrent_id = (result or {}).get("torrent_id") or (result or {}).get("id")
-        item = torbox.wait_until_ready(stream.info_hash, timeout=600,
+        # Cached torrents become ready in seconds, not minutes.
+        item = torbox.wait_until_ready(stream.info_hash, timeout=60,
                                        torrent_id=torrent_id)
-    else:
-        if not torbox._is_ready(item):
-            item = torbox.wait_until_ready(stream.info_hash, timeout=600,
-                                           torrent_id=item.get("id"))
+    elif not torbox._is_ready(item):
+        item = torbox.wait_until_ready(stream.info_hash, timeout=60,
+                                       torrent_id=item.get("id"))
 
     if not item:
         return None
@@ -172,16 +176,13 @@ def _get_cdn_url(stream: torrentio.TorrentioStream) -> str | None:
     if not files:
         fresh = torbox.find_by_id(torrent_id)
         files = (fresh or {}).get("files") or []
-
     if not files:
         return None
 
-    # Pick the largest non-trailer video file.
+    # Pick the largest video file.
     _VIDEO_EXT = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts"}
-    videos = [f for f in files
-              if Path(f.get("name") or "").suffix.lower() in _VIDEO_EXT]
-    if not videos:
-        videos = files
+    videos  = [f for f in files
+               if Path(f.get("name") or "").suffix.lower() in _VIDEO_EXT] or files
     main    = max(videos, key=lambda f: f.get("size") or 0)
     file_id = main.get("id")
 
@@ -221,7 +222,31 @@ def _run_job(job: PrepareJob) -> None:
             job.error  = "No web-compatible version found. Use Jellyfin."
             return
 
-        best = candidates[0]
+        # Priority 1: already in user's TorBox library (instant CDN URL).
+        best = None
+        for c in candidates:
+            if torbox.find_by_hash(c.info_hash):
+                best = c
+                log.info("web_player: found in TorBox library hash=%s", c.info_hash)
+                break
+
+        # Priority 2: TorBox has it cached (instant add, no download wait).
+        if best is None:
+            hashes      = [c.info_hash for c in candidates]
+            cached_set  = torbox.check_cached(hashes)
+            by_hash     = {c.info_hash: c for c in candidates}
+            # Pick the highest-scored cached candidate (candidates already sorted).
+            for c in candidates:
+                if c.info_hash in cached_set:
+                    best = c
+                    log.info("web_player: TorBox-cached hash=%s", c.info_hash)
+                    break
+
+        if best is None:
+            job.status = JobStatus.ERROR
+            job.error  = "No instantly available version found. Use Jellyfin."
+            return
+
         log.info("web_player: selected %r hash=%s", best.title, best.info_hash)
 
         # Check for a live session keyed by info_hash (avoids re-probing).
