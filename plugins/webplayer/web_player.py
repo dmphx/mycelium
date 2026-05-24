@@ -35,26 +35,35 @@ _TEXT_SUB_CODECS  = {"subrip", "ass", "ssa", "webvtt", "mov_text", "srt"}
 
 def _web_score(stream: torrentio.TorrentioStream) -> int:
     blob = f"{stream.name} {stream.title}"
-    if torrentio._HEVC_RE.search(blob):  return -1
-    if stream.quality == "2160p":         return -1
-    if torrentio._DV_RE.search(blob):    return -1
+    if stream.quality == "2160p":          return -1   # 4K: too large + browser issues
+    if torrentio._DV_RE.search(blob):     return -1   # Dolby Vision: browser-incompatible
 
-    # Hard size cap: streaming huge files causes long waits before seeking works.
+    # Hard size cap — configurable, default 15 GB.
     max_gb = _settings.get("WEB_PLAYER_MAX_SIZE_GB", 15) or 15
     if 0 < stream.size_gb > max_gb:
         return -1
 
-    score = 0
-    if stream.quality == "1080p":                   score += 100
-    elif stream.quality == "720p":                  score += 50
-    if torrentio._WEBDL_RE.search(blob):            score += 40
-    if stream.seeders > 10:                         score += 10
+    is_hevc = bool(torrentio._HEVC_RE.search(blob))
 
-    # Strong size preference: smaller file = faster segmentation = better UX.
-    # Typical 1080p WEB-DL is 4-8 GB; remux/high-bitrate can reach 20+ GB.
-    if   0 < stream.size_gb <  4:  score += 40
-    elif stream.size_gb     <  8:  score += 25
-    elif stream.size_gb     < 12:  score += 10
+    score = 0
+    if stream.quality == "1080p":                     score += 100
+    elif stream.quality == "720p":                    score += 50
+    if torrentio._WEBDL_RE.search(blob):              score += 40
+    if stream.seeders > 10:                           score += 10
+
+    # Strong size preference: smaller = faster segmentation / transcoding.
+    # Series episodes in x265 can be 200-500 MB — perfect for streaming.
+    if   0 < stream.size_gb < 0.5:  score += 55
+    elif stream.size_gb     < 2:    score += 40
+    elif stream.size_gb     < 4:    score += 30
+    elif stream.size_gb     < 8:    score += 18
+    elif stream.size_gb     < 12:   score += 8
+
+    # HEVC needs software video transcoding (CPU-intensive).
+    # A tiny 300 MB episode still wins; a 10 GB HEVC movie does not.
+    if is_hevc:
+        penalty = max(5, min(50, int(stream.size_gb * 8)))
+        score -= penalty
 
     return score
 
@@ -194,13 +203,15 @@ def _run_job(job: PrepareJob) -> None:
         tmp_dir = PLAYER_TMP_DIR / token
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        multi_audio = len(file_info["audio_tracks"]) > 1
+        multi_audio     = len(file_info["audio_tracks"]) > 1
+        needs_transcode = (file_info.get("video_codec") or "").lower() in {"hevc", "h265", "av1", "vp9", "vp8"}
+        seg_timeout     = 180 if needs_transcode else SEGMENT_WAIT_TIMEOUT
         session = _start_hls(token, cdn_url, file_info, tmp_dir)
 
         # For multi-audio, _start_hls already waited for video segments.
-        # For single-audio, wait here as before.
+        # For single-audio, wait here. Allow more time when transcoding video.
         if not multi_audio:
-            if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT):
+            if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, seg_timeout):
                 session.proc.terminate()
                 job.status = JobStatus.ERROR
                 job.error  = "Timeout: FFmpeg produced no segments."
@@ -357,8 +368,21 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
                seek_offset: float = 0.0) -> HLSSession:
     """Start (or restart) HLS segmentation.  seek_offset > 0 does a fast
     keyframe seek in the input before beginning to generate segments."""
-    audio_tracks = file_info["audio_tracks"]
-    multi_audio  = len(audio_tracks) > 1
+    audio_tracks  = file_info["audio_tracks"]
+    multi_audio   = len(audio_tracks) > 1
+
+    # Decide whether video can be stream-copied or needs transcoding.
+    # HEVC / AV1 / VP9 are not natively supported in HLS mpegts by browsers;
+    # transcode to H.264 with ultrafast preset (good speed, acceptable quality).
+    _NEEDS_TRANSCODE = {"hevc", "h265", "av1", "vp9", "vp8"}
+    video_codec      = (file_info.get("video_codec") or "h264").lower()
+    needs_transcode  = video_codec in _NEEDS_TRANSCODE
+    v_enc            = (
+        ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+        if needs_transcode else ["-c:v", "copy"]
+    )
+    # Allow more time for first segments when encoding video.
+    seg_timeout = 180 if needs_transcode else SEGMENT_WAIT_TIMEOUT
 
     # -ss BEFORE -i = fast input seeking (jumps to nearest keyframe).
     input_args = (["-ss", f"{seek_offset:.3f}"] if seek_offset > 0 else []) + ["-i", cdn_url]
@@ -370,7 +394,7 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
 
         # Output 0: video-only
         cmd += [
-            "-map", "0:v:0", "-c:v", "copy",
+            "-map", "0:v:0", *v_enc,
             "-hls_time", "6", "-hls_list_size", "0",
             "-hls_flags", "independent_segments",
             "-hls_segment_type", "mpegts",
@@ -401,7 +425,8 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
                 str(tmp_dir / f"audio_{i}.m3u8"),
             ]
 
-        log.info("web_player: starting FFmpeg (multi-audio) for token=%s seek=%.1f", token, seek_offset)
+        log.info("web_player: starting FFmpeg (multi-audio%s) for token=%s seek=%.1f",
+                 "+transcode" if needs_transcode else "", token, seek_offset)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir,
@@ -411,7 +436,7 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
             _sessions[token] = session
 
         # Wait for video segments before writing master playlist
-        _wait_segments_pattern(tmp_dir, "seg_v*.ts", SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT)
+        _wait_segments_pattern(tmp_dir, "seg_v*.ts", SEGMENT_WAIT_COUNT, seg_timeout)
 
         # Write master.m3u8
         lines = ["#EXTM3U"]
@@ -441,14 +466,15 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
             "ffmpeg", "-y", *input_args,
             "-map", "0:v:0",
             *((["-map", "0:a:0"] + a_codec_args) if track else ["-an"]),
-            "-c:v", "copy",
+            *v_enc,
             "-hls_time", "6", "-hls_list_size", "0",
             "-hls_flags", "independent_segments",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(tmp_dir / "seg%05d.ts"),
             str(tmp_dir / "playlist.m3u8"),
         ]
-        log.info("web_player: starting FFmpeg (single-audio) for token=%s seek=%.1f", token, seek_offset)
+        log.info("web_player: starting FFmpeg (single-audio%s) for token=%s seek=%.1f",
+                 "+transcode" if needs_transcode else "", token, seek_offset)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir,
