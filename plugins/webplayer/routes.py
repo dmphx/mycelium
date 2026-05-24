@@ -42,28 +42,23 @@ def web_player_status(job_id: str):
     )
 
 
-@bp.get("/stream/<token>/hls/playlist.m3u8")
-def stream_hls_playlist(token: str):
-    s = web_player.get_session(token)
-    if not s:
-        abort(404)
-    s.touch()
-    return send_file(s.tmp_dir / "playlist.m3u8",
-                     mimetype="application/vnd.apple.mpegurl")
-
-
-@bp.get("/stream/<token>/hls/<segment>")
-def stream_hls_segment(token: str, segment: str):
-    if "/" in segment or not segment.endswith(".ts"):
+@bp.get("/stream/<token>/hls/<path:filename>")
+def stream_hls_file(token: str, filename: str):
+    """Serve any HLS file for a session (master.m3u8, playlist.m3u8, audio/video sub-playlists, .ts segments)."""
+    if "/" in filename:
         abort(400)
     s = web_player.get_session(token)
     if not s:
         abort(404)
-    p = s.tmp_dir / segment
+    p = s.tmp_dir / filename
     if not p.exists():
         abort(404)
     s.touch()
-    return send_file(p, mimetype="video/mp2t")
+    if filename.endswith(".m3u8"):
+        return send_file(p, mimetype="application/vnd.apple.mpegurl")
+    if filename.endswith(".ts"):
+        return send_file(p, mimetype="video/mp2t")
+    abort(400)
 
 
 @bp.get("/stream/<token>/subtitles")

@@ -181,13 +181,17 @@ def _run_job(job: PrepareJob) -> None:
         tmp_dir = PLAYER_TMP_DIR / token
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        multi_audio = len(file_info["audio_tracks"]) > 1
         session = _start_hls(token, cdn_url, file_info, tmp_dir)
 
-        if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT):
-            session.proc.terminate()
-            job.status = JobStatus.ERROR
-            job.error  = "Timeout: FFmpeg produced no segments."
-            return
+        # For multi-audio, _start_hls already waited for video segments.
+        # For single-audio, wait here as before.
+        if not multi_audio:
+            if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT):
+                session.proc.terminate()
+                job.status = JobStatus.ERROR
+                job.error  = "Timeout: FFmpeg produced no segments."
+                return
 
         threading.Thread(
             target=_extract_subtitles,
@@ -197,7 +201,8 @@ def _run_job(job: PrepareJob) -> None:
 
         job.status     = JobStatus.READY
         job.message    = "Ready"
-        job.stream_url = f"/stream/{token}/hls/playlist.m3u8"
+        job.stream_url = (f"/stream/{token}/hls/master.m3u8" if multi_audio
+                          else f"/stream/{token}/hls/playlist.m3u8")
 
     except Exception:
         log.exception("web_player: prepare job %s crashed", job.job_id)
@@ -276,49 +281,110 @@ def get_session(token: str) -> HLSSession | None:
         return _sessions.get(token)
 
 
+def _aac_args(track_index: int) -> list[str]:
+    return [f"-c:a:{track_index}", "aac",
+            f"-ar:{track_index}", _AAC_SAMPLE_RATE,
+            f"-ac:{track_index}", "2",
+            f"-b:a:{track_index}", "192k"]
+
+
 def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path) -> HLSSession:
-    audio_args: list[str] = []
-    for i, track in enumerate(file_info["audio_tracks"]):
-        audio_args += ["-map", f"0:a:{i}"]
-        if track["codec"] in _BROWSER_AUDIO_OK and track.get("channels", 2) <= 2:
-            # AAC stereo/mono: copy as-is
-            audio_args += [f"-c:a:{i}", "copy"]
-        else:
-            # Re-encode to AAC stereo at 48 kHz — required for mpegts HLS in browsers
-            audio_args += [
-                f"-c:a:{i}", "aac",
-                f"-ar:{i}", _AAC_SAMPLE_RATE,
-                f"-ac:{i}", "2",
-                f"-b:a:{i}", "192k",
+    audio_tracks = file_info["audio_tracks"]
+    multi_audio  = len(audio_tracks) > 1
+
+    if multi_audio:
+        # Multi-audio: video-only stream + separate audio stream per track,
+        # stitched together via a master.m3u8 so Hls.js can switch languages.
+        cmd = ["ffmpeg", "-y", "-i", cdn_url]
+
+        # Output 0: video-only
+        cmd += [
+            "-map", "0:v:0", "-c:v", "copy",
+            "-hls_time", "6", "-hls_list_size", "0",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(tmp_dir / "seg_v%05d.ts"),
+            str(tmp_dir / "video.m3u8"),
+        ]
+
+        # Output 1…N: one audio stream per track
+        for i, track in enumerate(audio_tracks):
+            codec_ok = track["codec"] in _BROWSER_AUDIO_OK and track.get("channels", 2) <= 2
+            a_codec = ["copy"] if codec_ok else _aac_args(0)[2:]  # 0-indexed inside this output
+            cmd += [
+                "-map", f"0:a:{i}", "-c:a:0", *a_codec,
+                "-hls_time", "6", "-hls_list_size", "0",
+                "-hls_flags", "independent_segments",
+                "-hls_segment_type", "mpegts",
+                "-hls_segment_filename", str(tmp_dir / f"seg_a{i}_%05d.ts"),
+                str(tmp_dir / f"audio_{i}.m3u8"),
             ]
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", cdn_url,
-        "-map", "0:v:0",
-        *audio_args,
-        "-c:v", "copy",
-        "-hls_time", "6",
-        "-hls_list_size", "0",
-        "-hls_flags", "independent_segments",
-        "-hls_segment_type", "mpegts",
-        "-hls_segment_filename", str(tmp_dir / "seg%05d.ts"),
-        str(tmp_dir / "playlist.m3u8"),
-    ]
-    log.info("web_player: starting FFmpeg for token=%s", token)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        log.info("web_player: starting FFmpeg (multi-audio) for token=%s", token)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir)
-    session.start_heartbeat()
-    with _sessions_lock:
-        _sessions[token] = session
+        session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir)
+        session.start_heartbeat()
+        with _sessions_lock:
+            _sessions[token] = session
+
+        # Wait for video segments before writing master playlist
+        _wait_segments_pattern(tmp_dir, "seg_v*.ts", SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT)
+
+        # Write master.m3u8
+        lines = ["#EXTM3U"]
+        default = "YES"
+        for i, track in enumerate(audio_tracks):
+            lang   = (track.get("language") or "und").lower()
+            name   = track.get("title") or lang.upper()
+            lines.append(
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",'
+                f'NAME="{name}",DEFAULT={default},LANGUAGE="{lang}",'
+                f'URI="audio_{i}.m3u8"'
+            )
+            default = "NO"
+        lines.append('#EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"')
+        lines.append("video.m3u8")
+        (tmp_dir / "master.m3u8").write_text("\n".join(lines) + "\n")
+
+    else:
+        # Single audio: classic combined video+audio mpegts
+        track = audio_tracks[0] if audio_tracks else None
+        if track and track["codec"] in _BROWSER_AUDIO_OK and track.get("channels", 2) <= 2:
+            a_codec_args = ["-c:a:0", "copy"]
+        else:
+            a_codec_args = _aac_args(0)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", cdn_url,
+            "-map", "0:v:0",
+            *((["-map", "0:a:0"] + a_codec_args) if track else ["-an"]),
+            "-c:v", "copy",
+            "-hls_time", "6", "-hls_list_size", "0",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(tmp_dir / "seg%05d.ts"),
+            str(tmp_dir / "playlist.m3u8"),
+        ]
+        log.info("web_player: starting FFmpeg (single-audio) for token=%s", token)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir)
+        session.start_heartbeat()
+        with _sessions_lock:
+            _sessions[token] = session
+
     return session
 
 
 def _wait_segments(tmp_dir: Path, count: int, timeout: float) -> bool:
+    return _wait_segments_pattern(tmp_dir, "seg*.ts", count, timeout)
+
+
+def _wait_segments_pattern(tmp_dir: Path, pattern: str, count: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if len(list(tmp_dir.glob("seg*.ts"))) >= count:
+        if len(list(tmp_dir.glob(pattern))) >= count:
             return True
         time.sleep(0.5)
     return False
