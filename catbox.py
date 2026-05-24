@@ -356,9 +356,13 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 db.update_virtual_torbox_id(token, torbox_id)
                 log.info("Catbox: %s added via stored magnet (id=%s)", item["title"], torbox_id)
         except Exception as exc:
-            is_429 = "429" in str(exc)
+            exc_str = str(exc)
+            is_rate_limited = (isinstance(exc, torbox.RateLimited)
+                               or "429" in exc_str or "403" in exc_str)
             log.warning("Catbox: stored-magnet re-add failed for %s: %s", item["title"], exc)
-            if is_429:
+            if is_rate_limited:
+                # 429 = rate limited; 403 = API key/plan issue — either way
+                # there is no point continuing to checkcached, it will also fail.
                 _fail_put(token, _FAIL_COOLDOWN_429_SEC)
                 if ckey:
                     db.update_playability_fail(ckey, REASON_TB_429)
