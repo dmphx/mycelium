@@ -41,14 +41,14 @@ TMDB_API_KEY = _env("TMDB_API_KEY", "")
 LISTEN_HOST = _env("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = _env_int("LISTEN_PORT", 8088)
 
-# Quality preferences — 1080p first, 4K fallback, 720p last resort.
+# Quality preferences  -  1080p first, 4K fallback, 720p last resort.
 QUALITY_PREFERENCE = [q.strip() for q in _env("QUALITY_PREFERENCE", "1080p,2160p,720p").split(",") if q.strip()]
 ALLOW_4K = _env("ALLOW_4K", "true").lower() in ("1", "true", "yes")
 EXCLUDE_REMUX = _env("EXCLUDE_REMUX", "true").lower() in ("1", "true", "yes")
 EXCLUDE_BLURAY = _env("EXCLUDE_BLURAY", "false").lower() in ("1", "true", "yes")
 EXCLUDE_CAM = _env("EXCLUDE_CAM", "true").lower() in ("1", "true", "yes")
 # Exclude Dolby Vision Profile 5 (single-layer, no HDR10 fallback). Profile 5
-# releases have DV/DoVi in the name but no HDR10 alongside — they fail direct
+# releases have DV/DoVi in the name but no HDR10 alongside  -  they fail direct
 # play on Jellyfin Android TV, Linux app, and most browser clients. Profile 8
 # (DV + HDR10) works fine because it has an HDR10 base layer as fallback.
 EXCLUDE_DV_P5 = _env("EXCLUDE_DV_P5", "true").lower() in ("1", "true", "yes")
@@ -73,6 +73,7 @@ TORBOX_POLL_INTERVAL_SEC = _env_int("TORBOX_POLL_INTERVAL_SEC", 2)
 TORBOX_POLL_TIMEOUT_SEC = _env_int("TORBOX_POLL_TIMEOUT_SEC", 600)
 
 WEBHOOK_SECRET = _env("WEBHOOK_SECRET", "")
+METRICS_TOKEN  = _env("METRICS_TOKEN", "")   # optional Bearer token for /metrics scraping
 
 DB_PATH = _env("DB_PATH", "/data/requests.db")
 
@@ -113,12 +114,12 @@ BLACKLIST_FAIL_THRESHOLD = _env_int("BLACKLIST_FAIL_THRESHOLD", 3)
 CATBOX_MODE = _env("CATBOX_MODE", "false").lower() in ("1", "true", "yes")
 # Externally reachable host for the proxy URL written into .strm files.
 # Example: http://192.168.1.50:8088 (must be reachable from Jellyfin).
-# No default — set this in the setup wizard or .env, or .strm files will be broken.
+# No default  -  set this in the setup wizard or .env, or .strm files will be broken.
 CATBOX_HOST = _env("CATBOX_HOST", "")
 CATBOX_IDLE_MINUTES = _env_int("CATBOX_IDLE_MINUTES", 1440)
 CATBOX_GC_INTERVAL_MINUTES = _env_int("CATBOX_GC_INTERVAL_MINUTES", 10)
 # True lazy materialization: on import, only verify the release is cached and
-# register a virtual .strm — defer createtorrent to first playback. Massively
+# register a virtual .strm  -  defer createtorrent to first playback. Massively
 # reduces createtorrent (60/hour) usage for large libraries. Movies only for now.
 CATBOX_LAZY_ADD = _env("CATBOX_LAZY_ADD", "false").lower() in ("1", "true", "yes")
 # Pre-add the torrent to TorBox in the background when a .strm is created,
@@ -182,7 +183,7 @@ OPENSUBTITLES_LANGUAGES = [l.strip().lower() for l in _env("OPENSUBTITLES_LANGUA
 CONTINUE_WATCHING_INTERVAL_MINUTES = _env_int("CONTINUE_WATCHING_INTERVAL_MINUTES", 60)
 
 # ── TorBox quota warning ──────────────────────────────────────────────────────
-# Disabled by default — TorBox paid plans don't have hard storage limits.
+# Disabled by default  -  TorBox paid plans don't have hard storage limits.
 # Set QUOTA_CHECK_INTERVAL_HOURS > 0 to enable.
 QUOTA_WARN_TORRENT_COUNT = _env_int("QUOTA_WARN_TORRENT_COUNT", 999999)
 QUOTA_WARN_SIZE_GB = _env_int("QUOTA_WARN_SIZE_GB", 999999)

@@ -12,11 +12,15 @@ Two flavours, both opt-in:
    accepted as authenticated. A network whitelist guards against
    header spoofing from non-proxy clients.
 
-Webhook, /health, /healthz and /metrics stay unauthenticated so external
-systems (Seerr, Synology Container Manager, Prometheus) keep working.
+Webhook, /health and /healthz stay unauthenticated so external systems
+(Seerr, Synology Container Manager) keep working.
+/metrics requires an admin session or a valid METRICS_TOKEN header.
+/dav uses HTTP Basic Auth against the Mycelium user database.
+/stream/ uses token-based access (token embedded in .strm files).
 """
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import hmac
@@ -35,14 +39,12 @@ _PUBLIC_PATHS = (
     "/torbox-webhook",
     "/health",
     "/healthz",
-    "/metrics",
     "/login",
     "/login/oidc",
     "/oidc/callback",
     "/logout",
     "/setup",
     "/setup/",
-    "/dav",
     "/stream/",
     "/assets",
     "/static",
@@ -247,6 +249,27 @@ def require_auth(view):
     return wrapped
 
 
+def _enforce_basic_auth():
+    """Return a 401 WWW-Authenticate challenge unless valid Basic Auth is provided."""
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8")
+            username, password = decoded.split(":", 1)
+            import db as _db
+            user = _db.get_user_by_username(username)
+            if user and user.get("enabled") and _verify_hashed(password, user.get("password_hash", "")):
+                return None
+        except Exception:
+            pass
+    from flask import Response
+    return Response(
+        "Authentication required",
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="Mycelium WebDAV"'},
+    )
+
+
 def install_before_request(app) -> None:
     """Apply auth as a before_request hook so every UI route is covered."""
     @app.before_request
@@ -258,8 +281,10 @@ def install_before_request(app) -> None:
         for prefix in _PUBLIC_PATHS:
             if path == prefix or path.startswith(prefix + "/") or path == prefix.rstrip("/"):
                 return None
-        if path.startswith("/dav") or path.startswith("/stream/"):
+        if path.startswith("/stream/"):
             return None
+        if path.startswith("/dav"):
+            return _enforce_basic_auth()
         if session.get("user"):
             return None
         proxy_user = _proxy_user()

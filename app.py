@@ -1,3 +1,4 @@
+import hmac
 import logging
 import re
 import threading
@@ -43,6 +44,7 @@ from config import (
     LISTEN_HOST,
     LISTEN_PORT,
     MERGE_VERSIONS_INTERVAL_HOURS,
+    METRICS_TOKEN,
     MONITOR_INTERVAL_HOURS,
     MOVIE_SYNC_INTERVAL_MINUTES,
     QUOTA_CHECK_INTERVAL_HOURS,
@@ -70,7 +72,7 @@ LITE_MODE: bool = (
     or _os.getenv("LITE_MODE", "").lower() in ("1", "true", "yes")
 )
 if LITE_MODE:
-    log.info("LITE_MODE enabled — heavy background schedulers and startup tasks disabled")
+    log.info("LITE_MODE enabled  -  heavy background schedulers and startup tasks disabled")
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 if cfg.AUTH_SESSION_SECRET == "mycelium-please-change-me":
@@ -79,6 +81,11 @@ if cfg.AUTH_SESSION_SECRET == "mycelium-please-change-me":
         "AUTH_SESSION_SECRET is still the default value. "
         "Set a random string in your environment for production use.",
         stacklevel=1,
+    )
+if not WEBHOOK_SECRET:
+    log.warning(
+        "WEBHOOK_SECRET is not set - webhook endpoints are unprotected. "
+        "Set WEBHOOK_SECRET in your environment to secure /webhook and /torbox-webhook."
     )
 app.secret_key = cfg.AUTH_SESSION_SECRET
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -90,12 +97,22 @@ from flask_wtf.csrf import CSRFProtect, generate_csrf
 _csrf = CSRFProtect(app)
 
 
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
+
+
 @app.context_processor
 def _inject_csrf_token():
     return {"csrf_token": generate_csrf}
 
 
-# Rate limiter — applied selectively to auth endpoints.
+# Rate limiter  -  applied selectively to auth endpoints.
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 limiter = Limiter(
@@ -212,7 +229,7 @@ def _start_scheduler() -> BackgroundScheduler:
         )
         log.info("Scheduled Seerr movie+series sync every %dm", MOVIE_SYNC_INTERVAL_MINUTES)
     elif MOVIE_SYNC_INTERVAL_MINUTES > 0:
-        log.info("Seerr sync skipped — SEERR_URL not configured (using SPA discovery instead)")
+        log.info("Seerr sync skipped  -  SEERR_URL not configured (using SPA discovery instead)")
 
     if STRM_GENERATOR_INTERVAL_HOURS > 0:
         scheduler.add_job(
@@ -352,7 +369,7 @@ def _start_scheduler() -> BackgroundScheduler:
         try:
             scheduler.modify_job(jid, max_instances=1)
         except Exception as exc:
-            # Job may not exist if a feature is disabled — that's expected.
+            # Job may not exist if a feature is disabled  -  that's expected.
             log.debug("modify_job(%s): %s", jid, exc)
 
     scheduler.start()
@@ -431,7 +448,7 @@ def _check_auth() -> None:
         # Deprecated: secret in query string leaks via access logs and proxy history.
         # Migrate to the X-Webhook-Secret header.
         log.warning("Webhook secret passed via ?secret= query param from %s"
-                    " — migrate to X-Webhook-Secret header", request.remote_addr)
+                    "  -  migrate to X-Webhook-Secret header", request.remote_addr)
     if provided != WEBHOOK_SECRET:
         log.warning("Rejected webhook with bad/missing secret from %s", request.remote_addr)
         abort(401)
@@ -441,7 +458,7 @@ def _check_auth() -> None:
 
 @app.get("/health")
 def health_simple():
-    """Liveness probe used by Docker HEALTHCHECK — process up + DB reachable."""
+    """Liveness probe used by Docker HEALTHCHECK  -  process up + DB reachable."""
     try:
         db.get_recent(1)
         return jsonify(status="ok")
@@ -451,7 +468,13 @@ def health_simple():
 
 @app.get("/metrics")
 def metrics_export():
-    """Prometheus scrape endpoint."""
+    """Prometheus scrape endpoint. Requires admin session or X-Metrics-Token header."""
+    if METRICS_TOKEN:
+        provided = request.headers.get("X-Metrics-Token") or request.args.get("metrics_token")
+        if not provided or not hmac.compare_digest(provided, METRICS_TOKEN):
+            abort(401)
+    elif not auth.is_admin():
+        abort(401)
     import metrics_prom
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
     metrics_prom.refresh_gauges()
@@ -551,6 +574,7 @@ def setup_wizard():
 
 
 @app.post("/setup/skip")
+@limiter.limit("10 per minute")
 def setup_skip():
     import settings as _settings
     _settings.set("SETUP_COMPLETE", True)
@@ -558,6 +582,7 @@ def setup_skip():
 
 
 @app.post("/setup/save")
+@limiter.limit("10 per minute")
 def setup_save():
     import settings as _settings
     saved = 0
@@ -576,6 +601,7 @@ def setup_save():
 
 
 @app.post("/setup/test/<kind>")
+@limiter.limit("20 per minute")
 def setup_test(kind: str):
     """Test a single integration using values posted from the wizard form."""
     f = request.form
@@ -655,7 +681,7 @@ def setup_test(kind: str):
             if r.status_code == 200:
                 data = r.json().get("data", {})
                 remaining = data.get("remaining_downloads", "?")
-                return jsonify(ok=True, detail=f"OK — {remaining} downloads remaining today")
+                return jsonify(ok=True, detail=f"OK  -  {remaining} downloads remaining today")
             return jsonify(ok=r.status_code < 400, detail=f"HTTP {r.status_code}")
 
         if kind == "zilean":
@@ -707,7 +733,7 @@ def ui_submit():
     seasons_raw = request.form.get("seasons", "1")
 
     if not re.fullmatch(r"tt\d{6,10}", imdb_id):
-        flash("Invalid IMDB ID — must be tt followed by 6-10 digits.", "err")
+        flash("Invalid IMDB ID  -  must be tt followed by 6-10 digits.", "err")
         return redirect(url_for("ui_dashboard"))
     if media_type not in ("movie", "series"):
         flash("Invalid media type.", "err")
@@ -769,28 +795,28 @@ def ui_logs():
 @app.post("/ui/run-cleanup")
 def ui_run_cleanup():
     threading.Thread(target=cleanup.run_cleanup, name="cleanup-manual", daemon=True).start()
-    flash("Cleanup scan started — check Repair tab for results", "ok")
+    flash("Cleanup scan started  -  check Repair tab for results", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/repair-all")
 def ui_repair_all():
     threading.Thread(target=cleanup.run_cleanup, name="repair-all-manual", daemon=True).start()
-    flash("Repair All started — check Repair tab for results", "ok")
+    flash("Repair All started  -  check Repair tab for results", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/refresh-images")
 def ui_refresh_images():
     threading.Thread(target=jellyfin.refresh_missing_images, name="jf-images", daemon=True).start()
-    flash("Jellyfin image refresh started — missing posters will be fetched", "ok")
+    flash("Jellyfin image refresh started  -  missing posters will be fetched", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/merge-series")
 def ui_merge_series():
     threading.Thread(target=cleanup.merge_series_duplicates, name="merge-series", daemon=True).start()
-    flash("Series merge started — duplicate folders will be consolidated", "ok")
+    flash("Series merge started  -  duplicate folders will be consolidated", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
@@ -800,7 +826,7 @@ def ui_generate_nfos():
         nfo_generator.generate_all()
         nfo_generator.fetch_local_images()
     threading.Thread(target=_run, name="nfo-manual", daemon=True).start()
-    flash("NFO + image download started — Jellyfin will pick up metadata on next scan", "ok")
+    flash("NFO + image download started  -  Jellyfin will pick up metadata on next scan", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
@@ -969,7 +995,7 @@ def ui_add_magnet():
         return redirect(url_for("ui_dashboard") + "#search")
     try:
         torbox.add_magnet(magnet, reason="manual")
-        flash("Magnet added to TorBox — rescan will create .strm shortly", "ok")
+        flash("Magnet added to TorBox  -  rescan will create .strm shortly", "ok")
         threading.Thread(target=strm_generator.run_and_refresh, name="strm-after-add", daemon=True).start()
     except Exception as exc:
         flash(f"Add failed: {exc}", "err")
@@ -1059,7 +1085,7 @@ def ui_api_re_resolve(token: str):
     if result.get("url"):
         return jsonify(ok=True, resolved=True, title=item["title"])
     return jsonify(ok=True, resolved=False, title=item["title"],
-                   hint="check logs — re-resolve attempted but no URL returned")
+                   hint="check logs  -  re-resolve attempted but no URL returned")
 
 
 @app.get("/ui/api/playability-state")
@@ -1204,14 +1230,14 @@ def _library_import_and_resolve():
 def ui_library_import():
     threading.Thread(target=_library_import_and_resolve,
                      name="lib-import", daemon=True).start()
-    flash("Library import started — check Logs for progress", "ok")
+    flash("Library import started  -  check Logs for progress", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/recovery")
 def ui_recovery():
     threading.Thread(target=recovery.run, name="recovery-wizard", daemon=True).start()
-    flash("Recovery wizard started — runs integrity check + cleanup + import + strm scan", "ok")
+    flash("Recovery wizard started  -  runs integrity check + cleanup + import + strm scan", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
@@ -1576,7 +1602,7 @@ def _kick_off_processing(title: str, imdb_id: str, media_type: str,
         except Exception as exc:
             log.warning("upsert_monitored_series failed: %s", exc)
             monitored = seasons or [1]
-        # 'future' mode: don't eagerly fetch the back-catalog — let the monitor
+        # 'future' mode: don't eagerly fetch the back-catalog  -  let the monitor
         # pick up episodes as they air. Eagerly process only for all/selected.
         process_seasons = [] if monitor_mode == "future" else monitored
         req = MediaRequest(title=title, media_type="series",
@@ -1734,7 +1760,7 @@ def ui_search_all_wanted():
         upgrader.recheck_wanted()
         monitor.run_series_check()
     threading.Thread(target=_run, name="wanted-search-all", daemon=True).start()
-    flash("Search all wanted started — this may take a while.", "info")
+    flash("Search all wanted started  -  this may take a while.", "info")
     return redirect(url_for("ui_dashboard") + "#wanted")
 
 
@@ -1889,7 +1915,7 @@ def ui_api_library_series_episodes():
 
 @app.get("/ui/api/torbox-quota")
 def ui_api_torbox_quota():
-    """createtorrent usage in the last hour, broken down by reason — explains
+    """createtorrent usage in the last hour, broken down by reason  -  explains
     why TorBox 429 rate limits are being hit."""
     return jsonify(torbox.createtorrent_usage())
 
