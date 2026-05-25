@@ -1,4 +1,16 @@
-# ── Stage 1: build the React + Vite frontend ─────────────────────────────────
+# ── Stage 1: compile Mycelium Spore interceptor ──────────────────────────────
+# Must be built against glibc (same ABI as Plex Media Server on Debian/Ubuntu).
+# python:3.12-slim is Debian bookworm - same as Plex's Docker image base.
+FROM python:3.12-slim AS spore-builder
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY spore/spore.c /build/
+RUN gcc -shared -fPIC -O2 -D_GNU_SOURCE -D_LARGEFILE64_SOURCE \
+        -o /build/mycelium_spore.so /build/spore.c \
+        -ldl -lpthread \
+    && strip /build/mycelium_spore.so
+
+# ── Stage 2: build the React + Vite frontend ─────────────────────────────────
 FROM node:22-alpine AS frontend
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json* ./
@@ -7,7 +19,7 @@ COPY frontend/ ./
 COPY plugins/ /plugins/
 RUN npm run build
 
-# ── Stage 2: Python runtime ──────────────────────────────────────────────────
+# ── Stage 3: Python runtime ──────────────────────────────────────────────────
 FROM python:3.12-slim
 
 ARG BUILD_VERSION=dev
@@ -33,8 +45,10 @@ COPY *.py ./
 COPY plugins/ ./plugins/
 COPY templates/ ./templates/
 COPY docs/ ./docs/
-# Built SPA from stage 1 (Vite writes to ../static/app relative to frontend/)
+# Built SPA from stage 2 (Vite writes to ../static/app relative to frontend/)
 COPY --from=frontend /static/app/ ./static/app/
+# Spore interceptor .so (inject into Plex via LD_PRELOAD)
+COPY --from=spore-builder /build/mycelium_spore.so ./spore/mycelium_spore.so
 
 EXPOSE 8088
 

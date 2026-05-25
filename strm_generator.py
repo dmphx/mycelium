@@ -1,5 +1,6 @@
 import logging
 import re
+import struct
 import threading
 import time
 from pathlib import Path
@@ -26,11 +27,11 @@ _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 _SITE_PREFIX_RE = re.compile(
     r'^(?:\[[^\]]*\]\s*|(?:www\.|https?://)\S+\s*|'
     r'(?:rutor|hidratorrents|warmachine|xtorrenty|superseed|byethost\d*|'
-    r'uindex|devil-torrents)\s*[\.\-]?\s*(?:info|org|pl|com|net)?\s*[-–—\s]*)+'
+    r'uindex|devil-torrents)\s*[\.\-]?\s*(?:info|org|pl|com|net)?\s*[-– - \s]*)+'
     , re.IGNORECASE,
 )
 # Strip leading Cyrillic block (keeps Latin title when torrent has both)
-_CYRILLIC_PREFIX_RE = re.compile(r'^[Ѐ-ӿ\s\(\)\[\]\.,\-–—«»]+')
+_CYRILLIC_PREFIX_RE = re.compile(r'^[Ѐ-ӿ\s\(\)\[\]\.,\-– - «»]+')
 _JUNK_RE = re.compile(
     r'\s*\b(?:2160[pi]?|4K|UHD|1080[pi]?|720[pi]?|480[pi]?|HDTV|WEB[-.]?DL|WEBRip|WEB\b|'
     r'BluRay|BDRip|DVDRip|REMUX|HEVC|x\.?265|x\.?264|AVC|H\.?26[45]|'
@@ -45,7 +46,7 @@ _TRAILER_RE = re.compile(
     r'behind[. _-]the[. _-]scenes|making[. _-]of|promo|teaser)\b',
     re.IGNORECASE,
 )
-_MIN_MOVIE_SIZE = 200 * 1024 * 1024  # 200 MB — anything smaller is likely a trailer/sample
+_MIN_MOVIE_SIZE = 200 * 1024 * 1024  # 200 MB  -  anything smaller is likely a trailer/sample
 
 
 def _is_video(name: str) -> bool:
@@ -321,12 +322,12 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
     if imdb_id:
         existing_items = db.get_virtual_items_by_imdb(imdb_id, media_type="movie")
         if existing_items:
-            log.info("create_lazy_movie_strm: virtual_item for %s already exists — skipping",
+            log.info("create_lazy_movie_strm: virtual_item for %s already exists  -  skipping",
                      imdb_id)
             return False
         existing = _find_movie_folder_by_imdb(imdb_id)
         if existing:
-            log.info("create_lazy_movie_strm: folder for %s already exists (%s) — skipping",
+            log.info("create_lazy_movie_strm: folder for %s already exists (%s)  -  skipping",
                      imdb_id, existing.name)
             return False
         folder = _canonical_movie_folder(imdb_id, fallback_title=title, fallback_year=year)
@@ -354,6 +355,7 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
     )
     written = _write_strm(path, catbox.proxy_url(token))
     if written:
+        _write_spore_stubs(path, token, folder, quality, size_gb)
         if imdb_id or tmdb_id:
             _write_nfo(path, imdb_id, tmdb_id)
         if imdb_id:
@@ -414,6 +416,7 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     )
     written = _write_strm(path, catbox.proxy_url(token))
     if written:
+        _write_spore_stubs(path, token, ep_name, quality, size_gb)
         if imdb_id:
             series_root = path.parent.parent
             tvshow_nfo = series_root / "tvshow.nfo"
@@ -441,6 +444,171 @@ def _norm_title(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', s.lower())  # alphanumeric only
 
 
+# ── Mycelium Spore: stub MKV generation ─────────────────────────────────────
+
+def _ebml_vint(n: int) -> bytes:
+    """Encode n as EBML variable-length integer (used for element sizes)."""
+    if n < 0x7F:
+        return bytes([0x80 | n])
+    if n < 0x3FFF:
+        return bytes([0x40 | (n >> 8), n & 0xFF])
+    if n < 0x1FFFFF:
+        return bytes([0x20 | (n >> 16), (n >> 8) & 0xFF, n & 0xFF])
+    return bytes([0x10 | (n >> 24), (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
+
+
+def _ebml_uint(n: int) -> bytes:
+    """Encode unsigned integer in minimum bytes."""
+    if n == 0:
+        return b'\x00'
+    result = []
+    while n > 0:
+        result.append(n & 0xFF)
+        n >>= 8
+    return bytes(reversed(result))
+
+
+def _ebml_el(id_bytes: bytes, data: bytes) -> bytes:
+    """Build an EBML element: raw ID bytes + VINT(size) + data."""
+    return id_bytes + _ebml_vint(len(data)) + data
+
+
+def make_stub_mkv(title: str, quality: str | None = None,
+                   duration_sec: float = 7200.0) -> bytes:
+    """Generate a minimal valid MKV file for Plex scanning.
+
+    Contains EBML header + Segment Info (title, duration) + one fake video
+    track (resolution derived from quality).  No Cluster = no actual video
+    data.  Plex scanner parses the Tracks element and indexes the file; the
+    Spore interceptor serves real bytes at playback time.
+    """
+    width, height = 1920, 1080
+    if quality:
+        q = quality.lower()
+        if '2160' in q or '4k' in q or 'uhd' in q:
+            width, height = 3840, 2160
+        elif '720' in q:
+            width, height = 1280, 720
+        elif '480' in q:
+            width, height = 854, 480
+
+    # EBML header
+    ebml_data = (
+        _ebml_el(b'\x42\x86', _ebml_uint(1)) +       # EBMLVersion
+        _ebml_el(b'\x42\xF7', _ebml_uint(1)) +       # EBMLReadVersion
+        _ebml_el(b'\x42\xF2', _ebml_uint(4)) +       # EBMLMaxIDLength
+        _ebml_el(b'\x42\xF3', _ebml_uint(8)) +       # EBMLMaxSizeLength
+        _ebml_el(b'\x42\x82', b'matroska') +          # DocType
+        _ebml_el(b'\x42\x87', _ebml_uint(4)) +       # DocTypeVersion
+        _ebml_el(b'\x42\x85', _ebml_uint(2))          # DocTypeReadVersion
+    )
+    ebml_header = _ebml_el(b'\x1A\x45\xDF\xA3', ebml_data)
+
+    # Segment Info
+    info_data = (
+        _ebml_el(b'\x2A\xD7\xB1', _ebml_uint(1_000_000)) +          # TimestampScale = 1ms
+        _ebml_el(b'\x44\x89', struct.pack('>d', duration_sec * 1000.0)) +  # Duration (float64)
+        _ebml_el(b'\x7B\xA9', title.encode('utf-8')) +                # Title
+        _ebml_el(b'\x4D\x80', b'Mycelium Spore') +                    # MuxingApp
+        _ebml_el(b'\x57\x41', b'Mycelium Spore')                      # WritingApp
+    )
+    info_el = _ebml_el(b'\x15\x49\xA9\x66', info_data)
+
+    # Video track entry
+    video_data = (
+        _ebml_el(b'\xB0', _ebml_uint(width)) +        # PixelWidth
+        _ebml_el(b'\xBA', _ebml_uint(height)) +       # PixelHeight
+        _ebml_el(b'\x54\xB0', _ebml_uint(width)) +   # DisplayWidth
+        _ebml_el(b'\x54\xBA', _ebml_uint(height))     # DisplayHeight
+    )
+    track_data = (
+        _ebml_el(b'\xD7', _ebml_uint(1)) +            # TrackNumber
+        _ebml_el(b'\x73\xC5', _ebml_uint(1)) +        # TrackUID
+        _ebml_el(b'\x83', _ebml_uint(1)) +            # TrackType = video
+        _ebml_el(b'\xB9', _ebml_uint(1)) +            # FlagEnabled
+        _ebml_el(b'\x88', _ebml_uint(1)) +            # FlagDefault
+        _ebml_el(b'\x86', b'V_MPEG4/ISO/AVC') +       # CodecID
+        _ebml_el(b'\xE0', video_data)                  # Video
+    )
+    tracks_el = _ebml_el(b'\x16\x54\xAE\x6B',
+                          _ebml_el(b'\xAE', track_data))
+
+    # Minimal empty Cluster (Timecode=0, no frames).
+    # Required so ffprobe / Plex scanner detect the video stream.
+    cluster_data = _ebml_el(b'\xE7', _ebml_uint(0))   # Timecode = 0
+    cluster_el   = _ebml_el(b'\x1F\x43\xB6\x75', cluster_data)
+
+    # Segment with known size (header + tracks + cluster)
+    segment_body = info_el + tracks_el + cluster_el
+    segment = b'\x18\x53\x80\x67' + b'\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF' + segment_body
+
+    return ebml_header + segment
+
+
+def _write_spore_stubs(strm_path: Path, token: str,
+                        title: str, quality: str | None,
+                        size_gb: float | None) -> None:
+    """Write .mkv stub and .minfo sidecar into a hidden .plex/ subfolder.
+
+    The .plex/ directory is invisible to Jellyfin (starts with '.') but
+    discoverable by Plex when its library is pointed at the same media path.
+    The Spore interceptor (.so) reads the .minfo to resolve CDN bytes.
+    """
+    if not settings.get("SPORE_ENABLED", cfg.SPORE_ENABLED):
+        return
+
+    plex_dir = strm_path.parent / ".plex"
+    mkv_path   = plex_dir / (strm_path.stem + ".mkv")
+    minfo_path = plex_dir / (strm_path.stem + ".minfo")
+
+    if mkv_path.exists() and minfo_path.exists():
+        return
+
+    try:
+        plex_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log.warning("Spore: could not create .plex dir %s: %s", plex_dir, exc)
+        return
+
+    # Write stub .mkv
+    if not mkv_path.exists():
+        try:
+            stub = make_stub_mkv(title, quality)
+            mkv_path.write_bytes(stub)
+            log.debug("Spore: wrote stub MKV %s (%d bytes)", mkv_path.name, len(stub))
+        except Exception as exc:
+            log.warning("Spore: could not write stub MKV %s: %s", mkv_path, exc)
+            return
+
+    # Write .minfo (token + cdn_size)
+    if not minfo_path.exists():
+        try:
+            size_bytes = int((size_gb or 0.0) * 1_000_000_000)
+            minfo_path.write_text(
+                f"token={token}\nsize={size_bytes}\n", encoding="utf-8"
+            )
+            log.debug("Spore: wrote .minfo %s (token=%s size=%d)",
+                      minfo_path.name, token, size_bytes)
+        except Exception as exc:
+            log.warning("Spore: could not write .minfo %s: %s", minfo_path, exc)
+
+
+def _delete_spore_stubs(strm_path: Path) -> None:
+    """Remove .mkv stub and .minfo for a given .strm path (if they exist)."""
+    plex_dir = strm_path.parent / ".plex"
+    for ext in (".mkv", ".minfo"):
+        stub = plex_dir / (strm_path.stem + ext)
+        try:
+            stub.unlink(missing_ok=True)
+        except Exception as exc:
+            log.warning("Spore: could not delete stub %s: %s", stub, exc)
+    # Remove .plex dir if now empty
+    try:
+        plex_dir.rmdir()
+    except OSError:
+        pass  # not empty or doesn't exist - both fine
+
+
 def _write_strm(path: Path, url: str) -> bool:
     """Write .strm file only if it doesn't exist. Returns True if a new file was written."""
     if path.exists():
@@ -453,7 +621,7 @@ def _write_strm(path: Path, url: str) -> bool:
         for existing in parent.iterdir():
             if existing.is_dir() and existing != path.parent and _norm_title(existing.name) == norm:
                 if any(existing.glob("*.strm")):
-                    log.info("Skipping duplicate strm %s — already have %s", path.parent.name, existing.name)
+                    log.info("Skipping duplicate strm %s  -  already have %s", path.parent.name, existing.name)
                     return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,14 +665,14 @@ def process_torrent(item: dict) -> int:
         return 0
 
     # In Catbox mode: if this hash is already registered and the strm still exists on disk,
-    # skip entirely — avoids creating a second folder with the torrent-parsed title
+    # skip entirely  -  avoids creating a second folder with the torrent-parsed title
     # when the movie was originally added with the TMDB title.
     if settings.get("CATBOX_MODE", False):
         info_hash = (item.get('hash') or '').lower()
         if info_hash:
             existing = db.get_virtual_item_by_hash(info_hash)
             if existing and existing.get('strm_path') and Path(existing['strm_path']).exists():
-                log.debug("process_torrent: %s already has strm at %s — skipping",
+                log.debug("process_torrent: %s already has strm at %s  -  skipping",
                           torrent_name, existing['strm_path'])
                 return 0
 
@@ -651,7 +819,7 @@ def create_movie_strm_from_url(title: str, url: str) -> Path | None:
 def _run_once_catbox() -> int:
     """Catbox mode: rebuild any .strm files that are missing from disk.
 
-    virtual_items is the source of truth — torrents are not in TorBox when
+    virtual_items is the source of truth  -  torrents are not in TorBox when
     idle-released, so scanning mylist would find nothing.
     """
     import catbox
@@ -721,7 +889,7 @@ def migrate_to_canonical_names() -> dict:
     import shutil
 
     if not _maintenance_lock.acquire(blocking=False):
-        log.warning("migrate_to_canonical_names: maintenance already running — skipping")
+        log.warning("migrate_to_canonical_names: maintenance already running  -  skipping")
         return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0, "no_imdb": 0}
     try:
         return _migrate_to_canonical_names_locked()
@@ -801,7 +969,7 @@ def _migrate_to_canonical_names_locked() -> dict:
         try:
             canonical = _canonical_movie_folder(imdb_id)
             if not canonical:
-                log.debug("migrate: no canonical name for %s — skipping", imdb_id)
+                log.debug("migrate: no canonical name for %s  -  skipping", imdb_id)
                 skipped += len(folders)
                 continue
 
@@ -813,7 +981,7 @@ def _migrate_to_canonical_names_locked() -> dict:
                     skipped += 1
                     continue
                 if canonical_path.exists():
-                    log.warning("migrate: target '%s' already exists for %s — skipping",
+                    log.warning("migrate: target '%s' already exists for %s  -  skipping",
                                 canonical, imdb_id)
                     skipped += 1
                     continue
@@ -832,11 +1000,11 @@ def _migrate_to_canonical_names_locked() -> dict:
                 # Rename best folder to canonical if needed
                 if keep.resolve() != canonical_path.resolve():
                     if canonical_path.exists():
-                        # canonical already exists — it might be one of the others
+                        # canonical already exists  -  it might be one of the others
                         if canonical_path in ordered:
                             keep = canonical_path
                         else:
-                            log.warning("migrate: canonical '%s' exists but isn't in group — skipping",
+                            log.warning("migrate: canonical '%s' exists but isn't in group  -  skipping",
                                         canonical)
                             skipped += len(folders)
                             continue
@@ -876,8 +1044,8 @@ def repair_expired_strms(media_type: str = "movie") -> dict:
     Three kinds of breakage handled:
     1. Movie folder exists but has NO .strm file at all (NFO/poster present,
        added via generate-nfos before processor ran or after .strm was lost).
-    2. Direct TorBox CDN URL in .strm — expired after ~24h.
-    3. Catbox proxy URL whose token is NOT in virtual_items DB — 404 on play.
+    2. Direct TorBox CDN URL in .strm  -  expired after ~24h.
+    3. Catbox proxy URL whose token is NOT in virtual_items DB  -  404 on play.
 
     Repair strategy for each broken item:
       a. If a virtual_item exists for that imdb_id → write/rewrite the .strm
@@ -887,7 +1055,7 @@ def repair_expired_strms(media_type: str = "movie") -> dict:
     Returns a summary dict with counts.
     """
     if not _maintenance_lock.acquire(blocking=False):
-        log.warning("repair_expired_strms: maintenance already running — skipping")
+        log.warning("repair_expired_strms: maintenance already running  -  skipping")
         return {"scanned": 0, "ok": 0, "missing_strm": 0, "orphaned_tokens": 0,
                 "relinked": 0, "requeued": 0, "skipped": 0}
     try:
@@ -965,7 +1133,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             continue
         strms = list(movie_dir.glob("*.strm"))
         if strms:
-            continue  # has at least one .strm — handled in pass 2
+            continue  # has at least one .strm  -  handled in pass 2
         # Skip if a sibling folder with the same normalised title already has a .strm.
         norm = _norm_title(movie_dir.name)
         if any(
@@ -974,13 +1142,13 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             and any(sib.glob("*.strm"))
             for sib in root.iterdir()
         ):
-            log.debug("repair_strms: skipping %s — duplicate of sibling with .strm", movie_dir.name)
+            log.debug("repair_strms: skipping %s  -  duplicate of sibling with .strm", movie_dir.name)
             skipped += 1
             continue
-        # No .strm — check if there's a .nfo we can use to requeue
+        # No .strm  -  check if there's a .nfo we can use to requeue
         imdb_id = _nfo_imdb(movie_dir)
         if not imdb_id:
-            log.debug("repair_strms: no .nfo imdb_id in %s — skipping", movie_dir.name)
+            log.debug("repair_strms: no .nfo imdb_id in %s  -  skipping", movie_dir.name)
             skipped += 1
             continue
         missing += 1
@@ -988,7 +1156,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
         if _relink(imdb_id, expected_strm):
             relinked += 1
         else:
-            log.info("repair_strms: no virtual_item for %s — requeuing", movie_dir.name)
+            log.info("repair_strms: no virtual_item for %s  -  requeuing", movie_dir.name)
             _requeue(imdb_id, movie_dir.name, None)
             requeued += 1
 
@@ -1001,7 +1169,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             skipped += 1
             continue
 
-        # Valid catbox proxy URL — verify token is in DB.
+        # Valid catbox proxy URL  -  verify token is in DB.
         if url.startswith(catbox_base):
             m = _re.search(r"/stream/([a-f0-9]{16})$", url)
             token = m.group(1) if m else None
@@ -1015,7 +1183,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
         movie_folder = strm_path.parent
         imdb_id = _nfo_imdb(movie_folder)
         if not imdb_id:
-            log.warning("repair_strms: no imdb_id for %s — skipping", strm_path)
+            log.warning("repair_strms: no imdb_id for %s  -  skipping", strm_path)
             skipped += 1
             continue
 
@@ -1041,7 +1209,7 @@ def cleanup_duplicate_strms() -> dict:
     Keeps the .strm whose stem matches the folder name; falls back to the one whose
     token has an imdb_id set in virtual_items."""
     if not _maintenance_lock.acquire(blocking=False):
-        log.warning("cleanup_duplicate_strms: maintenance already running — skipping")
+        log.warning("cleanup_duplicate_strms: maintenance already running  -  skipping")
         return {"scanned": 0, "cleaned": 0, "skipped": 0}
     try:
         return _cleanup_duplicate_strms_locked()
@@ -1144,7 +1312,7 @@ def _self_heal_sample(sample_size: int = 10) -> None:
             url = s.read_text(encoding="utf-8").strip()
         except Exception:
             continue
-        # Catbox proxy URLs always work — skip the probe
+        # Catbox proxy URLs always work  -  skip the probe
         if "/stream/" in url and url.startswith("http://"):
             continue
         try:

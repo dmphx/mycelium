@@ -384,6 +384,13 @@ scheduler = _start_scheduler()
 if not LITE_MODE:
     plugin_loader.register_jobs(scheduler)
 
+if cfg.SPORE_ENABLED:
+    try:
+        import spore_server
+        spore_server.start(port=cfg.SPORE_PORT)
+    except Exception as _spore_exc:
+        log.warning("Mycelium Spore server failed to start: %s", _spore_exc)
+
 if CATCHUP_ENABLED:
     catchup.schedule()
 

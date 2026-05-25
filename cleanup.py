@@ -162,10 +162,10 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
         log.debug("strm OK (torrent_id=%s): %s", torrent_id, path.name)
         return "ok"
 
-    # Torrent gone — try to repair
+    # Torrent gone  -  try to repair
     folder_name = path.parent.name
     title, year = _parse_folder_name(folder_name)
-    log.info("Broken strm: %s (torrent_id=%s) — searching replacement for '%s'",
+    log.info("Broken strm: %s (torrent_id=%s)  -  searching replacement for '%s'",
              path.name, torrent_id, title)
 
     imdb_id = _resolve_imdb(title, year, media_type)
@@ -211,13 +211,14 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
                 break
 
     if rate_limited:
-        log.warning("Rate limited by TorBox for '%s' — will retry next cleanup run", title)
+        log.warning("Rate limited by TorBox for '%s'  -  will retry next cleanup run", title)
         raise _RateLimitedError()
 
     if winner:
         try:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
+            strm_generator._delete_spore_stubs(path)
         except Exception:
             pass
         log.info("Repaired '%s': deleted strm, added new torrent %s", title, winner.info_hash)
@@ -228,6 +229,7 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
     log.warning("All replacement candidates failed for '%s'; marking unfixable", title)
     try:
         path.unlink()
+        strm_generator._delete_spore_stubs(path)
     except Exception:
         pass
     db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
@@ -294,10 +296,11 @@ def _remove_duplicates(strm_files: list[Path], run_id: int) -> tuple[int, list[P
                 continue
             try:
                 dup.unlink()
-                # Remove the sibling NFO sidecar so the folder can be emptied —
+                # Remove the sibling NFO sidecar so the folder can be emptied  -
                 # otherwise the leftover .nfo keeps the (now media-less) folder
                 # alive and Jellyfin may retain a ghost entry for it.
                 dup.with_suffix(".nfo").unlink(missing_ok=True)
+                strm_generator._delete_spore_stubs(dup)
                 log.info("Duplicate removed: %s (kept %s)", dup, keeper_names)
                 try:
                     dup.parent.rmdir()
@@ -341,8 +344,8 @@ def _regenerate_wrong_files(strm_files: list[Path], mylist: list[dict], run_id: 
         main = strm_generator._pick_main_movie_file(item.get("files") or [])
         if not main or str(main.get("id")) == file_id:
             continue
-        # Current strm points to a wrong/smaller file (likely trailer) — regenerate
-        log.info("Wrong file detected: %s (file_id=%s, should be %s) — regenerating",
+        # Current strm points to a wrong/smaller file (likely trailer)  -  regenerate
+        log.info("Wrong file detected: %s (file_id=%s, should be %s)  -  regenerating",
                  path.name, file_id, main.get("id"))
         new_url = strm_generator._get_stream_url(int(torrent_id), main["id"])
         if not new_url:
@@ -383,7 +386,7 @@ def remove_orphan_folders() -> int:
     """Delete movie/series folders that no longer contain any .strm file.
 
     After dedup/repair removes a .strm, leftover .nfo/poster files can keep an
-    otherwise media-less folder alive — Jellyfin then retains a ghost entry for
+    otherwise media-less folder alive  -  Jellyfin then retains a ghost entry for
     it. This sweep removes such folders entirely (and empty Season subfolders).
     Returns the number of folders removed.
     """
@@ -418,7 +421,7 @@ def remove_orphan_folders() -> int:
                 except Exception as exc:
                     log.warning("Could not remove orphan folder %s: %s", folder, exc)
                 continue
-            # Series still has episodes — prune empty season subfolders
+            # Series still has episodes  -  prune empty season subfolders
             for sub in folder.iterdir():
                 if sub.is_dir() and not any(sub.rglob("*.strm")):
                     try:
@@ -567,7 +570,7 @@ def rename_messy_series_folders() -> int:
 
         canonical_title = monitored.get(imdb_id)
         if not canonical_title:
-            # Not in monitored_series — ask TMDB for the official title
+            # Not in monitored_series  -  ask TMDB for the official title
             try:
                 tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
                 if tmdb_id:
@@ -764,7 +767,7 @@ def run_cleanup() -> None:
     try:
         mylist = torbox.list_torrents()
     except Exception as exc:
-        log.error("Cleanup: could not fetch TorBox mylist: %s — aborting", exc)
+        log.error("Cleanup: could not fetch TorBox mylist: %s  -  aborting", exc)
         db.update_cleanup_run(run_id, scanned, 0, 0, 0)
         return
 
@@ -791,7 +794,7 @@ def run_cleanup() -> None:
         try:
             result = _repair_strm(path, run_id, mylist)
         except _RateLimitedError:
-            log.warning("Cleanup: TorBox rate limit hit — stopping repairs for this run")
+            log.warning("Cleanup: TorBox rate limit hit  -  stopping repairs for this run")
             break
         time.sleep(2)
         if result == "repaired":
