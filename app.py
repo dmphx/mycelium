@@ -63,6 +63,15 @@ configure_logging()
 log_buffer.install()
 log = logging.getLogger("mycelium")
 
+import settings as _settings_mod
+import os as _os
+LITE_MODE: bool = (
+    _settings_mod.get("LITE_MODE", False)
+    or _os.getenv("LITE_MODE", "").lower() in ("1", "true", "yes")
+)
+if LITE_MODE:
+    log.info("LITE_MODE enabled — heavy background schedulers and startup tasks disabled")
+
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 if cfg.AUTH_SESSION_SECRET == "mycelium-please-change-me":
     import warnings
@@ -99,7 +108,8 @@ limiter = Limiter(
 db.init()
 
 import plugin_loader
-plugin_loader.load_all(app)
+if not LITE_MODE:
+    plugin_loader.load_all(app)
 
 import auth
 import oidc
@@ -180,14 +190,6 @@ def _start_scheduler() -> BackgroundScheduler:
         job_defaults={"jitter": 60, "coalesce": True, "max_instances": 1},
     )
 
-    if MERGE_VERSIONS_INTERVAL_HOURS > 0:
-        scheduler.add_job(
-            jellyfin.merge_duplicate_versions,
-            trigger="interval", hours=MERGE_VERSIONS_INTERVAL_HOURS,
-            id="merge_versions", next_run_time=None,
-        )
-        log.info("Scheduled MergeVersions every %dh", MERGE_VERSIONS_INTERVAL_HOURS)
-
     if MONITOR_INTERVAL_HOURS > 0:
         scheduler.add_job(
             monitor.run_series_check,
@@ -261,55 +263,64 @@ def _start_scheduler() -> BackgroundScheduler:
         )
         log.info("Scheduled retry queue every %dm", RETRY_QUEUE_INTERVAL_MINUTES)
 
-    if AUTO_UPGRADE_ENABLED and AUTO_UPGRADE_INTERVAL_HOURS > 0:
-        scheduler.add_job(
-            upgrader.run_auto_upgrade,
-            trigger="interval", hours=AUTO_UPGRADE_INTERVAL_HOURS,
-            id="auto_upgrade", next_run_time=None,
-        )
-        log.info("Scheduled auto-upgrade every %dh", AUTO_UPGRADE_INTERVAL_HOURS)
+    if not LITE_MODE:
+        if AUTO_UPGRADE_ENABLED and AUTO_UPGRADE_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                upgrader.run_auto_upgrade,
+                trigger="interval", hours=AUTO_UPGRADE_INTERVAL_HOURS,
+                id="auto_upgrade", next_run_time=None,
+            )
+            log.info("Scheduled auto-upgrade every %dh", AUTO_UPGRADE_INTERVAL_HOURS)
 
-    if SEASON_PACK_CONSOLIDATION_ENABLED and SEASON_PACK_CHECK_INTERVAL_HOURS > 0:
-        scheduler.add_job(
-            upgrader.run_pack_consolidation,
-            trigger="interval", hours=SEASON_PACK_CHECK_INTERVAL_HOURS,
-            id="pack_consolidation", next_run_time=None,
-        )
-        log.info("Scheduled season-pack consolidation every %dh", SEASON_PACK_CHECK_INTERVAL_HOURS)
+        if SEASON_PACK_CONSOLIDATION_ENABLED and SEASON_PACK_CHECK_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                upgrader.run_pack_consolidation,
+                trigger="interval", hours=SEASON_PACK_CHECK_INTERVAL_HOURS,
+                id="pack_consolidation", next_run_time=None,
+            )
+            log.info("Scheduled season-pack consolidation every %dh", SEASON_PACK_CHECK_INTERVAL_HOURS)
 
-    if getattr(cfg, "WANTED_RECHECK_INTERVAL_HOURS", 0) > 0:
-        scheduler.add_job(
-            upgrader.recheck_wanted,
-            trigger="interval", hours=cfg.WANTED_RECHECK_INTERVAL_HOURS,
-            id="wanted_recheck", next_run_time=None,
-        )
-        log.info("Scheduled wanted-movie recheck every %dh", cfg.WANTED_RECHECK_INTERVAL_HOURS)
+        if getattr(cfg, "WANTED_RECHECK_INTERVAL_HOURS", 0) > 0:
+            scheduler.add_job(
+                upgrader.recheck_wanted,
+                trigger="interval", hours=cfg.WANTED_RECHECK_INTERVAL_HOURS,
+                id="wanted_recheck", next_run_time=None,
+            )
+            log.info("Scheduled wanted-movie recheck every %dh", cfg.WANTED_RECHECK_INTERVAL_HOURS)
 
-    _auto_add_total = (
-        TRENDING_PRECACHE_COUNT
-        + getattr(cfg, "TRENDING_TV_COUNT", 0)
-        + getattr(cfg, "POPULAR_MOVIE_COUNT", 0)
-        + getattr(cfg, "POPULAR_TV_COUNT", 0)
-        + getattr(cfg, "NETFLIX_NL_TOP_COUNT", 0)
-        + getattr(cfg, "PRIME_NL_TOP_COUNT", 0)
-        + getattr(cfg, "DISNEY_NL_TOP_COUNT", 0)
-    )
-    if _auto_add_total > 0 and TRENDING_CHECK_INTERVAL_HOURS > 0:
-        scheduler.add_job(
-            trending.run,
-            trigger="interval", hours=TRENDING_CHECK_INTERVAL_HOURS,
-            id="trending_precache", next_run_time=None,
+        _auto_add_total = (
+            TRENDING_PRECACHE_COUNT
+            + getattr(cfg, "TRENDING_TV_COUNT", 0)
+            + getattr(cfg, "POPULAR_MOVIE_COUNT", 0)
+            + getattr(cfg, "POPULAR_TV_COUNT", 0)
+            + getattr(cfg, "NETFLIX_NL_TOP_COUNT", 0)
+            + getattr(cfg, "PRIME_NL_TOP_COUNT", 0)
+            + getattr(cfg, "DISNEY_NL_TOP_COUNT", 0)
         )
-        log.info("Scheduled auto-add every %dh (total slots: %d)",
-                 TRENDING_CHECK_INTERVAL_HOURS, _auto_add_total)
+        if _auto_add_total > 0 and TRENDING_CHECK_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                trending.run,
+                trigger="interval", hours=TRENDING_CHECK_INTERVAL_HOURS,
+                id="trending_precache", next_run_time=None,
+            )
+            log.info("Scheduled auto-add every %dh (total slots: %d)",
+                     TRENDING_CHECK_INTERVAL_HOURS, _auto_add_total)
 
-    if CONTINUE_WATCHING_INTERVAL_MINUTES > 0:
-        scheduler.add_job(
-            continue_watching.prioritize_next_episodes,
-            trigger="interval", minutes=CONTINUE_WATCHING_INTERVAL_MINUTES,
-            id="continue_watching", next_run_time=None,
-        )
-        log.info("Scheduled continue-watching priority every %dm", CONTINUE_WATCHING_INTERVAL_MINUTES)
+        if CONTINUE_WATCHING_INTERVAL_MINUTES > 0:
+            scheduler.add_job(
+                continue_watching.prioritize_next_episodes,
+                trigger="interval", minutes=CONTINUE_WATCHING_INTERVAL_MINUTES,
+                id="continue_watching", next_run_time=None,
+            )
+            log.info("Scheduled continue-watching priority every %dm", CONTINUE_WATCHING_INTERVAL_MINUTES)
+
+        if MERGE_VERSIONS_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                jellyfin.merge_duplicate_versions,
+                trigger="interval", hours=MERGE_VERSIONS_INTERVAL_HOURS,
+                id="merge_versions", next_run_time=None,
+            )
+            log.info("Scheduled MergeVersions every %dh", MERGE_VERSIONS_INTERVAL_HOURS)
 
     if QUOTA_CHECK_INTERVAL_HOURS > 0:
         scheduler.add_job(
@@ -349,7 +360,8 @@ def _start_scheduler() -> BackgroundScheduler:
 
 
 scheduler = _start_scheduler()
-plugin_loader.register_jobs(scheduler)
+if not LITE_MODE:
+    plugin_loader.register_jobs(scheduler)
 
 if CATCHUP_ENABLED:
     catchup.schedule()
@@ -2046,6 +2058,8 @@ def _spa_index():
 @app.get("/")
 def root_index():
     import settings as _settings
+    if LITE_MODE:
+        return redirect(url_for("ui_dashboard"))
     if not _settings.get("SETUP_COMPLETE", False):
         return redirect(url_for("setup_wizard"))
     return _spa_index()

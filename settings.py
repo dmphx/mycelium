@@ -38,6 +38,7 @@ _BOOL_KEYS = {
     "WEBDAV_ENABLED",
     "AUTH_ENABLED",
     "TRUSTED_PROXY_AUTH",
+    "LITE_MODE",
 }
 _LIST_KEYS = {
     "QUALITY_PREFERENCE",
@@ -220,6 +221,11 @@ SETTING_GROUPS = [
             "MERGE_VERSIONS_INTERVAL_HOURS", "BACKUP_INTERVAL_HOURS",
             "RETRY_QUEUE_INTERVAL_MINUTES", "CONTINUE_WATCHING_INTERVAL_MINUTES",
         ],
+    },
+    {
+        "id": "mode",
+        "title": "Deployment mode (restart required)",
+        "keys": ["LITE_MODE"],
     },
 ]
 
