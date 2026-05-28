@@ -43,16 +43,21 @@ if [ "$spore_replaced" = "1" ]; then
         preferred_audio=$(grep "^preferred_audio=" "$spore_minfo" | head -1 | cut -d= -f2)
     fi
     if [ -n "$preferred_audio" ] && [ "$preferred_audio" != "0" ]; then
+        # Plex routes audio through filter_complex as "[0:N]" where N is the global
+        # stream index of the audio track in the input file (stub stream index).
+        # The stub always has 1 video track (0:0) so the first audio is at 0:1.
+        # In the CDN file the same index 0:1 holds TrueHD; the EAC3 fallback is at
+        # 0:(1+preferred_audio). Replace the filter_complex input reference only —
+        # do NOT touch -map 0:N or -codec:N args (those are output stream indices).
+        stub_audio_idx=1
+        cdn_preferred_idx=$((stub_audio_idx + preferred_audio))
         remapped=()
         for arg in "${newargs[@]}"; do
-            if [[ "$arg" == "0:a:0" ]]; then
-                echo "SPORE-WRAP: remapping 0:a:0 -> 0:a:${preferred_audio} (avoid TrueHD)" >&2
-                remapped+=("0:a:${preferred_audio}")
-            else
-                remapped+=("$arg")
-            fi
+            arg="${arg//\[0:${stub_audio_idx}\]/[0:${cdn_preferred_idx}]}"
+            remapped+=("$arg")
         done
         newargs=("${remapped[@]}")
+        echo "SPORE-WRAP: remapped filter_complex [0:${stub_audio_idx}] -> [0:${cdn_preferred_idx}] (avoid TrueHD)" >&2
     fi
 
     # Insert before the last argument (output file or last option).
