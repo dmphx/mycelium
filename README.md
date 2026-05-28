@@ -18,7 +18,9 @@
   typically under 30 seconds for cached releases, with zero local storage.<br>
   Inspired by <a href="https://docs.elfhosted.com/app/catbox/">elfhosted CatBox</a>:
   torrents are added on-demand at playback, released after idle time.
-  Your library can be as large as you want.
+  Your library can be as large as you want.<br>
+  Also includes <strong>Mycelium Spore</strong> — a custom-built Plex integration that streams
+  directly from TorBox CDN without rclone, FUSE, or local storage. <em>(experimental)</em>
 </p>
 
 <p>
@@ -415,14 +417,7 @@ CatBox is a managed hosting service. Mycelium runs on your own hardware with you
 <details>
 <summary><b>How does Plex work?</b></summary>
 
-Enable `WEBDAV_ENABLED=true`, then mount the WebDAV share on your host:
-
-```bash
-sudo mkdir -p /volume1/mycelium-library
-sudo mount -t davfs http://localhost:8088/dav /volume1/mycelium-library
-```
-
-Add to `/etc/fstab` for auto-remount, then point Plex at `/volume1/mycelium-library`. Plex sees virtual `.mkv` files; on read Mycelium streams bytes from TorBox CDN with Range support.
+Use **Mycelium Spore** — see the [Spore section](#-mycelium-spore-experimental--work-in-progress) for setup. No rclone or FUSE required.
 </details>
 
 <details>
