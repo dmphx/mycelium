@@ -13,7 +13,7 @@ echo "$(date '+%H:%M:%S') WRAP started" >> "$SPORE_LOG"
 # (known Plex bug). Discover and export it here as a fallback so EAE can init.
 echo "$(date '+%H:%M:%S') WRAP EAE_ROOT=${EAE_ROOT:-(not set)}" >> "$SPORE_LOG"
 if [ -z "$EAE_ROOT" ]; then
-    _eae_dir=$(find /tmp /var/tmp -maxdepth 5 -type d \
+    _eae_dir=$(find /tmp /var/tmp /run -maxdepth 6 -type d \
         \( -name "EasyAudioEncoder" -o -name "*EAE*" \) 2>/dev/null | head -1)
     if [ -n "$_eae_dir" ]; then
         export EAE_ROOT="$_eae_dir"
