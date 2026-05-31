@@ -69,10 +69,20 @@ class TorrentioStream:
     is_season_pack: bool
     languages: tuple[str, ...] = ()
     source: str = "torrentio"
+    # Usenet support: when protocol == "usenet", `info_hash` is a synthetic
+    # dedup key (sha1 of the NZB URL) and `nzb_url` is the HTTP(S) URL TorBox
+    # will fetch via /usenet/createusenetdownload. For torrents these stay
+    # at default and the existing magnet flow is used.
+    protocol: str = "torrent"
+    nzb_url: str | None = None
 
     @property
     def magnet(self) -> str:
         return f"magnet:?xt=urn:btih:{self.info_hash}"
+
+    @property
+    def is_usenet(self) -> bool:
+        return self.protocol == "usenet"
 
     @property
     def size(self) -> str:
