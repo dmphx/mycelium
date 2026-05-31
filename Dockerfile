@@ -27,10 +27,14 @@ WORKDIR /app
 
 # gosu lets the entrypoint drop privileges to the mapped UID/GID after fixing
 # ownership on /data; ffmpeg is required for stub MKV generation.
+# Note: the build-time UID/GID are arbitrary (8088). At runtime the entrypoint
+# remaps them to PUID/PGID (default 99/100 for Unraid) with usermod -o /
+# groupmod -o so duplicate IDs against base-image groups (Debian uses GID 100
+# for "users") are not a conflict.
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 100 mycgrp \
-    && useradd -u 99 -g 100 -m -s /bin/sh mycelium \
+    && groupadd -g 8088 mycgrp \
+    && useradd -u 8088 -g 8088 -m -s /bin/sh mycelium \
     && mkdir -p /data && chown -R mycelium:mycgrp /data /app
 
 COPY requirements.txt .

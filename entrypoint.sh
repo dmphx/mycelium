@@ -10,8 +10,8 @@ set -eu
 PUID="${PUID:-99}"
 PGID="${PGID:-100}"
 
-current_uid="$(id -u mycelium 2>/dev/null || echo 99)"
-current_gid="$(getent group mycgrp | cut -d: -f3 2>/dev/null || echo 100)"
+current_uid="$(id -u mycelium 2>/dev/null || echo 8088)"
+current_gid="$(getent group mycgrp | cut -d: -f3 2>/dev/null || echo 8088)"
 
 if [ "$current_gid" != "$PGID" ]; then
     groupmod -g "$PGID" -o mycgrp
