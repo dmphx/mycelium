@@ -112,7 +112,15 @@ _recent_lock = threading.Lock()
 
 def _is_scan_burst(token: str) -> bool:
     """Record this token request and report whether we appear to be inside a
-    library-scan burst (many distinct tokens within the recent window)."""
+    library-scan burst (many distinct tokens within the recent window).
+
+    Only counts tokens that actually exist in the virtual_items table so an
+    attacker (or noisy probe) hitting /stream/<random> repeatedly cannot
+    trip the burst threshold and force legitimate playbacks to be treated
+    as scans.
+    """
+    if not db.get_virtual_item(token):
+        return False
     now = time.monotonic()
     with _recent_lock:
         for t, ts in list(_recent_tokens.items()):
