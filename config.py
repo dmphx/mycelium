@@ -250,6 +250,11 @@ OIDC_CLIENT_SECRET = _env("OIDC_CLIENT_SECRET", "")
 OIDC_SCOPES = _env("OIDC_SCOPES", "openid email profile")
 OIDC_USER_CLAIM = _env("OIDC_USER_CLAIM", "preferred_username")
 OIDC_PROVIDER_NAME = _env("OIDC_PROVIDER_NAME", "SSO")
+# Name of the OIDC `groups` claim entry that grants admin role on first login.
+# Membership is re-evaluated on every login: dropping out of the group demotes
+# the DB user to role='user' on the next sign-in.
+OIDC_GROUPS_CLAIM = _env("OIDC_GROUPS_CLAIM", "groups")
+OIDC_ADMIN_GROUP  = _env("OIDC_ADMIN_GROUP", "admins")
 
 
 def configure_logging() -> None:

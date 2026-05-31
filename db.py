@@ -1326,6 +1326,43 @@ def update_user(user_id: int, **fields) -> None:
         conn.execute(sql, vals)
 
 
+def upsert_oidc_user(username: str, role: str = "user") -> int:
+    """Provision (or refresh) an OIDC-authenticated user.
+
+    Creates the row on first sign-in with a sentinel password hash that
+    cannot pass the scrypt verifier (so the local password fallback can't
+    impersonate them), and updates the role on subsequent sign-ins so
+    changes to the upstream groups claim take effect immediately.
+    """
+    with _connect() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE users SET role=?, enabled=1, auth_source='oidc' "
+                "WHERE id=? AND COALESCE(role, '') <> ?",
+                (role, row["id"], role),
+            )
+            return int(row["id"])
+        # Sentinel hash: not a valid scrypt$ prefix, so _verify_hashed always
+        # returns False. The OIDC flow never touches password_hash again.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "auth_source" in cols:
+            cur = conn.execute(
+                """INSERT INTO users (username, password_hash, role,
+                                       quota_monthly, auto_approve, enabled, auth_source)
+                   VALUES (?, ?, ?, 0, 1, 1, 'oidc')""",
+                (username, "oidc$" + "x" * 16, role),
+            )
+        else:
+            cur = conn.execute(
+                """INSERT INTO users (username, password_hash, role,
+                                       quota_monthly, auto_approve, enabled)
+                   VALUES (?, ?, ?, 0, 1, 1)""",
+                (username, "oidc$" + "x" * 16, role),
+            )
+        return int(cur.lastrowid)
+
+
 def touch_user_login(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("UPDATE users SET last_login=strftime('%Y-%m-%d %H:%M:%S','now') WHERE id=?",
