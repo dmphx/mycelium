@@ -12,6 +12,11 @@ services:
     environment:
       - LISTEN_HOST=0.0.0.0
       - LISTEN_PORT=8088
+      # WARNING: opens the dashboard to anyone who reaches port 8088.
+      # Acceptable for local development on a trusted LAN. For any deploy
+      # reachable beyond localhost, remove this line and configure one of
+      # AUTH_ENABLED, OIDC_ENABLED, or TRUSTED_PROXY_AUTH instead.
+      - INSECURE_ALLOW_ANON=true
     devices:
       - /dev/dri:/dev/dri
     group_add:
