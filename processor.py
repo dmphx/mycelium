@@ -224,10 +224,9 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
             log.info("Lazy: no cached torrent for %s  -  submitting NZB from %s",
                      req.title, best_nzb.source)
             try:
-                torbox.add_nzb(best_nzb.nzb_url, name=best_nzb.title,
-                               reason="processor-lazy-nzb")
-                # Same lazy-register path as the cached-torrent branch, but the
-                # magnet/info_hash slots carry the synthetic NZB key.
+                result = torbox.add_nzb(best_nzb.nzb_url, name=best_nzb.title,
+                                         reason="processor-lazy-nzb")
+                usenet_id = (result or {}).get("id")
                 year = strm_generator._extract_year(best_nzb.name) \
                     or strm_generator._extract_year(best_nzb.title)
                 if strm_generator.create_lazy_movie_strm(
@@ -235,9 +234,11 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
                     imdb_id=req.imdb_id, tmdb_id=getattr(req, 'tmdb_id', None),
                     quality=best_nzb.quality, source=best_nzb.source,
                     size_gb=best_nzb.size_gb,
+                    protocol="usenet", nzb_url=best_nzb.nzb_url,
+                    usenet_id=usenet_id,
                 ):
-                    log.info("Lazy-registered NZB %s (%s, %s)  -  TorBox downloading",
-                             req.title, best_nzb.quality, best_nzb.source)
+                    log.info("Lazy-registered NZB %s (%s, %s, usenet_id=%s)",
+                             req.title, best_nzb.quality, best_nzb.source, usenet_id)
                     return best_nzb
             except torbox.RateLimited:
                 log.warning("createusenet budget exhausted for %s  -  marking wanted",

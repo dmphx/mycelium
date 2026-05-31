@@ -166,7 +166,17 @@ def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
             return payload.get("data", {}) or {}
         raise RuntimeError(f"Torbox usenet add failed: {payload}")
     result = payload.get("data", {}) or {}
-    log.info("Torbox createusenetdownload response: %s", payload.get("detail") or result)
+    # Normalize: surface the new id under both "id" and "usenet_id" so callers
+    # don't have to care about the exact response key.
+    if isinstance(result, dict):
+        uid = result.get("usenet_download_id") or result.get("id")
+        if uid is not None:
+            result.setdefault("id", uid)
+            result.setdefault("usenet_id", uid)
+    invalidate_usenet_mylist_cache()
+    log.info("Torbox createusenetdownload response: %s (id=%s)",
+             payload.get("detail") or result,
+             result.get("id") if isinstance(result, dict) else None)
     return result
 
 
@@ -249,6 +259,96 @@ def find_by_id(torrent_id: int, timeout: int = 15) -> dict | None:
                     return item
     except requests.RequestException as exc:
         log.warning("TorBox find_by_id(%s) failed: %s", torrent_id, exc)
+    return None
+
+
+# ── Usenet helpers ───────────────────────────────────────────────────────────
+# TorBox's /usenet/* endpoints mirror /torrents/* 1:1 (same field names,
+# same readiness flags). We keep a separate list cache because usenet items
+# and torrents are tracked in different mylists.
+
+_USENET_MYLIST_TTL_SECONDS = 45
+_usenet_cache: dict = {"items": None, "ts": 0.0}
+_usenet_lock = __import__("threading").Lock()
+
+
+def list_usenet(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
+    """Return TorBox usenet mylist (all pages), cached ~45s."""
+    import time as _t
+    if not force_refresh:
+        cached = _usenet_cache["items"]
+        if cached is not None and (_t.monotonic() - _usenet_cache["ts"]) < _USENET_MYLIST_TTL_SECONDS:
+            return cached
+    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/mylist"
+    all_items: list[dict] = []
+    seen_ids: set[int] = set()
+    offset = 0
+    limit = 1000
+    for _ in range(20):
+        try:
+            resp = requests.get(url, headers=_headers(), timeout=timeout,
+                                params={"limit": limit, "offset": offset})
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("TorBox usenet mylist failed: %s", exc)
+            break
+        payload = resp.json() or {}
+        page = payload.get("data") or []
+        if not page:
+            break
+        added = False
+        for item in page:
+            iid = item.get("id")
+            if iid not in seen_ids:
+                seen_ids.add(iid)
+                all_items.append(item)
+                added = True
+        if not added or len(page) < limit:
+            break
+        offset += limit
+    with _usenet_lock:
+        _usenet_cache["items"] = all_items
+        _usenet_cache["ts"] = _t.monotonic()
+    return all_items
+
+
+def invalidate_usenet_mylist_cache() -> None:
+    with _usenet_lock:
+        _usenet_cache["items"] = None
+        _usenet_cache["ts"] = 0.0
+
+
+def find_usenet_by_id(usenet_id: int, timeout: int = 15) -> dict | None:
+    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/mylist"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=timeout,
+                            params={"id": usenet_id})
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        if isinstance(data, dict) and data.get("id") == usenet_id:
+            return data
+        if isinstance(data, list):
+            for item in data:
+                if item.get("id") == usenet_id:
+                    return item
+    except requests.RequestException as exc:
+        log.warning("TorBox find_usenet_by_id(%s) failed: %s", usenet_id, exc)
+    return None
+
+
+def find_usenet_by_nzb_url(nzb_url: str, force_refresh: bool = False) -> dict | None:
+    """Locate a usenet item by source URL or its sha1-keyed dedup hash.
+
+    TorBox doesn't echo back the original nzb link, so we match on the
+    item name produced at submit time (we pass `name=stream.title` from
+    processor) plus catch-all hash-suffix matching when stricter."""
+    if not nzb_url:
+        return None
+    import hashlib as _hl
+    key = _hl.sha1(nzb_url.encode()).hexdigest()
+    for item in list_usenet(force_refresh=force_refresh):
+        if key in str(item.get("magnet") or "") or key in str(item.get("source") or ""):
+            return item
     return None
 
 
@@ -371,6 +471,36 @@ def _is_ready(item: dict) -> bool:
         return True
     state = (item.get("download_state") or "").lower()
     return state in ("cached", "completed", "uploading", "metadl_done")
+
+
+def wait_until_ready_usenet(usenet_id: int, timeout: int | None = None) -> dict | None:
+    """Poll TorBox until the usenet download reports completion.
+
+    Same semantics as wait_until_ready but against /usenet/mylist. Usenet
+    downloads typically take several minutes from submit to completion
+    (vs torrent cached-add which is instant), so callers should pass a
+    generous timeout for first-play materialization.
+    """
+    limit = TORBOX_POLL_TIMEOUT_SEC if timeout is None else timeout
+    deadline = time.monotonic() + limit
+    last_state: str | None = None
+    while time.monotonic() < deadline:
+        item = find_usenet_by_id(usenet_id)
+        if item is None:
+            log.debug("Usenet %s not in mylist yet", usenet_id)
+        else:
+            state = item.get("download_state") or ""
+            progress = item.get("progress") or 0
+            if state != last_state:
+                log.info("TorBox usenet state: %s (progress=%.2f%%)",
+                         state, float(progress) * 100)
+                last_state = state
+            if _is_ready(item):
+                log.info("TorBox usenet reports ready: id=%s", usenet_id)
+                return item
+        time.sleep(TORBOX_POLL_INTERVAL_SEC)
+    log.warning("Timed out waiting for TorBox usenet id=%s to finish", usenet_id)
+    return find_usenet_by_id(usenet_id)
 
 
 def wait_until_ready(info_hash: str, timeout: int | None = None,
