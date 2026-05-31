@@ -939,6 +939,7 @@ def ui_search_episode():
 
 
 @app.post("/ui/download-movie")
+@auth.require_role("admin")
 def ui_download_movie():
     imdb_id = request.form.get("imdb_id", "")
     media_request = MediaRequest(
@@ -952,6 +953,7 @@ def ui_download_movie():
 
 
 @app.post("/ui/sync-movies")
+@auth.require_role("admin")
 def ui_sync_movies():
     threading.Thread(target=monitor.sync_movies, name="movie-sync-manual", daemon=True).start()
     flash("Movie sync started", "ok")
@@ -964,6 +966,7 @@ def ui_logs():
 
 
 @app.post("/ui/run-cleanup")
+@auth.require_role("admin")
 def ui_run_cleanup():
     threading.Thread(target=cleanup.run_cleanup, name="cleanup-manual", daemon=True).start()
     flash("Cleanup scan started  -  check Repair tab for results", "ok")
@@ -971,6 +974,7 @@ def ui_run_cleanup():
 
 
 @app.post("/ui/repair-all")
+@auth.require_role("admin")
 def ui_repair_all():
     threading.Thread(target=cleanup.run_cleanup, name="repair-all-manual", daemon=True).start()
     flash("Repair All started  -  check Repair tab for results", "ok")
@@ -978,6 +982,7 @@ def ui_repair_all():
 
 
 @app.post("/ui/refresh-images")
+@auth.require_role("admin")
 def ui_refresh_images():
     threading.Thread(target=jellyfin.refresh_missing_images, name="jf-images", daemon=True).start()
     flash("Jellyfin image refresh started  -  missing posters will be fetched", "ok")
@@ -985,6 +990,7 @@ def ui_refresh_images():
 
 
 @app.post("/ui/merge-series")
+@auth.require_role("admin")
 def ui_merge_series():
     threading.Thread(target=cleanup.merge_series_duplicates, name="merge-series", daemon=True).start()
     flash("Series merge started  -  duplicate folders will be consolidated", "ok")
@@ -1011,6 +1017,7 @@ def ui_api_fix_imdb_titles():
 
 
 @app.post("/ui/generate-nfos")
+@auth.require_role("admin")
 def ui_generate_nfos():
     def _run():
         nfo_generator.generate_all()
@@ -1022,6 +1029,7 @@ def ui_generate_nfos():
 
 @app.post("/api/run-cleanup")
 @_csrf.exempt
+@auth.require_role("admin")
 def api_run_cleanup():
     threading.Thread(target=cleanup.run_cleanup, name="cleanup-api", daemon=True).start()
     return jsonify(ok=True, started="run_cleanup")
@@ -1029,6 +1037,7 @@ def api_run_cleanup():
 
 @app.post("/api/generate-nfos")
 @_csrf.exempt
+@auth.require_role("admin")
 def api_generate_nfos():
     def _run():
         nfo_generator.generate_all()
@@ -1039,6 +1048,7 @@ def api_generate_nfos():
 
 @app.post("/ui/api/repair-strms")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_repair_strms():
     """Scan movie .strm files for expired direct TorBox CDN URLs and repair them.
     Files with a catbox token → left alone. Files with a direct URL:
@@ -1071,6 +1081,7 @@ def ui_api_spore_regenerate():
 
 @app.post("/ui/api/migrate-canonical")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_migrate_canonical():
     """Rename all movie folders to TMDB canonical names and merge duplicates."""
     result = strm_generator.migrate_to_canonical_names()
@@ -1079,6 +1090,7 @@ def ui_api_migrate_canonical():
 
 @app.post("/ui/api/cleanup-duplicate-strms")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_cleanup_duplicate_strms():
     """Remove extra .strm files from folders that have more than one."""
     result = strm_generator.cleanup_duplicate_strms()
@@ -1087,6 +1099,7 @@ def ui_api_cleanup_duplicate_strms():
 
 @app.post("/ui/api/series-backfill")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_series_backfill():
     """Import all Sonarr series + run series check to create .strm files for all episodes."""
     threading.Thread(target=monitor.run_series_backfill, name="series-backfill", daemon=True).start()
@@ -1146,6 +1159,7 @@ def ui_api_torbox_list():
 
 
 @app.post("/ui/torbox-delete")
+@auth.require_role("admin")
 def ui_torbox_delete():
     torrent_id = request.form.get("torrent_id")
     if not torrent_id:
@@ -1159,6 +1173,7 @@ def ui_torbox_delete():
 
 
 @app.post("/ui/strm-rescan")
+@auth.require_role("admin")
 def ui_strm_rescan():
     threading.Thread(target=strm_generator.run_and_refresh, name="strm-manual", daemon=True).start()
     flash("strm rescan started", "ok")
@@ -1166,6 +1181,7 @@ def ui_strm_rescan():
 
 
 @app.post("/ui/test-notify")
+@auth.require_role("admin")
 def ui_test_notify():
     results = notify.test()
     return jsonify(results)
@@ -1208,6 +1224,7 @@ def ui_api_search_candidates():
 
 
 @app.post("/ui/add-magnet")
+@auth.require_role("admin")
 def ui_add_magnet():
     magnet = (request.form.get("magnet") or "").strip()
     if not magnet.startswith("magnet:"):
@@ -1223,6 +1240,7 @@ def ui_add_magnet():
 
 
 @app.post("/ui/retry-request/<int:row_id>")
+@auth.require_role("admin")
 def ui_retry_request(row_id: int):
     rows = [r for r in db.get_recent(1000) if r["id"] == row_id]
     if not rows:
@@ -1497,6 +1515,7 @@ def ui_api_virtual_items():
 
 @app.post("/ui/api/virtual-items/<token>/re-resolve")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_re_resolve(token: str):
     """Clear fail state for a token and trigger a fresh materialize attempt."""
     item = db.get_virtual_item(token)
@@ -1541,6 +1560,7 @@ def ui_api_integrity():
 
 
 @app.post("/ui/catbox-gc")
+@auth.require_role("admin")
 def ui_catbox_gc():
     n = catbox.release_idle()
     flash(f"Released {n} idle torrent(s)", "ok")
@@ -1553,6 +1573,7 @@ def ui_api_blacklist():
 
 
 @app.post("/ui/blacklist-clear/<info_hash>")
+@auth.require_role("admin")
 def ui_blacklist_clear(info_hash: str):
     db.clear_failed_hash(info_hash)
     flash(f"Cleared blacklist for {info_hash[:12]}…", "ok")
@@ -1560,6 +1581,7 @@ def ui_blacklist_clear(info_hash: str):
 
 
 @app.post("/ui/backup-now")
+@auth.require_role("admin")
 def ui_backup_now():
     threading.Thread(target=backup.run, name="backup-manual", daemon=True).start()
     flash("DB backup started", "ok")
@@ -1572,6 +1594,7 @@ def ui_api_backups():
 
 
 @app.post("/ui/backup-restore")
+@auth.require_role("admin")
 def ui_backup_restore():
     name = request.form.get("name", "").strip()
     if not backup.restore(name):
@@ -1584,6 +1607,7 @@ def ui_backup_restore():
 # ── Upgrader / consolidation / trending triggers ──────────────────────────────
 
 @app.post("/ui/auto-upgrade")
+@auth.require_role("admin")
 def ui_auto_upgrade():
     threading.Thread(target=upgrader.run_auto_upgrade, name="upgrade-manual", daemon=True).start()
     flash("Auto-upgrade scan started", "ok")
@@ -1591,6 +1615,7 @@ def ui_auto_upgrade():
 
 
 @app.post("/ui/pack-consolidate")
+@auth.require_role("admin")
 def ui_pack_consolidate():
     threading.Thread(target=upgrader.run_pack_consolidation, name="pack-manual", daemon=True).start()
     flash("Season-pack consolidation started", "ok")
@@ -1598,6 +1623,7 @@ def ui_pack_consolidate():
 
 
 @app.post("/ui/trending-now")
+@auth.require_role("admin")
 def ui_trending_now():
     threading.Thread(target=trending.run, name="trending-manual", daemon=True).start()
     flash("Trending pre-cache started", "ok")
@@ -1605,6 +1631,7 @@ def ui_trending_now():
 
 
 @app.post("/ui/continue-watching")
+@auth.require_role("admin")
 def ui_continue_watching():
     threading.Thread(target=continue_watching.prioritize_next_episodes,
                      name="cw-manual", daemon=True).start()
@@ -1619,6 +1646,7 @@ def ui_api_settings():
 
 
 @app.post("/ui/settings")
+@auth.require_role("admin")
 def ui_save_settings():
     import settings
     saved = 0
@@ -1642,6 +1670,7 @@ def ui_save_settings():
 
 
 @app.post("/ui/settings-reset/<key>")
+@auth.require_role("admin")
 def ui_settings_reset(key: str):
     import settings
     settings.set(key, None)
@@ -1665,6 +1694,7 @@ def _library_import_and_resolve():
 
 
 @app.post("/ui/library-import")
+@auth.require_role("admin")
 def ui_library_import():
     threading.Thread(target=_library_import_and_resolve,
                      name="lib-import", daemon=True).start()
@@ -1673,6 +1703,7 @@ def ui_library_import():
 
 
 @app.post("/ui/recovery")
+@auth.require_role("admin")
 def ui_recovery():
     threading.Thread(target=recovery.run, name="recovery-wizard", daemon=True).start()
     flash("Recovery wizard started  -  runs integrity check + cleanup + import + strm scan", "ok")
@@ -1680,6 +1711,7 @@ def ui_recovery():
 
 
 @app.post("/ui/db-vacuum")
+@auth.require_role("admin")
 def ui_db_vacuum():
     threading.Thread(target=db.vacuum, name="db-vacuum", daemon=True).start()
     flash("DB vacuum started", "ok")
@@ -1687,6 +1719,7 @@ def ui_db_vacuum():
 
 
 @app.post("/ui/db-prune")
+@auth.require_role("admin")
 def ui_db_prune():
     threading.Thread(target=lambda: db.prune_old(90), name="db-prune", daemon=True).start()
     flash("Pruning rows older than 90 days", "ok")
@@ -1694,6 +1727,7 @@ def ui_db_prune():
 
 
 @app.post("/ui/quota-check")
+@auth.require_role("admin")
 def ui_quota_check():
     threading.Thread(
         target=lambda: torbox.check_quota_and_warn(QUOTA_WARN_TORRENT_COUNT, QUOTA_WARN_SIZE_GB),
@@ -1735,6 +1769,7 @@ def ui_api_failed_requests():
 
 @app.post("/ui/api/requests/<int:row_id>/retry")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_retry_request(row_id: int):
     rows = [r for r in db.get_recent(1000) if r["id"] == row_id]
     if not rows:
@@ -1752,6 +1787,7 @@ def ui_api_retry_request(row_id: int):
 
 @app.post("/ui/api/requests/<int:row_id>/delete")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_delete_request(row_id: int):
     with db._connect() as conn:
         cur = conn.execute("DELETE FROM requests WHERE id=?", (row_id,))
@@ -1784,6 +1820,7 @@ def ui_api_show_overrides():
 
 
 @app.post("/ui/show-override")
+@auth.require_role("admin")
 def ui_show_override():
     imdb_id = (request.form.get("imdb_id") or "").strip()
     if not re.fullmatch(r"tt\d{6,10}", imdb_id):
@@ -1801,6 +1838,7 @@ def ui_show_override():
 
 
 @app.post("/ui/show-override-delete/<imdb_id>")
+@auth.require_role("admin")
 def ui_show_override_delete(imdb_id: str):
     db.delete_show_override(imdb_id)
     flash(f"Cleared override for {imdb_id}", "ok")
@@ -2147,6 +2185,7 @@ def ui_api_user_requests():
 
 
 @app.post("/ui/api/user-requests/<int:req_id>/approve")
+@auth.require_role("admin")
 def ui_api_user_request_approve(req_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2161,6 +2200,7 @@ def ui_api_user_request_approve(req_id: int):
 
 
 @app.post("/ui/api/user-requests/<int:req_id>/deny")
+@auth.require_role("admin")
 def ui_api_user_request_deny(req_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2181,6 +2221,7 @@ def ui_api_wanted_movies():
 
 @app.post("/ui/api/wanted-recheck")
 @_csrf.exempt
+@auth.require_role("admin")
 def ui_api_wanted_recheck():
     def _run():
         try:
@@ -2193,6 +2234,7 @@ def ui_api_wanted_recheck():
 
 
 @app.post("/ui/search-all-wanted")
+@auth.require_role("admin")
 def ui_search_all_wanted():
     def _run():
         upgrader.recheck_wanted()
@@ -2398,6 +2440,7 @@ def ui_api_users():
 
 
 @app.post("/ui/api/users/create")
+@auth.require_role("admin")
 def ui_api_users_create():
     import settings as _settings
     # Bootstrap: only allow unauthenticated first-admin creation when no users exist AND
@@ -2435,6 +2478,7 @@ def ui_api_users_create():
 
 
 @app.post("/ui/api/users/<int:user_id>/update")
+@auth.require_role("admin")
 def ui_api_users_update(user_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2627,6 +2671,7 @@ def ui_api_users_delete(user_id: int):
 # ── Auto-add now (trigger immediately) ───────────────────────────────────────
 
 @app.post("/ui/api/auto-add-now")
+@auth.require_role("admin")
 def ui_api_auto_add_now():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2643,6 +2688,7 @@ def ui_api_arr_import_status():
 
 
 @app.post("/ui/api/arr-import/radarr")
+@auth.require_role("admin")
 def ui_api_arr_import_radarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2655,6 +2701,7 @@ def ui_api_arr_import_radarr():
 
 
 @app.post("/ui/api/arr-import/sonarr")
+@auth.require_role("admin")
 def ui_api_arr_import_sonarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2667,6 +2714,7 @@ def ui_api_arr_import_sonarr():
 
 
 @app.post("/ui/api/arr-import/test-radarr")
+@auth.require_role("admin")
 def ui_api_arr_import_test_radarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2680,6 +2728,7 @@ def ui_api_arr_import_test_radarr():
 
 
 @app.post("/ui/api/arr-import/test-sonarr")
+@auth.require_role("admin")
 def ui_api_arr_import_test_sonarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
