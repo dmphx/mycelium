@@ -98,13 +98,32 @@ if LITE_MODE:
     log.info("LITE_MODE enabled  -  heavy background schedulers and startup tasks disabled")
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-if cfg.AUTH_SESSION_SECRET == "mycelium-please-change-me":
-    import warnings
-    warnings.warn(
-        "AUTH_SESSION_SECRET is still the default value. "
-        "Set a random string in your environment for production use.",
-        stacklevel=1,
+
+# Session cookies are signed with AUTH_SESSION_SECRET. The default value is
+# a hard-coded public string, so anyone running auth with the default can
+# forge cookies for any user. Refuse to start when any auth mechanism is
+# active and the secret is still the default. Anon-only deploys keep the
+# previous behaviour (warning only) because there is no session to forge.
+_DEFAULT_SESSION_SECRET = "mycelium-please-change-me"
+_secret = (cfg.AUTH_SESSION_SECRET or "").strip()
+_auth_active = cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH
+if not _secret or _secret == _DEFAULT_SESSION_SECRET:
+    if _auth_active:
+        import sys as _sys
+        log.error(
+            "Refusing to start: AUTH_SESSION_SECRET is unset or default while "
+            "auth is enabled. Set it to a long random string (e.g. "
+            "`openssl rand -hex 32`). Session cookies signed with the default "
+            "value are forgeable by anyone with access to the source."
+        )
+        _sys.exit(1)
+    log.warning(
+        "AUTH_SESSION_SECRET is unset or default. OK for INSECURE_ALLOW_ANON "
+        "mode (no sessions are issued), but set a real secret before enabling "
+        "any auth method."
     )
+    _secret = _DEFAULT_SESSION_SECRET
+cfg.AUTH_SESSION_SECRET = _secret
 import secrets as _secrets_mod
 if not WEBHOOK_SECRET:
     _stored = _settings_mod.get("WEBHOOK_SECRET_AUTO", "")
