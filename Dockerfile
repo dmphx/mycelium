@@ -19,12 +19,19 @@ LABEL org.opencontainers.image.title="mycelium" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     LISTEN_HOST=0.0.0.0 \
-    LISTEN_PORT=8088
+    LISTEN_PORT=8088 \
+    PUID=99 \
+    PGID=100
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# gosu lets the entrypoint drop privileges to the mapped UID/GID after fixing
+# ownership on /data; ffmpeg is required for stub MKV generation.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 100 mycgrp \
+    && useradd -u 99 -g 100 -m -s /bin/sh mycelium \
+    && mkdir -p /data && chown -R mycelium:mycgrp /data /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -37,6 +44,9 @@ COPY docs/ ./docs/
 # Built SPA from stage 1 (Vite writes to ../static/app relative to frontend/)
 COPY --from=frontend /static/app/ ./static/app/
 
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh && chown -R mycelium:mycgrp /app
+
 EXPOSE 8088
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
@@ -45,4 +55,5 @@ port=os.environ.get('LISTEN_PORT','8088'); \
 r=urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=5); \
 sys.exit(0 if r.status==200 else 1)" || exit 1
 
-CMD ["sh", "-c", "gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 1 --threads 8 --access-logfile - app:app"]
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sh", "-c", "exec gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 1 --threads 8 --access-logfile - app:app"]
