@@ -31,6 +31,10 @@ ARG TARGETARCH
 # ownership on /data. ffmpeg is required for stub MKV generation; the Intel
 # VA-API driver (iHD = Gen8+, includes J3455/J4125) enables webplayer hardware
 # transcode and is x86-only (skipped on arm64).
+# Note: the build-time UID/GID are arbitrary (8088). At runtime the entrypoint
+# remaps them to PUID/PGID (default 99/100 for Unraid) with usermod -o /
+# groupmod -o so duplicate IDs against base-image groups (Debian uses GID 100
+# for "users") are not a conflict.
 RUN echo "deb http://deb.debian.org/debian bookworm contrib non-free non-free-firmware" \
         > /etc/apt/sources.list.d/non-free.list \
     && apt-get update \
@@ -43,8 +47,8 @@ RUN echo "deb http://deb.debian.org/debian bookworm contrib non-free non-free-fi
         apt-get install -y --no-install-recommends intel-media-va-driver; \
     fi \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 100 mycgrp \
-    && useradd -u 99 -g 100 -m -s /bin/sh mycelium \
+    && groupadd -g 8088 mycgrp \
+    && useradd -u 8088 -g 8088 -m -s /bin/sh mycelium \
     && mkdir -p /data && chown -R mycelium:mycgrp /data /app
 
 COPY requirements.txt .
