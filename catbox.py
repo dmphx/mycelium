@@ -192,12 +192,15 @@ def register(info_hash: str, magnet: str, title: str, media_type: str,
              file_id: int | None = None, imdb_id: str | None = None,
              quality: str | None = None, source: str | None = None,
              size_gb: float | None = None, season: int | None = None,
-             episode: int | None = None, year: int | None = None) -> str:
+             episode: int | None = None, year: int | None = None,
+             protocol: str = "torrent", nzb_url: str | None = None,
+             usenet_id: int | None = None) -> str:
     token = uuid.uuid4().hex[:16]
     db.insert_virtual_item(token, info_hash, magnet, title, media_type,
                             strm_path=strm_path, torbox_id=torbox_id, file_id=file_id,
                             imdb_id=imdb_id, quality=quality, source=source,
-                            size_gb=size_gb, season=season, episode=episode, year=year)
+                            size_gb=size_gb, season=season, episode=episode, year=year,
+                            protocol=protocol, nzb_url=nzb_url, usenet_id=usenet_id)
     return token
 
 
@@ -239,6 +242,98 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
         return url
 
 
+def _pick_usenet_file_id(item: dict, virtual_item: dict) -> int | None:
+    """Pick the right file inside a completed TorBox usenet download.
+
+    For movies: largest video file.
+    For episodes: the file whose name matches SxxExx of the virtual_item.
+    Falls back to file[0] if nothing matches (rare).
+    """
+    files = item.get("files") or []
+    if not files:
+        return None
+    video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm", ".ts", ".m2ts")
+    videos = [f for f in files
+              if (f.get("name") or f.get("short_name") or "").lower().endswith(video_exts)]
+    pool = videos or files
+    if virtual_item.get("media_type") == "movie":
+        return max(pool, key=lambda f: f.get("size") or 0).get("id")
+    s_num = virtual_item.get("season")
+    e_num = virtual_item.get("episode")
+    if s_num and e_num:
+        import re as _re
+        ep_re = _re.compile(rf"[Ss]0?{s_num}[Ee]0?{e_num}\b", _re.IGNORECASE)
+        for f in pool:
+            name = f.get("name") or f.get("short_name") or ""
+            if ep_re.search(name):
+                return f.get("id")
+    return max(pool, key=lambda f: f.get("size") or 0).get("id")
+
+
+def _materialize_usenet(token: str, item: dict) -> str | None:
+    """On-play materialize for a usenet virtual_item.
+
+    Path:
+      1. If stored usenet_id exists and download is ready, just refresh the CDN URL.
+      2. If usenet_id exists but item is still downloading, wait briefly.
+      3. If no usenet_id (rare: lost between submit and persist), resubmit the
+         stored NZB URL.
+    """
+    import strm_generator as _sg
+
+    usenet_id = item.get("usenet_id")
+    nzb_url = item.get("nzb_url") or item.get("magnet")  # magnet col was the fallback
+
+    if not usenet_id and nzb_url:
+        # Resubmit; happens only if we crashed between add_nzb returning and the
+        # row being persisted (very rare). Costs 1 quota slot.
+        try:
+            log.info("Catbox/usenet: no usenet_id stored for %s  -  resubmitting NZB",
+                     item.get("title"))
+            result = torbox.add_nzb(nzb_url, name=item.get("title"),
+                                     reason="catbox-usenet-resubmit")
+            usenet_id = (result or {}).get("id")
+            if usenet_id:
+                db.update_virtual_usenet_id(token, usenet_id)
+        except torbox.RateLimited:
+            _fail_put(token, _FAIL_COOLDOWN_429_SEC)
+            return None
+        except Exception as exc:
+            log.warning("Catbox/usenet: resubmit failed for %s: %s",
+                        item.get("title"), exc)
+            _fail_put(token, _FAIL_COOLDOWN_SEC)
+            return None
+
+    if not usenet_id:
+        log.warning("Catbox/usenet: no usenet_id and no nzb_url for %s", item.get("title"))
+        return None
+
+    live = torbox.find_usenet_by_id(usenet_id)
+    if not live or not torbox._is_ready(live):
+        # Wait up to ON_PLAY_READY_TIMEOUT_SEC. Usenet downloads of a typical
+        # movie complete in 30-120s; first playback may need this window.
+        log.info("Catbox/usenet: %s not ready (id=%s)  -  waiting up to %ds",
+                 item.get("title"), usenet_id, ON_PLAY_READY_TIMEOUT_SEC)
+        live = torbox.wait_until_ready_usenet(usenet_id, timeout=ON_PLAY_READY_TIMEOUT_SEC)
+        if not live or not torbox._is_ready(live):
+            _fail_put(token, _FAIL_COOLDOWN_SEC)
+            return None
+
+    file_id = _pick_usenet_file_id(live, item)
+    if not file_id:
+        log.warning("Catbox/usenet: no video file in TorBox usenet id=%s", usenet_id)
+        _fail_put(token, _FAIL_COOLDOWN_SEC)
+        return None
+
+    url = _sg._get_usenet_stream_url(usenet_id, file_id)
+    if not url:
+        _fail_put(token, _FAIL_COOLDOWN_SEC)
+        return None
+    log.info("Catbox/usenet: served %s (usenet_id=%s, file=%s)",
+             item.get("title"), usenet_id, file_id)
+    return url
+
+
 def _rd_get_url(item: dict, rd_id: str) -> str | None:
     """Get a playable URL from RealDebrid for this virtual item."""
     import re as _re
@@ -267,7 +362,17 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
 
     ckey = _content_key(item)
     debrid_provider = (item.get("debrid_provider") or "torbox").lower()
+    protocol = (item.get("protocol") or "torrent").lower()
     rematerialized = False
+
+    # ── TorBox usenet path ────────────────────────────────────────────────────
+    if protocol == "usenet":
+        url = _materialize_usenet(token, item)
+        if url:
+            db.touch_virtual_item(token)
+            if ckey:
+                db.update_playability_ok(ckey, "torbox-usenet")
+        return url
 
     # ── RealDebrid path ───────────────────────────────────────────────────────
     if debrid_provider == "realdebrid":

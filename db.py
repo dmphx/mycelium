@@ -364,6 +364,12 @@ def _migrate() -> None:
             ("debrid_provider", "TEXT DEFAULT 'torbox'"),
             ("rd_id", "TEXT"),
             ("spore_tracks", "TEXT"),
+            # Usenet support: "torrent" (default) or "usenet". When usenet,
+            # the magnet slot holds the NZB download URL and torbox_id refers
+            # to a usenet download row (different TorBox endpoint).
+            ("protocol", "TEXT NOT NULL DEFAULT 'torrent'"),
+            ("nzb_url", "TEXT"),
+            ("usenet_id", "INTEGER"),
         ]:
             if col not in vi_cols:
                 conn.execute(f"ALTER TABLE virtual_items ADD COLUMN {col} {typedef}")
@@ -850,15 +856,31 @@ def insert_virtual_item(token: str, info_hash: str, magnet: str, title: str,
                          imdb_id: str | None = None, quality: str | None = None,
                          source: str | None = None, size_gb: float | None = None,
                          season: int | None = None, episode: int | None = None,
-                         year: int | None = None) -> int:
+                         year: int | None = None, protocol: str = "torrent",
+                         nzb_url: str | None = None,
+                         usenet_id: int | None = None) -> int:
+    """Insert a virtual item.
+
+    For torrents (protocol='torrent'): `magnet` holds the magnet URI and
+    `info_hash` is the bittorrent infohash. catbox.materialize re-adds via
+    torbox.add_magnet on first playback.
+
+    For usenet (protocol='usenet'): `magnet` holds the NZB download URL
+    (also mirrored to nzb_url for clarity), and `info_hash` is the synthetic
+    sha1 used as a dedup/lookup key. catbox.materialize re-adds via
+    torbox.add_nzb. `usenet_id` is the TorBox usenet download row id, set
+    once the download completes.
+    """
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO virtual_items
                (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
-                imdb_id, quality, source, size_gb, season, episode, year)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                imdb_id, quality, source, size_gb, season, episode, year,
+                protocol, nzb_url, usenet_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
-             imdb_id, quality, source, size_gb, season, episode, year),
+             imdb_id, quality, source, size_gb, season, episode, year,
+             protocol, nzb_url, usenet_id),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
@@ -965,6 +987,13 @@ def update_virtual_debrid_provider(token: str, provider: str) -> None:
 def update_virtual_rd_id(token: str, rd_id: str | None) -> None:
     with _connect() as conn:
         conn.execute("UPDATE virtual_items SET rd_id=? WHERE token=?", (rd_id, token))
+        conn.commit()
+
+
+def update_virtual_usenet_id(token: str, usenet_id: int | None) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE virtual_items SET usenet_id=? WHERE token=?",
+                      (usenet_id, token))
         conn.commit()
 
 

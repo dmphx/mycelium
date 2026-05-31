@@ -148,6 +148,29 @@ def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
         return None
 
 
+def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
+    """Resolve a TorBox usenet download to a CDN URL.
+
+    Mirrors _get_stream_url but hits /usenet/requestdl with usenet_id instead
+    of torrent_id."""
+    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/requestdl"
+    params = {
+        "token": settings.get("TORBOX_API_KEY", ""),
+        "usenet_id": usenet_id,
+        "file_id": file_id,
+        "zip_link": "false",
+    }
+    try:
+        resp = req_lib.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        return data.get("data") or None
+    except Exception as exc:
+        log.warning("usenet requestdl failed usenet=%s file=%s: %s",
+                    usenet_id, file_id, exc)
+        return None
+
+
 def _extract_year(name: str) -> int | None:
     m = _YEAR_RE.search(name or "")
     return int(m.group(1)) if m else None
@@ -514,7 +537,9 @@ def _preload_torrent(info_hash: str, magnet: str, title: str) -> None:
 def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                             year: int | None, imdb_id: str | None = None,
                             tmdb_id: int | None = None, quality: str | None = None,
-                            source: str | None = None, size_gb: float | None = None) -> bool:
+                            source: str | None = None, size_gb: float | None = None,
+                            protocol: str = "torrent", nzb_url: str | None = None,
+                            usenet_id: int | None = None) -> bool:
     """Write a Catbox virtual movie .strm WITHOUT adding the torrent to TorBox.
     createtorrent is deferred until first playback (see catbox.materialize).
     Atomically writes .nfo, poster.jpg, fanart.jpg, and requests subtitles.
@@ -556,6 +581,9 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
         source=source,
         size_gb=size_gb,
         year=year,
+        protocol=protocol,
+        nzb_url=nzb_url,
+        usenet_id=usenet_id,
     )
     written = _write_strm(path, catbox.proxy_url(token))
     if written:
@@ -573,7 +601,12 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                 subtitles.fetch_for(path, imdb_id, "movie")
             except Exception as exc:
                 log.debug("Subtitle fetch skipped for %s: %s", folder, exc)
-        if settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD) and info_hash and magnet:
+        # Preload only makes sense for torrents (push cached magnet to TorBox
+        # so first-play is instant). Usenet items are already downloading by
+        # the time we get here (we eager-submitted in _lazy_register_movie).
+        if (protocol == "torrent" and
+                settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD)
+                and info_hash and magnet):
             threading.Thread(
                 target=_preload_torrent,
                 args=(info_hash, magnet, folder),
