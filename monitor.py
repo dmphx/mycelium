@@ -252,9 +252,35 @@ def _retry_episode(ep: dict) -> bool:
             log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
         return bool(written)
 
-    cached_hashes = torbox.check_cached([s.info_hash for s in candidates])
-    ordered = [s for s in candidates if s.info_hash in cached_hashes] or candidates[:1]
+    # check_cached is torrent-only; usenet candidates always look "uncached"
+    # so they get prioritised after cached torrents. That's the desired order:
+    # cached torrent (instant) > NZB (downloaded fresh, usually fast) > uncached torrent.
+    torrent_hashes = [s.info_hash for s in candidates if not s.is_usenet]
+    cached_hashes = torbox.check_cached(torrent_hashes) if torrent_hashes else set()
+    cached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes]
+    nzbs = [s for s in candidates if s.is_usenet]
+    uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
+    ordered = cached_torrents + nzbs + uncached_torrents
+    if not ordered:
+        ordered = candidates[:1]
     for stream in ordered:
+        if stream.is_usenet:
+            if not stream.nzb_url:
+                continue
+            try:
+                torbox.add_nzb(stream.nzb_url, name=stream.title, reason="series-monitor-nzb")
+                log.info("Monitor: added NZB %s S%02dE%02d (%s)",
+                         title, season, episode, stream.source)
+                return True
+            except torbox.RateLimited:
+                raise processor.RateLimited()
+            except Exception as exc:
+                if "429" in str(exc):
+                    raise processor.RateLimited()
+                log.warning("Monitor: NZB add failed %s S%02dE%02d: %s",
+                            title, season, episode, exc)
+                continue
+
         # Skip createtorrent if already in the TorBox library.
         existing = torbox.find_by_hash(stream.info_hash)
         if existing and torbox._is_ready(existing):

@@ -124,6 +124,52 @@ def add_magnet(magnet: str, timeout: int = 30, reason: str = "unknown") -> dict:
     return data
 
 
+def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
+            reason: str = "unknown") -> dict:
+    """POST /usenet/createusenetdownload with link=<nzb-url>.
+
+    TorBox usenet API mirrors createtorrent: same 60/hour + 10/minute rate
+    limits, returns the same payload shape. We reuse the createtorrent
+    counter because TorBox enforces these limits jointly on the account.
+    The `link` field accepts any HTTP(S) URL that returns NZB XML; Prowlarr
+    indexer download URLs work directly.
+    """
+    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/createusenetdownload"
+    usage_hour = createtorrent_usage(window_sec=3600)
+    usage_min  = createtorrent_usage(window_sec=60)
+    if usage_hour["count"] >= _CREATETORRENT_LIMIT_HOUR - 2:
+        log.warning("createusenetdownload [%s] SKIPPED  -  hourly quota %d/%d reached (resets ~%ds)",
+                    reason, usage_hour["count"], _CREATETORRENT_LIMIT_HOUR,
+                    usage_hour["resets_in_sec"])
+        raise RateLimited()
+    if usage_min["count"] >= _CREATETORRENT_LIMIT_MIN - 1:
+        log.warning("createusenetdownload [%s] SKIPPED  -  per-minute burst %d/%d reached",
+                    reason, usage_min["count"], _CREATETORRENT_LIMIT_MIN)
+        raise RateLimited()
+    _record_createtorrent(reason)
+    log.info("createusenetdownload [%s] (%d/60h, %d/10m): %s",
+             reason, usage_hour["count"] + 1, usage_min["count"] + 1, nzb_url[:80])
+    data = {"link": nzb_url}
+    if name:
+        data["name"] = name
+    resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", 60))
+        log.warning("createusenetdownload [%s] got 429 from TorBox (Retry-After=%ds)",
+                    reason, retry_after)
+        raise RateLimited()
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    if not payload.get("success", False):
+        if payload.get("error") == "DUPLICATE_ITEM":
+            log.info("Torbox: usenet item already exists (DUPLICATE_ITEM), treating as success")
+            return payload.get("data", {}) or {}
+        raise RuntimeError(f"Torbox usenet add failed: {payload}")
+    result = payload.get("data", {}) or {}
+    log.info("Torbox createusenetdownload response: %s", payload.get("detail") or result)
+    return result
+
+
 _MYLIST_TTL_SECONDS = 45
 _mylist_cache: dict = {"items": None, "ts": 0.0}
 _mylist_lock = __import__("threading").Lock()

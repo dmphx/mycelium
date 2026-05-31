@@ -103,11 +103,40 @@ def _is_429(exc: Exception) -> bool:
 
 
 def _try_add_magnet(stream: TorrentioStream, label: str) -> bool:
-    """Add a single magnet to TorBox. Raises RateLimited (without blacklisting)
-    when the hourly createtorrent budget is gone, so the request is rescheduled
-    rather than wasting the quota or marking a good torrent bad. We do NOT retry
-    a 429 inline  -  the hourly window won't reset in seconds."""
-    # Skip createtorrent entirely if this hash is already in our TorBox library  - 
+    """Add a single candidate to TorBox.
+
+    For torrents: POST /torrents/createtorrent. Skips the API call entirely
+    when the hash is already in our TorBox library.
+
+    For usenet (NZB) streams: POST /usenet/createusenetdownload with the
+    Prowlarr-provided NZB URL. Same 60/hour + 10/minute rate budget as
+    torrent adds (TorBox enforces them jointly).
+
+    Raises RateLimited (without blacklisting) when the budget is gone so
+    the request is rescheduled rather than wasting quota or marking a good
+    candidate bad. We do NOT retry 429 inline  -  the hourly window won't
+    reset in seconds.
+    """
+    if stream.is_usenet:
+        if not stream.nzb_url:
+            log.warning("Usenet candidate %s has no nzb_url  -  skipping", label)
+            return False
+        try:
+            torbox.add_nzb(stream.nzb_url, name=stream.title, reason="processor-nzb")
+            return True
+        except torbox.RateLimited:
+            log.warning("createusenet budget exhausted adding %s  -  will retry later", label)
+            raise RateLimited()
+        except Exception as exc:
+            if _is_429(exc):
+                log.warning("Rate limited (429) adding NZB %s  -  will retry later", label)
+                raise RateLimited()
+            log.warning("Failed to add NZB %s: %s", label, exc)
+            blacklist.record_failure(stream.info_hash, str(exc)[:200])
+            return False
+
+    # Torrent path  -  preserve existing behaviour.
+    # Skip createtorrent entirely if this hash is already in our TorBox library  -
     # re-adding it would waste a 60/hour quota slot for content we already have.
     existing = torbox.find_by_hash(stream.info_hash)
     if existing and torbox._is_ready(existing):
@@ -170,14 +199,54 @@ def _add_best_from(candidates: list, label: str) -> tuple[bool, Optional[Torrent
 def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[TorrentioStream]:
     """Catbox lazy mode: pick the best CACHED candidate and register a virtual
     .strm WITHOUT adding to TorBox. createtorrent is deferred to first play.
-    Returns the registered stream, or None if nothing is cached yet."""
+    Returns the registered stream, or None if nothing is cached yet.
+
+    Usenet fallback: when there are no cached torrents but a usenet
+    candidate exists, eagerly submit the NZB to TorBox (one quota slot).
+    TorBox will download it in ~minutes and the title becomes playable;
+    that's much better than parking in 'wanted' indefinitely hoping a
+    torrent cache appears.
+    """
     candidates = blacklist.filter_candidates(candidates)
     if not candidates:
         return None
     import debrid
-    cached_hashes = debrid.check_cached_multi([s.info_hash for s in candidates]).get("torbox", set())
-    cached = [s for s in candidates if s.info_hash in cached_hashes]
+    torrent_only = [s for s in candidates if not s.is_usenet]
+    cached_hashes = debrid.check_cached_multi(
+        [s.info_hash for s in torrent_only]
+    ).get("torbox", set()) if torrent_only else set()
+    cached = [s for s in torrent_only if s.info_hash in cached_hashes]
     if not cached:
+        # No cached torrents  -  try the best NZB before giving up to wanted.
+        nzbs = [s for s in candidates if s.is_usenet and s.nzb_url]
+        if nzbs:
+            best_nzb = nzbs[0]
+            log.info("Lazy: no cached torrent for %s  -  submitting NZB from %s",
+                     req.title, best_nzb.source)
+            try:
+                torbox.add_nzb(best_nzb.nzb_url, name=best_nzb.title,
+                               reason="processor-lazy-nzb")
+                # Same lazy-register path as the cached-torrent branch, but the
+                # magnet/info_hash slots carry the synthetic NZB key.
+                year = strm_generator._extract_year(best_nzb.name) \
+                    or strm_generator._extract_year(best_nzb.title)
+                if strm_generator.create_lazy_movie_strm(
+                    best_nzb.info_hash, best_nzb.nzb_url, req.title, year,
+                    imdb_id=req.imdb_id, tmdb_id=getattr(req, 'tmdb_id', None),
+                    quality=best_nzb.quality, source=best_nzb.source,
+                    size_gb=best_nzb.size_gb,
+                ):
+                    log.info("Lazy-registered NZB %s (%s, %s)  -  TorBox downloading",
+                             req.title, best_nzb.quality, best_nzb.source)
+                    return best_nzb
+            except torbox.RateLimited:
+                log.warning("createusenet budget exhausted for %s  -  marking wanted",
+                            req.title)
+                return None
+            except Exception as exc:
+                log.warning("NZB submit failed for %s: %s  -  marking wanted",
+                            req.title, exc)
+                return None
         log.info("Lazy: no cached release for %s  -  will wait in wanted", req.title)
         return None
     winner = cached[0]
