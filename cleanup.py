@@ -175,8 +175,8 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
         try:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s: %s", path, exc)
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                               "unfixable", "IMDB ID not found")
         return "unfixable"
@@ -187,8 +187,8 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
         try:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s: %s", path, exc)
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                               "unfixable", "no candidates found")
         return "unfixable"
@@ -220,8 +220,8 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
             strm_generator._delete_spore_stubs(path)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s after repair: %s", path, exc)
         log.info("Repaired '%s': deleted strm, added new torrent %s", title, winner.info_hash)
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id,
                               winner.info_hash, "repaired", None)
@@ -231,8 +231,8 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
     try:
         path.unlink()
         strm_generator._delete_spore_stubs(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("unlink failed for %s after all-candidates-failed: %s", path, exc)
     db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                           "unfixable", "all replacement candidates failed")
     return "unfixable"
