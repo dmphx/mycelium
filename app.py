@@ -56,6 +56,7 @@ from config import (
     SEASON_PACK_CHECK_INTERVAL_HOURS,
     SEASON_PACK_CONSOLIDATION_ENABLED,
     STRM_GENERATOR_INTERVAL_HOURS,
+    TORBOX_WEBHOOK_SECRET,
     TRENDING_CHECK_INTERVAL_HOURS,
     TRENDING_PRECACHE_COUNT,
     WEBHOOK_SECRET,
@@ -535,8 +536,25 @@ def _check_auth() -> None:
         # Migrate to the X-Webhook-Secret header.
         log.warning("Webhook secret passed via ?secret= query param from %s"
                     " - migrate to X-Webhook-Secret header", request.remote_addr)
-    if provided != secret:
+    # Constant-time compare to avoid leaking the secret one character at a time
+    # via response-time side-channels.
+    if not hmac.compare_digest(provided or "", secret):
         log.warning("Rejected webhook with bad/missing secret from %s", request.remote_addr)
+        abort(401)
+
+
+def _check_torbox_auth() -> None:
+    """Optional auth for the TorBox completion-notification endpoint.
+
+    If TORBOX_WEBHOOK_SECRET is set, the caller must present it via the
+    X-Webhook-Secret header. Empty secret preserves the legacy unauthenticated
+    behaviour."""
+    if not TORBOX_WEBHOOK_SECRET:
+        return
+    provided = request.headers.get("X-Webhook-Secret") or request.args.get("secret") or ""
+    if not hmac.compare_digest(provided, TORBOX_WEBHOOK_SECRET):
+        log.warning("Rejected torbox-webhook with bad/missing secret from %s",
+                    request.remote_addr)
         abort(401)
 
 
@@ -625,7 +643,7 @@ def webhook():
 def torbox_webhook():
     """Endpoint for TorBox to push completion notifications.
     Triggers strm_generator to catch the newly-ready torrent."""
-    _check_auth()
+    _check_torbox_auth()
     payload = request.get_json(silent=True) or {}
     log.info("TorBox webhook: %s", payload)
     threading.Thread(target=strm_generator.run_and_refresh, name="torbox-push", daemon=True).start()
