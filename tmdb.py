@@ -9,8 +9,19 @@ log = logging.getLogger(__name__)
 _BASE = "https://api.themoviedb.org/3"
 
 
+def _is_v4_token() -> bool:
+    # TMDB v4 read-access-tokens are JWTs ("eyJ..."); v3 API keys are 32-char hex.
+    # tmdb.py historically only sent the v4 Bearer header, which 401s when the
+    # configured key is a v3 key — silently breaking number_of_seasons lookups
+    # (and thus all-seasons expansion). Detect and auth accordingly.
+    return bool(TMDB_API_KEY) and TMDB_API_KEY.startswith("eyJ")
+
+
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {TMDB_API_KEY}", "Accept": "application/json"}
+    h = {"Accept": "application/json"}
+    if _is_v4_token():
+        h["Authorization"] = f"Bearer {TMDB_API_KEY}"
+    return h
 
 
 def _get(path: str, params: dict | None = None, timeout: int = 10) -> dict | None:
@@ -18,7 +29,10 @@ def _get(path: str, params: dict | None = None, timeout: int = 10) -> dict | Non
         log.warning("TMDB_API_KEY not set; skipping %s", path)
         return None
     try:
-        resp = req_lib.get(f"{_BASE}{path}", headers=_headers(), params=params, timeout=timeout)
+        p = dict(params or {})
+        if not _is_v4_token():
+            p["api_key"] = TMDB_API_KEY  # v3 auth via query param
+        resp = req_lib.get(f"{_BASE}{path}", headers=_headers(), params=p, timeout=timeout)
         resp.raise_for_status()
         return resp.json() or {}
     except req_lib.RequestException as exc:
