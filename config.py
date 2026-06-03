@@ -113,6 +113,14 @@ MAX_RETRY_ATTEMPTS = _env_int("MAX_RETRY_ATTEMPTS", 10)
 # Automatic Jellyfin merge of duplicate movie versions (every N hours; 0 disables).
 MERGE_VERSIONS_INTERVAL_HOURS = _env_int("MERGE_VERSIONS_INTERVAL_HOURS", 6)
 
+# Debounce/coalesce Jellyfin full-library scans (jellyfin.refresh_library). Many
+# code paths call it unconditionally; a burst of /Library/Refresh would otherwise
+# trigger overlapping full scans that cancel-restart each other, pinning CPU and
+# OOM-killing Jellyfin. Collapse a burst into one scan after this quiet window,
+# then enforce a cooldown so scans fire no more often than the minimum interval.
+JELLYFIN_REFRESH_DEBOUNCE_SEC = _env_int("JELLYFIN_REFRESH_DEBOUNCE_SEC", 30)
+JELLYFIN_REFRESH_MIN_INTERVAL_SEC = _env_int("JELLYFIN_REFRESH_MIN_INTERVAL_SEC", 300)
+
 # Cleanup/repair scan every N hours (0 disables).
 CLEANUP_INTERVAL_HOURS = _env_int("CLEANUP_INTERVAL_HOURS", 24)
 
