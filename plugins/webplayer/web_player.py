@@ -94,7 +94,7 @@ def _parse_browser_caps(user_agent: str) -> dict:
     return {"hevc_ok": hevc_ok}
 
 
-# -- Torrent selection ---------------------------------------------------------------
+# ── Torrent selection ──────────────────────────────────────────────────────────
 
 def _web_score(stream: torrentio.TorrentioStream,
                caps: dict | None = None) -> int:
@@ -176,7 +176,7 @@ def find_web_candidates(imdb_id: str, media_type: str,
     return [s for s, _ in scored]
 
 
-# -- Job lifecycle ------------------------------------------------------------------
+# ── Job lifecycle ──────────────────────────────────────────────────────────────
 
 class JobStatus(str, Enum):
     SEARCHING     = "searching"
@@ -231,7 +231,7 @@ def get_job(job_id: str) -> PrepareJob | None:
         return _jobs.get(job_id)
 
 
-# -- Pipeline -----------------------------------------------------------------------
+# ── Pipeline ───────────────────────────────────────────────────────────────────
 
 def _get_cdn_url(stream: torrentio.TorrentioStream,
                  ) -> tuple[str | None, int | None, int | None]:
@@ -394,7 +394,7 @@ def _run_job(job: PrepareJob) -> None:
 
             log.info("web_player: selected %r hash=%s", candidate.title, _hash)
 
-            # Reuse an active direct session (always prefer direct play).
+            # Reuse an active direct session (prefer direct play for non-HEVC).
             with _direct_lock:
                 existing_direct = _direct_sessions.get(_hash)
             if existing_direct:
@@ -403,13 +403,51 @@ def _run_job(job: PrepareJob) -> None:
                     log.info("web_player: CDN URL stale (%.0fs), refreshing hash=%s",
                              age, _hash)
                     _refresh_direct_cdn_url(existing_direct)
-                else:
+
+                if existing_direct.file_info.get('video_codec') != 'hevc':
                     log.info("web_player: reusing active direct session hash=%s", _hash)
-                job.token       = _hash
-                job.file_info   = existing_direct.file_info
-                job.cdn_url     = None
-                job.stream_type = "direct"
-                job.stream_url  = f"/stream/{_hash}/direct"
+                    job.token       = _hash
+                    job.file_info   = existing_direct.file_info
+                    job.cdn_url     = None
+                    job.stream_type = "direct"
+                    job.stream_url  = f"/stream/{_hash}/direct"
+                    job.status      = JobStatus.READY
+                    job.message     = "Ready"
+                    return
+
+                # HEVC: check for an existing HLS session first.
+                with _sessions_lock:
+                    existing_hls = _sessions.get(_hash)
+                if existing_hls and existing_hls.proc.poll() is None:
+                    log.info("web_player: reusing active HLS session for HEVC hash=%s", _hash)
+                    multi_audio = len(existing_hls.file_info.get("audio_tracks", [])) > 1
+                    job.token       = _hash
+                    job.file_info   = existing_hls.file_info
+                    job.cdn_url     = existing_hls.cdn_url
+                    job.stream_type = "hls"
+                    job.stream_url  = (f"/stream/{_hash}/hls/master.m3u8" if multi_audio
+                                       else f"/stream/{_hash}/hls/playlist.m3u8")
+                    job.status      = JobStatus.READY
+                    job.message     = "Ready"
+                    return
+
+                # HEVC without an HLS session - run conversion on the existing direct session.
+                log.info("web_player: transcoding HEVC direct session to HLS hash=%s", _hash)
+                job.token    = _hash
+                job.file_info = existing_direct.file_info
+                job.status   = JobStatus.PREPARING
+                job.message  = "Transcoding HEVC to 720p..."
+                _do_hls_conversion(_hash, existing_direct.file_info)
+                tmp_dir  = PLAYER_TMP_DIR / _hash
+                err_file = tmp_dir / "hls_error.txt"
+                rdy_file = tmp_dir / "hls_ready.txt"
+                if err_file.exists():
+                    job.status = JobStatus.ERROR
+                    job.error  = err_file.read_text()
+                    return
+                playlist = rdy_file.read_text().strip() if rdy_file.exists() else "playlist.m3u8"
+                job.stream_type = "hls"
+                job.stream_url  = f"/stream/{_hash}/hls/{playlist}"
                 job.status      = JobStatus.READY
                 job.message     = "Ready"
                 return
@@ -438,7 +476,7 @@ def _run_job(job: PrepareJob) -> None:
                 log.warning("web_player: requestdl failed for hash=%s, skipping", _hash)
                 continue
 
-            # Skip probe -- serve directly and let the browser decide.
+            # Skip probe — serve directly and let the browser decide.
             # ffprobe runs lazily only if HLS fallback is triggered.
             cdn_url     = _cdn
             torrent_id  = _torrent_id
@@ -455,18 +493,18 @@ def _run_job(job: PrepareJob) -> None:
         job.cdn_url   = cdn_url
         job.file_info = file_info
 
+        # Always transcode HEVC to HLS - browsers cannot reliably decode raw HEVC
+        # from a CDN MP4 regardless of whether they claim codec support.
+        needs_hls = hevc_fallback or file_info.get('video_codec') == 'hevc'
+
         job.status  = JobStatus.PREPARING
-        job.message = ("No H264 found - transcoding HEVC to 720p..."
-                       if hevc_fallback else "Preparing for playback...")
+        job.message = "Transcoding HEVC to 720p..." if needs_hls else "Preparing for playback..."
 
         _start_direct(session_key, file_info, cdn_url,
                       torrent_id=torrent_id, file_id=file_id)
         job.token = session_key
 
-        if hevc_fallback:
-            # Browser cannot play HEVC natively. Run HLS conversion now so the
-            # frontend receives a working HLS URL instead of a direct HEVC URL
-            # that the browser will reject with a black screen.
+        if needs_hls:
             _do_hls_conversion(session_key, file_info)
             tmp_dir  = PLAYER_TMP_DIR / session_key
             err_file = tmp_dir / "hls_error.txt"
@@ -495,7 +533,7 @@ def _run_job(job: PrepareJob) -> None:
         job.error  = f"Internal error ({type(exc).__name__}: {exc})"
 
 
-# -- FFprobe ------------------------------------------------------------------------
+# ── FFprobe ────────────────────────────────────────────────────────────────────
 
 def _probe(cdn_url: str) -> dict | None:
     try:
@@ -549,7 +587,7 @@ def _probe(cdn_url: str) -> dict | None:
     }
 
 
-# -- Direct play -------------------------------------------------------------------
+# ── Direct play ───────────────────────────────────────────────────────────────
 
 def _content_type_for(file_info: dict) -> str:
     fmt = file_info.get("container", "")
@@ -626,7 +664,7 @@ def start_hls_conversion(token: str) -> bool:
     if not s:
         return False
     if s.converting:
-        return True  # already in progress -- idempotent
+        return True  # already in progress — idempotent
     s.converting = True
     threading.Thread(target=_do_hls_conversion, args=(token, s.file_info),
                      daemon=True).start()
@@ -634,7 +672,7 @@ def start_hls_conversion(token: str) -> bool:
 
 
 def _file_info_from_candidate(candidate) -> dict:
-    """Minimal file_info derived from torrent name -- no ffprobe needed."""
+    """Minimal file_info derived from torrent name — no ffprobe needed."""
     blob = f"{candidate.name} {candidate.title}".lower()
     codec = 'unknown'
     if 'x265' in blob or 'hevc' in blob or 'h265' in blob:
@@ -664,8 +702,8 @@ def _do_hls_conversion(token: str, file_info: dict) -> None:
         s = get_direct_session(token)
         cdn_url = s.cdn_url if s else None
         if not cdn_url:
-            log.warning("web_player: HLS fallback -- no CDN URL for token=%s", token)
-            (tmp_dir / "hls_error.txt").write_text("Session expired -- please reopen the player")
+            log.warning("web_player: HLS fallback — no CDN URL for token=%s", token)
+            (tmp_dir / "hls_error.txt").write_text("Session expired — please reopen the player")
             return
         # Probe now if we skipped it during direct play (lazy path).
         if not file_info.get('audio_tracks'):
@@ -673,7 +711,7 @@ def _do_hls_conversion(token: str, file_info: dict) -> None:
             probed = _probe(cdn_url)
             if probed is None:
                 log.warning("web_player: ffprobe failed for token=%s", token)
-                (tmp_dir / "hls_error.txt").write_text("Could not read file info -- use Jellyfin")
+                (tmp_dir / "hls_error.txt").write_text("Could not read file info — use Jellyfin")
                 return
             file_info = probed
             s = get_direct_session(token)
@@ -683,7 +721,7 @@ def _do_hls_conversion(token: str, file_info: dict) -> None:
         if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT):
             session.proc.terminate()
             log.warning("web_player: HLS fallback timed out token=%s", token)
-            (tmp_dir / "hls_error.txt").write_text("FFmpeg timed out -- use Jellyfin for this file")
+            (tmp_dir / "hls_error.txt").write_text("FFmpeg timed out — use Jellyfin for this file")
             return
         multi_audio = len(file_info.get("audio_tracks", [])) > 1
         playlist = "master.m3u8" if multi_audio else "playlist.m3u8"
@@ -702,7 +740,7 @@ def _do_hls_conversion(token: str, file_info: dict) -> None:
             pass
 
 
-# -- HLS session -------------------------------------------------------------------
+# ── HLS session ────────────────────────────────────────────────────────────────
 
 @dataclass
 class HLSSession:
@@ -828,7 +866,7 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
     elif _vaapi_ok:
         # Hardware transcode via Intel QuickSync VA-API.
         # Decode HEVC in GPU, scale to 720p if needed, encode to H264 in GPU.
-        # Near-zero CPU -- eliminates the "can't keep up" issue on NAS hardware.
+        # Near-zero CPU — eliminates the "can't keep up" issue on NAS hardware.
         hw_pre = ["-hwaccel", "vaapi",
                   "-hwaccel_device", _VAAPI_DEV,
                   "-hwaccel_output_format", "vaapi"]
@@ -862,7 +900,7 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
         ]
         cmd.append(str(tmp_dir / "video.m3u8"))
 
-        # Outputs 1...N: one audio stream each
+        # Outputs 1…N: one audio stream each
         for i, track in enumerate(audio_tracks):
             cmd += [
                 "-map", f"0:a:{i}", *_audio_copy_or_transcode(track, 0),
@@ -955,7 +993,7 @@ def _wait_segments_pattern(tmp_dir: Path, pattern: str, count: int, timeout: flo
     return False
 
 
-# -- Subtitles ---------------------------------------------------------------------
+# ── Subtitles ──────────────────────────────────────────────────────────────────
 
 def _extract_subtitles(cdn_url: str, sub_tracks: list,
                        token: str, tmp_dir: Path) -> None:
@@ -1067,7 +1105,7 @@ def list_subtitles(token: str) -> list[dict]:
     return out
 
 
-# -- Cleanup -----------------------------------------------------------------------
+# ── Cleanup ────────────────────────────────────────────────────────────────────
 
 def cleanup_idle_sessions() -> None:
     cutoff = time.monotonic() - SESSION_IDLE_CLEANUP
