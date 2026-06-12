@@ -353,6 +353,28 @@ if [ "$spore_replaced" = "1" ]; then
                 _fa2+=("$_a")
             done
             newargs=("${_fa2[@]}")
+
+            # Also remove pre-input audio decoder hints injected earlier.
+            # With -codec:1 copy output, no decoder is needed. But the
+            # injected -codec:1 eac3 hint causes Plex's FFmpeg to open
+            # eac3_eae (its aliased decoder) even for copy mode, which
+            # fails with "No EAE watchfolder set!" on HTTP input.
+            _fa3=()
+            _past_i_ah=0
+            _sk_ah=0
+            for idx in "${!newargs[@]}"; do
+                [ "$_sk_ah" -gt 0 ] && { _sk_ah=$((_sk_ah-1)); continue; }
+                _a="${newargs[$idx]}"
+                _n="${newargs[$((idx+1))]:-}"
+                [ "$_a" = "-i" ] && _past_i_ah=1
+                if [ "$_past_i_ah" = "0" ] && [[ "$_a" =~ ^-codec:[1-9] ]]; then
+                    _sk_ah=1
+                    echo "$(date '+%H:%M:%S') WRAP removed pre-input audio hint: $_a $_n (audio copy)" >> "$SPORE_LOG"
+                    continue
+                fi
+                _fa3+=("$_a")
+            done
+            newargs=("${_fa3[@]}")
             echo "$(date '+%H:%M:%S') WRAP audio copy forced OK" >> "$SPORE_LOG"
         fi
     fi
