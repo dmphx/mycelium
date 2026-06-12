@@ -92,12 +92,21 @@ if [ "$spore_replaced" = "1" ]; then
                 echo "SPORE-WRAP: removed pre-input hint: $arg $next_arg" >&2
                 continue
             fi
-            # Before -i: remove -eae_prefix:N SESSION_ pairs
+            # Before -i: remove -eae_prefix:N SESSION_ pairs -- but ONLY when
+            # EAE_ROOT is not set (PCM/TrueHD stubs without EAE). When EAC3
+            # stub triggered EAE startup EAE_ROOT is already in the environment
+            # and the prefix is required for the eac3_eae decoder to coordinate
+            # file IPC with EAE. Removing it causes eac3_eae to fall back to
+            # the native ac3 decoder, which cannot decode E-AC-3.
             if [ "$idx" -lt "$i_pos" ] && [[ "$arg" =~ ^-eae_prefix:[0-9]+$ ]]; then
-                skip_next=1
-                echo "$(date '+%H:%M:%S') WRAP removed pre-input: $arg $next_arg" >> "$SPORE_LOG"
-                echo "SPORE-WRAP: removed pre-input EAE hint: $arg ..." >&2
-                continue
+                if [ -z "$EAE_ROOT" ]; then
+                    skip_next=1
+                    echo "$(date '+%H:%M:%S') WRAP removed pre-input: $arg $next_arg" >> "$SPORE_LOG"
+                    echo "SPORE-WRAP: removed pre-input EAE hint: $arg ..." >&2
+                    continue
+                else
+                    echo "$(date '+%H:%M:%S') WRAP kept -eae_prefix: $arg $next_arg (EAE running)" >> "$SPORE_LOG"
+                fi
             fi
             cleaned+=("$arg")
         done
