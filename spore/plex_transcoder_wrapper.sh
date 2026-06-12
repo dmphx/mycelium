@@ -172,6 +172,14 @@ if [ "$spore_replaced" = "1" ]; then
     # _needs_eae is used only to trigger force-audio-copy fallback when EAE_ROOT
     # is absent -- a safety net for edge cases, normally a no-op.
     case "$cdn_audio_codec" in truehd|dts_hd_ma) _needs_eae=1 ;; esac
+    # Stale PCM metadata: stub was updated to PCM by probe but then regenerated
+    # back to EAC3. Plex still thinks audio is PCM so it sends pcm_s16le decoder
+    # hint and does NOT start EAE. CDN has EAC3 -> eac3_eae auto-selected ->
+    # fails without watchfolder. Treat as EAE-needed so force-copy fires below.
+    if [ "$_is_pcm" = "1" ] && [ "$cdn_audio_codec" = "eac3" ] && [ "$_audio_output_is_copy" = "0" ]; then
+        _needs_eae=1
+        echo "$(date '+%H:%M:%S') WRAP stale PCM + EAC3 CDN: force audio copy (no EAE session)" >> "$SPORE_LOG"
+    fi
     if [ "$_needs_eae" = "0" ]; then
         _after_i=0
         for _a in "${newargs[@]}"; do
@@ -229,13 +237,10 @@ if [ "$spore_replaced" = "1" ]; then
         for idx in "${!newargs[@]}"; do
             if [ "${newargs[$idx]}" = "-i" ]; then i_pos_n=$idx; break; fi
         done
-        # Inject native decoder when:
-        #   (a) audio output is copy -- EAE not needed, native decoder prevents
-        #       eac3_eae from being auto-selected on HTTP input, or
-        #   (b) we removed a stale PCM decoder hint (_is_pcm=1) -- stub metadata
-        #       was PCM but CDN has EAC3; without injection FFmpeg auto-selects
-        #       eac3_eae which fails without a watchfolder (no -eae_prefix set).
-        if [ "$i_pos_n" -gt 0 ] && ([ "$_audio_output_is_copy" = "1" ] || [ "$_is_pcm" = "1" ]); then
+        # Inject native decoder only when audio output is copy -- EAE not needed,
+        # native decoder prevents eac3_eae from being auto-selected on HTTP input.
+        # Stale PCM + EAC3 CDN case is handled above via force-copy (_needs_eae=1).
+        if [ "$i_pos_n" -gt 0 ] && [ "$_audio_output_is_copy" = "1" ]; then
             front=("${newargs[@]:0:$i_pos_n}")
             back=("${newargs[@]:$i_pos_n}")
             # Use removed EAE stream indices if available; otherwise default to 1
