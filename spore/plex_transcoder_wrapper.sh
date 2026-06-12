@@ -48,16 +48,18 @@ if [ "$spore_replaced" = "1" ]; then
     fi
     echo "$(date '+%H:%M:%S') WRAP spore preferred_audio=${preferred_audio:-0}" >> "$SPORE_LOG"
 
-    # ── Remove pre-input EAE TrueHD/DTS-MA/PCM decoder hints ─────────────────
-    # Old stubs declared A_TRUEHD or A_PCM so Plex passed -codec:N truehd_eae
-    # or -codec:N pcm_s16le before -i. The CDN file has EAC3 (not TrueHD/PCM),
-    # causing wrong decoder selection. Remove those stale hints.
-    # NOTE: the new stub declares A_EAC3, so Plex passes -codec:1 eac3_eae
-    # before -i. That hint is intentionally KEPT here (not removed) because:
-    #   (a) Plex starts EAE before the transcoder when the stub has EAC3, so
-    #       EAE_ROOT is set and eac3_eae can decode the real CDN EAC3.
-    #   (b) If EAE_ROOT is somehow absent, the force-audio-copy block below
-    #       will remove the eac3_eae hint and fall back to audio passthrough.
+    # ── Remove pre-input EAE decoder hints ────────────────────────────────────
+    # Plex injects decoder hints before -i based on the stub audio codec:
+    #   A_EAC3 stub  -> -codec:1 eac3_eae  (EAE IPC decoder)
+    #   A_TRUEHD stub -> -codec:1 truehd_eae
+    #   A_PCM stub    -> -codec:1 pcm_s16le
+    # We remove ALL of these and inject the native decoder instead (see below).
+    # Native decoder (eac3, truehd, aac...) does not use EAE IPC, so:
+    #   - No EAE watchfolder needed -> no EAE startup latency
+    #   - Works over HTTP input (CDN URL) where EAE IPC is unreliable
+    #   - Works on any client (phone, Android TV, Shield TV) regardless of EAE state
+    # -eae_prefix is also always removed: only needed by eac3_eae/truehd_eae, which
+    # we no longer use.
     i_pos=-1
     for idx in "${!newargs[@]}"; do
         if [ "${newargs[$idx]}" = "-i" ]; then
@@ -79,12 +81,10 @@ if [ "$spore_replaced" = "1" ]; then
             next_idx=$((idx + 1))
             next_arg="${newargs[$next_idx]:-}"
 
-            # Before -i: remove -codec:N truehd_eae / dts_ma_eae / pcm_s* pairs.
-            # Plex injects pcm_s16le (or pcm_s24le etc) when the stub declares PCM
-            # audio. The CDN file has EAC3, so this hint is wrong and conflicts with
-            # the -codec:N eac3 hint we inject below, causing FFmpeg to crash.
+            # Before -i: remove ALL EAE decoder hints and PCM hints.
+            # We inject the native decoder below, which is faster (no EAE IPC).
             if [ "$idx" -lt "$i_pos" ] && [[ "$arg" =~ ^-codec:[0-9]+$ ]] && \
-               [[ "$next_arg" =~ ^((truehd|dts_ma)_eae|pcm_s[0-9]+(le|be))$ ]]; then
+               [[ "$next_arg" =~ ^((eac3|truehd|dts_ma)_eae|pcm_s[0-9]+(le|be))$ ]]; then
                 skip_next=1
                 stream_n="${arg#-codec:}"
                 removed_eae_indices+=("$stream_n")
@@ -92,34 +92,35 @@ if [ "$spore_replaced" = "1" ]; then
                 echo "SPORE-WRAP: removed pre-input hint: $arg $next_arg" >&2
                 continue
             fi
-            # Before -i: remove -eae_prefix:N SESSION_ pairs -- but ONLY when
-            # EAE_ROOT is not set (PCM/TrueHD stubs without EAE). When EAC3
-            # stub triggered EAE startup EAE_ROOT is already in the environment
-            # and the prefix is required for the eac3_eae decoder to coordinate
-            # file IPC with EAE. Removing it causes eac3_eae to fall back to
-            # the native ac3 decoder, which cannot decode E-AC-3.
+            # Before -i: ALWAYS remove -eae_prefix:N pairs.
+            # eae_prefix is only needed by eac3_eae/truehd_eae (EAE IPC). Since we
+            # replace those with native decoders (injected below), the prefix is
+            # never needed. Keeping it with native eac3 decoder causes FFmpeg to
+            # pass -eae_prefix as an unknown option, which may cause an error.
             if [ "$idx" -lt "$i_pos" ] && [[ "$arg" =~ ^-eae_prefix:[0-9]+$ ]]; then
-                if [ -z "$EAE_ROOT" ]; then
-                    skip_next=1
-                    echo "$(date '+%H:%M:%S') WRAP removed pre-input: $arg $next_arg" >> "$SPORE_LOG"
-                    echo "SPORE-WRAP: removed pre-input EAE hint: $arg ..." >&2
-                    continue
-                else
-                    echo "$(date '+%H:%M:%S') WRAP kept -eae_prefix: $arg $next_arg (EAE running)" >> "$SPORE_LOG"
-                fi
+                skip_next=1
+                echo "$(date '+%H:%M:%S') WRAP removed -eae_prefix: $arg $next_arg (native decoder, no EAE IPC)" >> "$SPORE_LOG"
+                echo "SPORE-WRAP: removed EAE prefix hint: $arg" >&2
+                continue
             fi
             cleaned+=("$arg")
         done
         newargs=("${cleaned[@]}")
     fi
 
-    # ── Inject native decoder hint (non-EAE codecs only) ─────────────────────
-    # For codecs other than EAC3/TrueHD: inject an explicit decoder hint so
-    # FFmpeg uses the right native decoder instead of an EAE variant.
-    # For EAC3: Plex already passes -codec:1 eac3_eae before -i (because the
-    # stub declares A_EAC3), and EAE_ROOT is set (Plex started EAE for the
-    # stub). We skip injection for eac3 entirely -- the existing hint works.
-    # If EAE_ROOT is absent, force-audio-copy below handles the fallback.
+    # ── Inject native decoder hint ────────────────────────────────────────────
+    # For ALL CDN audio codecs where output is NOT copy: inject the native
+    # decoder before -i. This replaces any eac3_eae/truehd_eae hint (already
+    # removed above) with the native FFmpeg decoder, which does not use EAE IPC.
+    #
+    # Why native decoder instead of eac3_eae:
+    #   - No EAE watchfolder needed (EAE IPC fails/hangs over HTTP CDN input)
+    #   - Fast: no file IPC round-trip per audio frame
+    #   - Works on all clients (Shield TV Direct Stream, phone Opus, Android TV)
+    #
+    # When output IS copy (Direct Stream audio -- e.g. Shield TV + AV receiver):
+    #   _output_is_copy returns true -> injection is skipped. Audio packets are
+    #   copied directly from CDN without any decode. EAC3 passthrough to eARC.
     cdn_audio_codec=""
     if [ -f "$spore_minfo" ]; then
         cdn_audio_codec=$(grep "^cdn_audio_codec=" "$spore_minfo" | head -1 | cut -d= -f2)
@@ -134,11 +135,11 @@ if [ "$spore_replaced" = "1" ]; then
     # OR the post-input args contain eac3_eae/truehd_eae as output encoder
     # (e.g. Shield TV requests EAC3 output for AV receiver via eARC).
     _needs_eae=0
-    # EAC3 routes through eac3_eae (EAE), which requires EAE_ROOT to be set.
-    # Plex starts EAE before the transcoder when the stub declares EAC3, so
-    # EAE_ROOT should be present in our environment. We still check/discover
-    # it here as a safety net (and to trigger force-audio-copy fallback if absent).
-    case "$cdn_audio_codec" in eac3|truehd|eac3_eae|truehd_eae) _needs_eae=1 ;; esac
+    # EAE is needed only for TrueHD/DTS-MA when native decoder is also absent.
+    # EAC3 is handled by the native eac3 decoder (injected below), not EAE.
+    # _needs_eae is used only to trigger force-audio-copy fallback when EAE_ROOT
+    # is absent -- a safety net for edge cases, normally a no-op.
+    case "$cdn_audio_codec" in truehd|dts_hd_ma) _needs_eae=1 ;; esac
     if [ "$_needs_eae" = "0" ]; then
         _after_i=0
         for _a in "${newargs[@]}"; do
@@ -213,13 +214,6 @@ if [ "$spore_replaced" = "1" ]; then
                     echo "SPORE-WRAP: skip decoder hint -codec:${ei} (output=copy, EAE not needed)" >&2
                     continue
                 fi
-                # Skip EAC3: Plex's own eac3_eae hint works when EAE_ROOT is set
-                # (Plex started EAE because stub declares A_EAC3). If EAE_ROOT
-                # is absent the force-audio-copy block below handles the fallback.
-                if [ "$cdn_audio_codec" = "eac3" ]; then
-                    echo "$(date '+%H:%M:%S') WRAP skip eac3 injection (EAE_ROOT=${EAE_ROOT:-(not set)}, Plex hint kept)" >> "$SPORE_LOG"
-                    continue
-                fi
                 native_hints+=("-codec:${ei}" "$cdn_audio_codec")
                 echo "$(date '+%H:%M:%S') WRAP inject native decoder: -codec:${ei} ${cdn_audio_codec}" >> "$SPORE_LOG"
                 echo "SPORE-WRAP: injected native decoder: -codec:${ei} ${cdn_audio_codec}" >&2
@@ -229,8 +223,8 @@ if [ "$spore_replaced" = "1" ]; then
     fi
 
     # ── Force video copy when Plex chose full transcode ───────────────────────
-    # 16ch PCM stubs force Plex to full-transcode (hevc_vaapi or libx264).
-    # hevc_vaapi fails at 4K on GeminiLake UHD 600; libx264 is too slow.
+    # VP8 stub forces Plex to transcode video (no client Direct Plays VP8).
+    # The actual CDN video (HEVC, H264) is copied as-is by FFmpeg.
     # Detect when post-input -codec:0 is not "copy" and restructure:
     #   - Remove video filter_complex ([0:0]scale...hwupload/yuv420p)
     #   - Remove -init_hw_device / -filter_hw_device
@@ -319,21 +313,19 @@ if [ "$spore_replaced" = "1" ]; then
         echo "SPORE-WRAP: remapped filter_complex [0:${stub_audio_idx}] -> [0:${cdn_preferred_idx}]" >&2
     fi
 
-    # ── Force audio copy for EAC3 CDN (always) / fallback for other EAE codecs ─
-    # For EAC3: always force -codec:1 copy regardless of EAE_ROOT state.
-    #   - EAE is unreliable over HTTP input (watchfolder IPC designed for
-    #     local files). Even when EAE_ROOT is found it may be stale, causing
-    #     eac3_eae to hang ~5 sec before Plex kills the session.
-    #   - EAC3 copy passthrough is actually better: Shield TV + eARC AV
-    #     receiver receives the native EAC3 5.1 bitstream directly.
-    # For TrueHD/other EAE codecs: force copy only when EAE is unavailable.
+    # ── Force audio copy as fallback when EAE unavailable ────────────────────
+    # With the VP8+EAC3 stub and native decoder injection above, audio decode
+    # works without EAE for all clients. This block handles edge cases where
+    # EAE is expected but not running AND native decode is also unavailable
+    # (e.g. TrueHD fallback when native truehd decoder fails to init).
+    #
+    # For Shield TV + AV receiver: audio is Direct Stream (already copy),
+    # so _acodec_post = "copy" -> inner condition is false -> no-op.
+    # For phone/MiTV: native decoder injected, EAE_ROOT set -> not triggered.
     _force_audio_copy=0
-    if [ "$cdn_audio_codec" = "eac3" ]; then
+    if [ "$_needs_eae" = "1" ] && [ -z "$EAE_ROOT" ]; then
         _force_audio_copy=1
-        echo "$(date '+%H:%M:%S') WRAP force audio copy: EAC3 CDN (always passthrough)" >> "$SPORE_LOG"
-    elif [ "$_needs_eae" = "1" ] && [ -z "$EAE_ROOT" ]; then
-        _force_audio_copy=1
-        echo "$(date '+%H:%M:%S') WRAP force audio copy: EAE unavailable" >> "$SPORE_LOG"
+        echo "$(date '+%H:%M:%S') WRAP force audio copy: EAE unavailable (fallback)" >> "$SPORE_LOG"
     fi
     if [ "$_force_audio_copy" = "1" ]; then
         _acodec_post=""
