@@ -49,6 +49,12 @@ _TRAILER_RE = re.compile(
 _MIN_MOVIE_SIZE = 200 * 1024 * 1024  # 200 MB  -  anything smaller is likely a trailer/sample
 
 
+# =============================================================================
+# SHARED UTILITIES
+# Naam-parsing, pad-opbouw, bestandsdetectie.
+# Gebruikt door zowel Jellyfin .strm als Plex Spore -- voorzichtig wijzigen.
+# =============================================================================
+
 def _is_video(name: str) -> bool:
     return Path(name).suffix.lower() in _VIDEO_EXTS
 
@@ -150,6 +156,10 @@ def _extract_year(name: str) -> int | None:
     m = _YEAR_RE.search(name or "")
     return int(m.group(1)) if m else None
 
+
+# ── Jellyfin: NFO en mapbeheer ────────────────────────────────────────────────
+# NFO sidecars, canonieke mapnamen, IMDB-titelherstel.
+# Alles hier raakt uitsluitend Jellyfin; Plex Spore stubs blijven onaangetast.
 
 def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
                media_type: str = "movie", nfo_path: Path | None = None) -> None:
@@ -331,6 +341,9 @@ _preload_state = {"last_add": 0.0}            # mutable so no global keyword nee
 _PRELOAD_MIN_INTERVAL = 7.0                   # seconds between add_magnet calls (~8/min, limit is 10/min)
 
 
+# ── Catbox: CDN URL cache ─────────────────────────────────────────────────────
+# TorBox CDN URL ophalen en opslaan. Gedeeld door Jellyfin en Spore.
+
 def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
     """Fetch CDN URL for a ready TorBox item and store in catbox URL cache.
     Uses _pick_main_movie_file to select the correct file."""
@@ -368,6 +381,10 @@ _SAFE_AUDIO_CODECS = frozenset({
     "pcm_s16le", "pcm_s24le", "pcm_s32le",
 })
 
+
+# ── Plex Spore: audio-voorkeur helpers ────────────────────────────────────────
+# Selectie van veilig decodeerbaar audiotrack en .minfo sidecar beheer.
+# Raakt ALLEEN Plex .minfo bestanden; geen Jellyfin .strm bestanden.
 
 def _preferred_audio_index(audio_streams: list[dict]) -> int:
     """Return 0-based audio stream index to prefer for FFmpeg -map 0:a:N.
@@ -502,6 +519,14 @@ def _preload_torrent(info_hash: str, magnet: str, title: str) -> None:
             with _preload_lock:
                 _preload_in_flight.discard(info_hash)
 
+
+# =============================================================================
+# CATBOX / LAZY STRM  --  RAAKT BEIDE SYSTEMEN
+# create_lazy_*_strm schrijft zowel Jellyfin .strm als Plex .minfo + stub MKV.
+# Wijzigingen hier kunnen ZOWEL Jellyfin als Plex breken. Na aanpassing:
+#   - test Jellyfin: controleer of .strm aangemaakt wordt in MEDIA_PATH
+#   - test Plex: controleer of .mkv + .minfo aangemaakt worden in SPORE_MEDIA_PATH
+# =============================================================================
 
 def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                             year: int | None, imdb_id: str | None = None,
@@ -640,7 +665,11 @@ def _norm_title(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', s.lower())  # alphanumeric only
 
 
-# ── Mycelium Spore: stub MKV generation ─────────────────────────────────────
+# =============================================================================
+# PLEX SPORE: stub MKV generatie
+# Alleen Plex-gerelateerde code. Jellyfin .strm bestanden worden hier NIET
+# aangeraakt. EBML bytes, .mkv stubs, .minfo sidecars, stub-update na probe.
+# =============================================================================
 
 def _ebml_vint(n: int) -> bytes:
     """Encode n as EBML variable-length integer (used for element sizes)."""
@@ -843,16 +872,13 @@ def make_stub_mkv(title: str, quality: str | None = None,
             )
             next_num += 1
     else:
-        # PCM 2ch placeholder: PCM stereo is not listed in the Shield TV XML
-        # profile's DirectPlayProfile audio codecs, so Plex always invokes the
-        # external transcoder (never direct-plays the stub). Using 2ch instead
-        # of the previous 16ch avoids the Shield TV client augmentation limit of
-        # audio.channels <= 8, which caused "Direct Streaming is disabled" and
-        # forced unnecessary video re-encoding. With 2ch the channels check
-        # passes and Plex can copy the video stream while transcoding audio.
+        # PCM 16ch placeholder: 16-channel PCM cannot be Direct Played on any
+        # device (HDMI/eARC max is 8ch), so Plex always invokes the external
+        # transcoder regardless of client profile. The wrapper then forces
+        # video copy mode (see plex_transcoder_wrapper.sh force-video-copy).
         tracks_data += _ebml_audio_track_entry(
             track_num=2, codec_mkv="A_PCM/INT/LIT", lang="und",
-            channels=2, sample_rate=48000.0, is_default=True,
+            channels=16, sample_rate=48000.0, is_default=True,
         )
         next_num = 3
 
@@ -1147,6 +1173,12 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
         log.warning("Spore: stub update failed for token=%s: %s", token, exc)
         return False
 
+
+# =============================================================================
+# JELLYFIN .strm  --  batch write / repair / cleanup
+# Alles hieronder schrijft of herstelt Jellyfin .strm bestanden.
+# Plex Spore stubs (.mkv / .minfo) worden hier NIET aangeraakt.
+# =============================================================================
 
 def _write_strm(path: Path, url: str) -> bool:
     """Write .strm file only if it doesn't exist. Returns True if a new file was written."""

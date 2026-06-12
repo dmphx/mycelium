@@ -138,6 +138,7 @@ if [ "$spore_replaced" = "1" ]; then
 
     if [ "$_needs_eae" = "1" ]; then
         if [ -z "$EAE_ROOT" ]; then
+            # Methode 1: lees EAE_ROOT uit PMS process environment
             for _pid in $(pgrep -f "Plex Media Server" 2>/dev/null | head -5); do
                 [ -r "/proc/$_pid/environ" ] || continue
                 _val=$(tr '\0' '\n' < "/proc/$_pid/environ" 2>/dev/null \
@@ -148,6 +149,16 @@ if [ "$spore_replaced" = "1" ]; then
                     break
                 fi
             done
+        fi
+        if [ -z "$EAE_ROOT" ]; then
+            # Methode 2: zoek EasyAudioEncoder watchfolder direct op schijf
+            # Plex maakt /run/plex-temp/pms-<uuid>/EasyAudioEncoder aan bij opstarten.
+            _found=$(find /run/plex-temp /tmp -maxdepth 4 -type d \
+                         -name "EasyAudioEncoder" 2>/dev/null | head -1)
+            if [ -n "$_found" ]; then
+                export EAE_ROOT="$_found"
+                echo "$(date '+%H:%M:%S') WRAP EAE_ROOT from find: $EAE_ROOT" >> "$SPORE_LOG"
+            fi
         fi
         if [ -z "$EAE_ROOT" ]; then
             echo "$(date '+%H:%M:%S') WRAP WARNING: EAE_ROOT not set -- EAE will likely fail" >> "$SPORE_LOG"
@@ -199,6 +210,69 @@ if [ "$spore_replaced" = "1" ]; then
         fi
     fi
 
+    # ── Force video copy when Plex chose full transcode ───────────────────────
+    # 16ch PCM stubs force Plex to full-transcode (hevc_vaapi or libx264).
+    # hevc_vaapi fails at 4K on GeminiLake UHD 600; libx264 is too slow.
+    # Detect when post-input -codec:0 is not "copy" and restructure:
+    #   - Remove video filter_complex ([0:0]scale...hwupload/yuv420p)
+    #   - Remove -init_hw_device / -filter_hw_device
+    #   - Replace -map [video_hw_label] with -map 0:0
+    #   - Replace -codec:0 <encoder> with -codec:0 copy
+    #   - Remove video encoding params (bitrate, preset, keyframe, etc.)
+    _vcodec_post=""
+    _ai=0
+    for idx in "${!newargs[@]}"; do
+        [ "${newargs[$idx]}" = "-i" ] && _ai=1 && continue
+        if [ "$_ai" = "1" ] && [ "${newargs[$idx]}" = "-codec:0" ]; then
+            _vcodec_post="${newargs[$((idx+1))]:-}"
+            break
+        fi
+    done
+
+    if [ -n "$_vcodec_post" ] && [ "$_vcodec_post" != "copy" ]; then
+        echo "$(date '+%H:%M:%S') WRAP force video copy (was: $_vcodec_post)" >> "$SPORE_LOG"
+        echo "SPORE-WRAP: forcing video copy (was: $_vcodec_post)" >&2
+        _vhl=""
+        _fc=()
+        _sk=0
+        _past_i=0
+        for idx in "${!newargs[@]}"; do
+            [ "$_sk" -gt 0 ] && { _sk=$((_sk-1)); continue; }
+            _a="${newargs[$idx]}"
+            _n="${newargs[$((idx+1))]:-}"
+            [ "$_a" = "-i" ] && _past_i=1
+            case "$_a" in
+                -fps_mode|-init_hw_device|-filter_hw_device)
+                    _sk=1; continue ;;
+                -filter_complex)
+                    if [[ "$_n" == \[0:0\]* ]]; then
+                        _vhl=$(echo "$_n" | grep -oE '\[[0-9]+\]' | tail -1)
+                        _sk=1
+                        echo "$(date '+%H:%M:%S') WRAP removed video filter_complex (label=${_vhl})" >> "$SPORE_LOG"
+                        continue
+                    fi ;;
+                -map)
+                    if [ -n "$_vhl" ] && [ "$_n" = "$_vhl" ]; then
+                        _fc+=("-map" "0:0"); _sk=1
+                        echo "$(date '+%H:%M:%S') WRAP replaced -map ${_vhl} -> 0:0" >> "$SPORE_LOG"
+                        continue
+                    fi ;;
+                -codec:0)
+                    # Only replace post-input: pre-input is a decoder hint (keep as-is)
+                    if [ "$_past_i" = "1" ] && [ "$_n" != "copy" ]; then
+                        _fc+=("-codec:0" "copy"); _sk=1; continue
+                    fi ;;
+                -b:0|-maxrate:0|-bufsize:0|-force_key_frames:0|-crf:0|-preset:0|-level:0|-x264opts:0|-x265opts:0)
+                    _sk=1; continue ;;
+                -sei:0|-a53_cc)
+                    continue ;;
+            esac
+            _fc+=("$_a")
+        done
+        newargs=("${_fc[@]}")
+        echo "$(date '+%H:%M:%S') WRAP video copy forced OK" >> "$SPORE_LOG"
+    fi
+
     # ── Remap audio stream if preferred_audio > 0 ─────────────────────────────
     # Used when CDN has TrueHD at 0:1 AND a decode-safe fallback at 0:(1+N).
     # preferred_audio=N is written to .minfo by Mycelium's probe logic.
@@ -227,6 +301,28 @@ if [ "$spore_replaced" = "1" ]; then
         echo "SPORE-WRAP: remapped filter_complex [0:${stub_audio_idx}] -> [0:${cdn_preferred_idx}]" >&2
     fi
 
+    # ── Make subtitle stream mappings optional ─────────────────────────────────
+    # CDN MKV stream layout may differ from stub metadata. If Plex maps 0:2 for
+    # subtitles but the CDN file has no stream at index 2, FFmpeg exits with error.
+    # Append '?' to -map 0:N specifiers in the subtitle output section (after
+    # media-%05d.ts) so FFmpeg silently skips missing streams instead of crashing.
+    _past_first_out=0
+    _sub_optional_count=0
+    for idx in "${!newargs[@]}"; do
+        _a="${newargs[$idx]}"
+        [[ "$_a" == *"media-%05d"* ]] && _past_first_out=1
+        if [ "$_past_first_out" = "1" ] && [ "$_a" = "-map" ]; then
+            _nxt="${newargs[$((idx+1))]:-}"
+            if [[ "$_nxt" =~ ^0:[0-9]+$ ]]; then
+                newargs[$((idx+1))]="${_nxt}?"
+                _sub_optional_count=$((_sub_optional_count+1))
+                echo "$(date '+%H:%M:%S') WRAP sub-map optional: ${_nxt} -> ${_nxt}?" >> "$SPORE_LOG"
+            fi
+        fi
+    done
+    [ "$_sub_optional_count" -gt 0 ] && \
+        echo "$(date '+%H:%M:%S') WRAP made $_sub_optional_count sub-map(s) optional" >> "$SPORE_LOG"
+
     # ── Muxer error tolerance ──────────────────────────────────────────────────
     # -max_interleave_delta 0 : video keeps flowing even if audio stalls
     # -max_muxing_queue_size  : bigger buffer for audio seek-sync recovery
@@ -238,4 +334,8 @@ if [ "$spore_replaced" = "1" ]; then
     echo "$(date '+%H:%M:%S') WRAP final cmd: ${newargs[*]}" >> "$SPORE_LOG"
 fi
 
+if [ "$spore_replaced" = "1" ]; then
+    exec '/usr/lib/plexmediaserver/Plex Transcoder.real' "${newargs[@]}" \
+        2>>/config/spore-ffmpeg-stderr.log
+fi
 exec '/usr/lib/plexmediaserver/Plex Transcoder.real' "${newargs[@]}"
