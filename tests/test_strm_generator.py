@@ -167,8 +167,8 @@ class TestMakeStubMkv:
 
     def test_audio_track_present(self):
         data = sg.make_stub_mkv("Test", quality="1080p")
-        # EAC3 16ch placeholder audio track (triggers EAE startup in Plex)
-        assert b"A_EAC3" in data
+        # PCM 16ch placeholder -- prevents Direct Play (HDMI max 8ch PCM)
+        assert b"A_PCM/INT/LIT" in data
 
 
 class TestWriteSporeStubs:

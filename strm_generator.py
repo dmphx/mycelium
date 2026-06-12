@@ -780,7 +780,7 @@ def make_stub_mkv(title: str, quality: str | None = None,
 
     audio_tracks: list of dicts with keys codec, language, channels, sample_rate.
     subtitle_tracks: list of dicts with keys codec, language.
-    When audio_tracks is None, a single TrueHD placeholder is used so Plex
+    When audio_tracks is None, a PCM 16ch placeholder is used so Plex
     always invokes the transcoder (never direct-plays the stub).
     """
     width, height = 1920, 1080
@@ -872,22 +872,25 @@ def make_stub_mkv(title: str, quality: str | None = None,
             )
             next_num += 1
     else:
-        # EAC3 5.1 (6ch) placeholder. Design goals:
-        #   1. Prevent Direct PLAY: video has no SPS/PPS so Plex can't verify
-        #      the HEVC profile -- video must be transcoded, wrapper is called.
-        #   2. Allow Direct Stream Audio: Plex sees EAC3 5.1 + client accepts
-        #      EAC3 in HLS (Shield TV / Android TV profile) -> Plex chooses
-        #      audio passthrough (-codec:1 copy). No EAE decode needed.
-        #      First HLS segment is produced instantly (video+audio copy).
-        #   3. Wrapper forces video copy (hevc_vaapi -> copy). Audio is already
-        #      copy. Shield TV plays HEVC + EAC3 5.1 via eARC to AV receiver.
+        # PCM 16ch placeholder. Design goals:
+        #   1. Prevent Direct Play: HDMI max is 8ch PCM. Plex knows no client
+        #      can direct-play 16ch PCM, so it always calls the Plex Transcoder.
+        #      The wrapper intercepts the call and replaces -i stub.mkv with
+        #      -i http://127.0.0.1:8088/spore-stream/<token>.
+        #   2. Force audio copy for EAC3/TrueHD CDN: the wrapper reads
+        #      cdn_audio_codec from the .minfo sidecar. When EAE_ROOT is absent
+        #      (Plex did NOT start EAE because the stub is PCM), the
+        #      force-audio-copy block replaces the output audio codec with
+        #      -codec:1 copy. Raw EAC3/TrueHD packets are passed through;
+        #      eac3_eae is never invoked. Shield TV + eARC AV receiver receives
+        #      the original lossless/lossy audio bitstream directly.
         #
-        # Why NOT 16ch: 16ch EAC3 forces Opus transcoding via EAE. EAE IPC
-        # latency makes the first segment too slow for Plex's startup timeout
-        # (~200ms), causing the session to be killed before any segments appear.
+        # Why NOT EAC3 6ch: with HEVC video + EAC3 5.1, Plex chooses Full
+        # Direct Play for Shield TV (both codecs supported). Wrapper is never
+        # called. The empty stub MKV is served directly -> black screen.
         tracks_data += _ebml_audio_track_entry(
-            track_num=2, codec_mkv="A_EAC3", lang="und",
-            channels=6, sample_rate=48000.0, is_default=True,
+            track_num=2, codec_mkv="A_PCM/INT/LIT", lang="und",
+            channels=16, sample_rate=48000.0, is_default=True,
         )
         next_num = 3
 
