@@ -229,7 +229,13 @@ if [ "$spore_replaced" = "1" ]; then
         for idx in "${!newargs[@]}"; do
             if [ "${newargs[$idx]}" = "-i" ]; then i_pos_n=$idx; break; fi
         done
-        if [ "$i_pos_n" -gt 0 ] && [ "$_audio_output_is_copy" = "1" ]; then
+        # Inject native decoder when:
+        #   (a) audio output is copy -- EAE not needed, native decoder prevents
+        #       eac3_eae from being auto-selected on HTTP input, or
+        #   (b) we removed a stale PCM decoder hint (_is_pcm=1) -- stub metadata
+        #       was PCM but CDN has EAC3; without injection FFmpeg auto-selects
+        #       eac3_eae which fails without a watchfolder (no -eae_prefix set).
+        if [ "$i_pos_n" -gt 0 ] && ([ "$_audio_output_is_copy" = "1" ] || [ "$_is_pcm" = "1" ]); then
             front=("${newargs[@]:0:$i_pos_n}")
             back=("${newargs[@]:$i_pos_n}")
             # Use removed EAE stream indices if available; otherwise default to 1
