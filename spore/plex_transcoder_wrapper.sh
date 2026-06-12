@@ -301,6 +301,62 @@ if [ "$spore_replaced" = "1" ]; then
         echo "SPORE-WRAP: remapped filter_complex [0:${stub_audio_idx}] -> [0:${cdn_preferred_idx}]" >&2
     fi
 
+    # ── Force audio copy when EAE unavailable ─────────────────────────────────
+    # eac3_eae / truehd_eae require an EAE_ROOT watchfolder that Plex creates
+    # only for local-file sessions. With HTTP input (-i http://...) EAE never
+    # initialises, causing "No EAE watchfolder set!" and decode failure.
+    # Fix: copy the audio stream as-is (EAC3 passthrough). Shield TV + eARC
+    # AV receiver receives the original EAC3 5.1 stream directly.
+    if [ "$_needs_eae" = "1" ] && [ -z "$EAE_ROOT" ]; then
+        _acodec_post=""
+        _ai3=0
+        for idx in "${!newargs[@]}"; do
+            [ "${newargs[$idx]}" = "-i" ] && _ai3=1 && continue
+            if [ "$_ai3" = "1" ] && [ "${newargs[$idx]}" = "-codec:1" ]; then
+                _acodec_post="${newargs[$((idx+1))]:-}"
+                break
+            fi
+        done
+
+        if [ -n "$_acodec_post" ] && [ "$_acodec_post" != "copy" ]; then
+            echo "$(date '+%H:%M:%S') WRAP force audio copy (was: $_acodec_post, EAE unavailable)" >> "$SPORE_LOG"
+            _ahl2=""
+            _fa2=()
+            _sk3=0
+            _past_i3=0
+            for idx in "${!newargs[@]}"; do
+                [ "$_sk3" -gt 0 ] && { _sk3=$((_sk3-1)); continue; }
+                _a="${newargs[$idx]}"
+                _n="${newargs[$((idx+1))]:-}"
+                [ "$_a" = "-i" ] && _past_i3=1
+                case "$_a" in
+                    -filter_complex)
+                        if [[ "$_n" == \[0:1\]* ]]; then
+                            _ahl2=$(echo "$_n" | grep -oE '\[[0-9]+\]' | tail -1)
+                            _sk3=1
+                            echo "$(date '+%H:%M:%S') WRAP removed audio filter_complex (label=${_ahl2})" >> "$SPORE_LOG"
+                            continue
+                        fi ;;
+                    -map)
+                        if [ -n "$_ahl2" ] && [ "$_n" = "$_ahl2" ]; then
+                            _fa2+=("-map" "0:1"); _sk3=1
+                            echo "$(date '+%H:%M:%S') WRAP replaced audio -map ${_ahl2} -> 0:1" >> "$SPORE_LOG"
+                            continue
+                        fi ;;
+                    -codec:1)
+                        if [ "$_past_i3" = "1" ] && [ "$_n" != "copy" ]; then
+                            _fa2+=("-codec:1" "copy"); _sk3=1; continue
+                        fi ;;
+                    -b:1|-maxrate:1|-bufsize:1)
+                        [ "$_past_i3" = "1" ] && { _sk3=1; continue; } ;;
+                esac
+                _fa2+=("$_a")
+            done
+            newargs=("${_fa2[@]}")
+            echo "$(date '+%H:%M:%S') WRAP audio copy forced OK" >> "$SPORE_LOG"
+        fi
+    fi
+
     # ── Make subtitle stream mappings optional ─────────────────────────────────
     # CDN MKV stream layout may differ from stub metadata. If Plex maps 0:2 for
     # subtitles but the CDN file has no stream at index 2, FFmpeg exits with error.
