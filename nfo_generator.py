@@ -111,7 +111,7 @@ def repair_tvshow_titles() -> dict:
             continue
 
         title_el = root.find("title")
-        if not title_el or not title_el.text:
+        if title_el is None or not (title_el.text or "").strip():
             continue
         if not _BAD_TITLE_RE.match(title_el.text.strip()):
             continue  # title already looks correct
@@ -123,7 +123,7 @@ def repair_tvshow_titles() -> dict:
 
         # Prefer canonical DB title, fall back to folder name (strip region suffix like (IN))
         correct_title = monitored_by_imdb.get(imdb_id)
-        if not correct_title:
+        if not correct_title or _BAD_TITLE_RE.match(correct_title):
             correct_title = re.sub(r'\s+\([A-Z]{2}\)$', '', folder.name).strip() or folder.name
 
         try:

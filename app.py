@@ -526,6 +526,7 @@ _delayed(60.0, library_sync.resolve_unknowns, "resolve-unknowns-init")
 _delayed(90.0, library_sync.import_series_to_monitored, "series-monitored-init")
 _delayed(120.0, nfo_generator.generate_all, "nfo-init")
 _delayed(150.0, nfo_generator.fetch_local_images, "images-init")
+_delayed(180.0, nfo_generator.repair_tvshow_titles, "nfo-repair")
 _delayed(45.0, _backfill_tmdb_ids, "tmdb-id-backfill")
 
 
