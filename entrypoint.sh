@@ -20,7 +20,22 @@ if [ "$current_uid" != "$PUID" ]; then
     usermod -u "$PUID" -o mycelium >/dev/null
 fi
 
-# Only chown the writable data dir; /app is baked into the image.
-chown -R mycelium:mycgrp /data 2>/dev/null || true
+# Fix ownership of the writable state under /data so the dropped-privilege
+# mycelium user can read/write it. Deliberately do NOT recurse the large
+# bind-mounted media library (/data/media) or the Spore stub tree
+# (/data/plex-media): mycelium creates those files as itself (already PUID:PGID),
+# and walking 200k+ inodes on every start adds minutes to a cold restart and
+# scales with library size. /app is baked into the image.
+for entry in /data/* /data/.[!.]*; do
+    [ -e "$entry" ] || continue
+    case "$entry" in
+        /data/media|/data/plex-media) continue ;;
+    esac
+    chown -R mycelium:mycgrp "$entry" 2>/dev/null || true
+done
+# The top-level dirs themselves (mountpoints), non-recursively.
+chown mycelium:mycgrp /data 2>/dev/null || true
+[ -d /data/media ] && chown mycelium:mycgrp /data/media 2>/dev/null || true
+[ -d /data/plex-media ] && chown mycelium:mycgrp /data/plex-media 2>/dev/null || true
 
 exec gosu mycelium "$@"
