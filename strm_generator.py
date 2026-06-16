@@ -1561,6 +1561,11 @@ def _write_strm(path: Path, url: str) -> bool:
     try:
         atomic_write_text(path, url)
         log.info("Created .strm: %s", path)
+        try:
+            import media_servers
+            media_servers.mark(path)
+        except Exception:
+            pass
         return True
     except Exception as exc:
         log.warning("Could not write %s: %s", path, exc)
