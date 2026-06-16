@@ -1,7 +1,11 @@
 #!/bin/bash
 # Mycelium Plex Transcoder wrapper.
-# Rewrites -i /plex-media/*.mkv to http://127.0.0.1:8088/spore-stream/<token>
+# Rewrites -i /plex-media/*.mkv to http://${SPORE_HOST}/spore-stream/<token>
 # so FFmpeg reads from the CDN directly (MKV) or via moov-first proxy (MP4).
+#
+# SPORE_MYCELIUM_HOST lets multi-container deploys point at mycelium's real
+# host:port (e.g. 172.20.5.20:8088) instead of localhost. Plex passes it via env.
+SPORE_HOST="${SPORE_MYCELIUM_HOST:-127.0.0.1:8088}"
 
 SPORE_LOG=/config/spore-wrap-debug.log
 echo "$(date '+%H:%M:%S') WRAP started" >> "$SPORE_LOG"
@@ -31,7 +35,7 @@ for a in "$@"; do
                 tok=$(grep "^token=" "$minfo" | head -1 | cut -d= -f2)
                 if [ -n "$tok" ]; then
                     echo "SPORE-WRAP: -i $a -> spore-stream/$tok" >&2
-                    a="http://127.0.0.1:8088/spore-stream/$tok"
+                    a="http://${SPORE_HOST}/spore-stream/$tok"
                     spore_replaced=1
                     spore_minfo="$minfo"
                 fi
@@ -43,10 +47,10 @@ for a in "$@"; do
             if [[ "$strm_url" =~ /s(tream|pore-stream)/([a-f0-9]{8,}) ]]; then
                 tok="${BASH_REMATCH[2]}"
                 echo "SPORE-WRAP: .strm path $a -> token=$tok -> spore-stream" >&2
-                a="http://127.0.0.1:8088/spore-stream/$tok"
+                a="http://${SPORE_HOST}/spore-stream/$tok"
                 spore_replaced=1
                 _strm_tmp_minfo="/tmp/spore-minfo-$tok.txt"
-                curl -sf "http://127.0.0.1:8088/ui/api/spore-minfo/$tok" \
+                curl -sf "http://${SPORE_HOST}/ui/api/spore-minfo/$tok" \
                      -o "$_strm_tmp_minfo" 2>/dev/null \
                      || echo "token=$tok" > "$_strm_tmp_minfo"
                 spore_minfo="$_strm_tmp_minfo"
@@ -56,10 +60,10 @@ for a in "$@"; do
             # Plex passes the stream URL directly as -i (fallback for URL-based inputs).
             tok="${BASH_REMATCH[2]}"
             echo "SPORE-WRAP: -i stream URL tok=$tok -> spore-stream/$tok" >&2
-            a="http://127.0.0.1:8088/spore-stream/$tok"
+            a="http://${SPORE_HOST}/spore-stream/$tok"
             spore_replaced=1
             _strm_tmp_minfo="/tmp/spore-minfo-$tok.txt"
-            curl -sf "http://127.0.0.1:8088/ui/api/spore-minfo/$tok" \
+            curl -sf "http://${SPORE_HOST}/ui/api/spore-minfo/$tok" \
                  -o "$_strm_tmp_minfo" 2>/dev/null \
                  || echo "token=$tok" > "$_strm_tmp_minfo"
             spore_minfo="$_strm_tmp_minfo"
