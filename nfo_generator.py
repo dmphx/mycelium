@@ -71,6 +71,23 @@ def _movie_nfo(title: str, year: int | None, imdb_id: str) -> str:
     )
 
 
+def _episode_nfo(title: str, season: int, episode: int,
+                 plot: str | None = None, aired: str | None = None) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        "<episodedetails>",
+        "  <title>%s</title>" % _xml_escape(title),
+        "  <season>%d</season>" % season,
+        "  <episode>%d</episode>" % episode,
+    ]
+    if plot:
+        lines.append("  <plot>%s</plot>" % _xml_escape(plot))
+    if aired:
+        lines.append("  <aired>%s</aired>" % _xml_escape(aired))
+    lines.append("</episodedetails>")
+    return "\n".join(lines) + "\n"
+
+
 def _tvshow_nfo(title: str, imdb_id: str) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
@@ -274,16 +291,61 @@ def fetch_images_for_folder(folder: Path, imdb_id: str, media_type: str = "movie
     """Download poster.jpg + fanart.jpg for a single folder. Called atomically at creation."""
     poster = folder / "poster.jpg"
     fanart = folder / "fanart.jpg"
-    if poster.exists() and fanart.exists():
-        return
-    try:
-        p, b = tmdb.get_images(imdb_id, "movie" if media_type == "movie" else "tv")
-        if p and not poster.exists():
-            _download_image(f"{_IMAGE_BASE_POSTER}{p}", poster)
-        if b and not fanart.exists():
-            _download_image(f"{_IMAGE_BASE_BACKDROP}{b}", fanart)
-    except Exception as exc:
-        log.debug("fetch_images_for_folder %s: %s", folder.name, exc)
+    if not (poster.exists() and fanart.exists()):
+        try:
+            p, b = tmdb.get_images(imdb_id, "movie" if media_type == "movie" else "tv")
+            if p and not poster.exists():
+                _download_image(f"{_IMAGE_BASE_POSTER}{p}", poster)
+            if b and not fanart.exists():
+                _download_image(f"{_IMAGE_BASE_BACKDROP}{b}", fanart)
+        except Exception as exc:
+            log.debug("fetch_images_for_folder %s: %s", folder.name, exc)
+    if media_type != "movie":
+        try:
+            tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
+            if tmdb_id:
+                _write_episode_meta(folder, tmdb_id)
+        except Exception as exc:
+            log.debug("episode meta %s: %s", folder.name, exc)
+
+
+def _write_episode_meta(folder: Path, tmdb_id: int) -> tuple[int, int]:
+    """Write missing episode .nfo (title/plot/aired) + -thumb.jpg for a series folder.
+
+    One TMDB call per episode, reused for both, so Jellyfin AND Plex read episode
+    titles locally with no internet metadata fetching."""
+    n_nfo = n_still = 0
+    for season_folder in sorted(folder.iterdir()):
+        if not season_folder.is_dir():
+            continue
+        for strm in sorted(season_folder.glob("*.strm")):
+            m = _EP_RE.search(strm.name)
+            if not m:
+                continue
+            s_num, e_num = int(m.group(1)), int(m.group(2))
+            nfo = strm.with_suffix(".nfo")
+            thumb = strm.with_name(f"{strm.stem}-thumb.jpg")
+            if nfo.exists() and thumb.exists():
+                continue
+            try:
+                det = tmdb.get_episode_details(tmdb_id, s_num, e_num)
+                time.sleep(0.15)
+            except Exception:
+                continue
+            if not det:
+                continue
+            if not nfo.exists() and det.get("title"):
+                try:
+                    atomic_write_text(nfo, _episode_nfo(det["title"], s_num, e_num,
+                                                        det.get("overview"), det.get("aired")))
+                    n_nfo += 1
+                except Exception as exc:
+                    log.debug("episode nfo write failed %s: %s", nfo.name, exc)
+            still = det.get("still_path")
+            if still and not thumb.exists():
+                if _download_image(f"{_IMAGE_BASE_STILL}{still}", thumb):
+                    n_still += 1
+    return n_nfo, n_still
 
 
 def fetch_local_images() -> dict:
@@ -344,28 +406,12 @@ def fetch_local_images() -> dict:
                     except Exception:
                         pass
 
-                # Episode stills  -  one TMDB call per missing thumbnail
+                # Episode NFOs + stills  -  one TMDB call per episode, reused for both
                 tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
                 if tmdb_id:
                     time.sleep(0.15)
-                    for season_folder in sorted(folder.iterdir()):
-                        if not season_folder.is_dir():
-                            continue
-                        for strm in sorted(season_folder.glob("*.strm")):
-                            thumb = strm.with_name(f"{strm.stem}-thumb.jpg")
-                            if thumb.exists():
-                                continue
-                            m = _EP_RE.search(strm.name)
-                            if not m:
-                                continue
-                            s_num, e_num = int(m.group(1)), int(m.group(2))
-                            try:
-                                still = tmdb.get_episode_still(tmdb_id, s_num, e_num)
-                                time.sleep(0.15)
-                            except Exception:
-                                continue
-                            if still and _download_image(f"{_IMAGE_BASE_STILL}{still}", thumb):
-                                e_count += 1
+                    _n_nfo, _n_still = _write_episode_meta(folder, tmdb_id)
+                    e_count += _n_still
 
     log.info("fetch_local_images: %d movie poster(s), %d series poster(s), %d episode still(s)",
              m_count, s_count, e_count)

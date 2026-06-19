@@ -152,6 +152,21 @@ def get_episode_still(tmdb_id: int, season: int, episode: int) -> str | None:
     return data.get("still_path")
 
 
+def get_episode_details(tmdb_id: int, season: int, episode: int) -> dict | None:
+    """Return {title, overview, aired, still_path} for a TV episode, or None.
+
+    One TMDB call, reused for both the .nfo sidecar and the episode still."""
+    data = _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
+    if not data:
+        return None
+    return {
+        "title": data.get("name") or None,
+        "overview": data.get("overview") or None,
+        "aired": data.get("air_date") or None,
+        "still_path": data.get("still_path") or None,
+    }
+
+
 def search_movie(title: str, year: int | None = None) -> str | None:
     """Search TMDB for a movie by title; return IMDB ID or None."""
     params: dict = {"query": title}
