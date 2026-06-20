@@ -312,39 +312,47 @@ def fetch_images_for_folder(folder: Path, imdb_id: str, media_type: str = "movie
 def _write_episode_meta(folder: Path, tmdb_id: int) -> tuple[int, int]:
     """Write missing episode .nfo (title/plot/aired) + -thumb.jpg for a series folder.
 
-    One TMDB call per episode, reused for both, so Jellyfin AND Plex read episode
+    One TMDB call per SEASON (not per episode), so the library's many bogus
+    episode numbers are skipped with no 404 storm. Jellyfin AND Plex read episode
     titles locally with no internet metadata fetching."""
     n_nfo = n_still = 0
     for season_folder in sorted(folder.iterdir()):
         if not season_folder.is_dir():
             continue
+        # group episodes still needing meta by real season number (from filename)
+        by_season: dict = {}
         for strm in sorted(season_folder.glob("*.strm")):
             m = _EP_RE.search(strm.name)
             if not m:
                 continue
-            s_num, e_num = int(m.group(1)), int(m.group(2))
             nfo = strm.with_suffix(".nfo")
             thumb = strm.with_name(f"{strm.stem}-thumb.jpg")
             if nfo.exists() and thumb.exists():
                 continue
+            by_season.setdefault(int(m.group(1)), []).append(
+                (int(m.group(2)), nfo, thumb))
+        for s_num, items in by_season.items():
             try:
-                det = tmdb.get_episode_details(tmdb_id, s_num, e_num)
+                eps = {e.get("episode_number"): e
+                       for e in tmdb.get_season_episodes(tmdb_id, s_num)}
                 time.sleep(0.15)
             except Exception:
                 continue
-            if not det:
-                continue
-            if not nfo.exists() and det.get("title"):
-                try:
-                    atomic_write_text(nfo, _episode_nfo(det["title"], s_num, e_num,
-                                                        det.get("overview"), det.get("aired")))
-                    n_nfo += 1
-                except Exception as exc:
-                    log.debug("episode nfo write failed %s: %s", nfo.name, exc)
-            still = det.get("still_path")
-            if still and not thumb.exists():
-                if _download_image(f"{_IMAGE_BASE_STILL}{still}", thumb):
-                    n_still += 1
+            for e_num, nfo, thumb in items:
+                det = eps.get(e_num)
+                if not det:
+                    continue
+                if not nfo.exists() and det.get("name"):
+                    try:
+                        atomic_write_text(nfo, _episode_nfo(det["name"], s_num, e_num,
+                                                            det.get("overview"), det.get("air_date")))
+                        n_nfo += 1
+                    except Exception as exc:
+                        log.debug("episode nfo write failed %s: %s", nfo.name, exc)
+                still = det.get("still_path")
+                if still and not thumb.exists():
+                    if _download_image(f"{_IMAGE_BASE_STILL}{still}", thumb):
+                        n_still += 1
     return n_nfo, n_still
 
 
@@ -410,8 +418,11 @@ def fetch_local_images() -> dict:
                 tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
                 if tmdb_id:
                     time.sleep(0.15)
-                    _n_nfo, _n_still = _write_episode_meta(folder, tmdb_id)
-                    e_count += _n_still
+                    try:
+                        _n_nfo, _n_still = _write_episode_meta(folder, tmdb_id)
+                        e_count += _n_still
+                    except Exception as exc:
+                        log.debug("episode meta backfill %s: %s", folder.name, exc)
 
     log.info("fetch_local_images: %d movie poster(s), %d series poster(s), %d episode still(s)",
              m_count, s_count, e_count)
