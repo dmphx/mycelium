@@ -45,6 +45,12 @@ _url_cache_lock = threading.Lock()
 # hammer TorBox with repeated createtorrent calls.
 _FAIL_COOLDOWN_SEC = 30        # standard failure (readd blocked, no file)
 _FAIL_COOLDOWN_429_SEC = 120   # TorBox 429  -  back off longer
+# A torrent that was added but is not "ready" yet is a transient cold-start state
+# that usually clears within seconds. A hard 30s wall here turns a normal first
+# play into a "transcoder crashed" for half a minute even though the CDN URL is
+# about to exist, so give it a short cooldown and let the next play pick it up as
+# soon as TorBox finishes readying the file.
+_FAIL_COOLDOWN_READYING_SEC = 8   # added, waiting for TorBox/RD "ready"
 # TTL on the cache equals the longest cooldown; per-entry expiries still
 # enforced explicitly via the monotonic-timestamp value (older entries with
 # shorter cooldowns get reported as expired sooner).
@@ -238,7 +244,11 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
             _cache_put(token, url)
             _schedule_next_episode_preload(token)
         else:
-            _fail_put(token)
+            # Do not clobber a more specific cooldown that _materialize_locked
+            # already set (the short readying window, or a long 429 / no-cached
+            # back-off)  -  only apply the default when none is active.
+            if not _fail_get(token):
+                _fail_put(token)
         return url
 
 
@@ -435,7 +445,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 rd_info = _rd.wait_until_ready(rd_id)
                 if not rd_info:
                     log.error("Catbox/RD: wait_until_ready timed out for %s", item["title"])
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -532,7 +542,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                             _metrics_inc("rematerialized")
                             return url
                     log.error("Catbox: RD wait_until_ready timed out for %s", item["title"])
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -571,7 +581,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 rd_id = result["id"]
                 rd_info = _rd.wait_until_ready(rd_id)
                 if not rd_info:
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -612,7 +622,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
             if not live:
                 log.error("Catbox: fresh release not ready for %s  -  keeping .strm, retry soon",
                           item["title"])
-                _fail_put(token, _FAIL_COOLDOWN_SEC)
+                _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                 if ckey:
                     db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                 return None
