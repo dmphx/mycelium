@@ -146,6 +146,40 @@ def _strm_path(info: dict) -> Path:
     return media / 'series' / title / f"Season {s:02d}" / f"{title} S{s:02d}E{e:02d}.strm"
 
 
+def _requestdl_get(url: str, params: dict, label: str) -> str | None:
+    """GET a TorBox requestdl endpoint, retrying transient failures.
+
+    TorBox's requestdl intermittently returns HTTP 5xx (usually 500) and
+    recovers within seconds (the same token then succeeds). A single attempt
+    surfaces to Jellyfin as a fatal player error (mycelium 404) and trips the
+    catbox fail-cooldown, so we retry 5xx and network/timeout errors with a
+    short linear backoff. 4xx (auth / rate-limit / gone) fail immediately and
+    are never retried. The happy path adds no latency (returns on attempt 1).
+    """
+    attempts = max(1, cfg.REQUESTDL_RETRIES)
+    last = "no response"
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = req_lib.get(url, params=params, timeout=15)
+            if resp.status_code < 500:
+                resp.raise_for_status()  # 4xx raises below; not retried
+                data = resp.json() or {}
+                return data.get("data") or None
+            last = f"HTTP {resp.status_code}"
+        except req_lib.HTTPError as exc:
+            log.warning("%s: %s", label, exc)
+            return None
+        except req_lib.RequestException as exc:
+            last = str(exc)
+        if attempt < attempts:
+            delay = (cfg.REQUESTDL_BACKOFF_MS / 1000.0) * attempt
+            log.info("%s transient (%s); retry %d/%d in %.1fs",
+                     label, last, attempt, attempts - 1, delay)
+            time.sleep(delay)
+    log.warning("%s failed after %d attempt(s): %s", label, attempts, last)
+    return None
+
+
 def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
     url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/requestdl"
     params = {
@@ -154,14 +188,7 @@ def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
         "file_id": file_id,
         "zip_link": "false",
     }
-    try:
-        resp = req_lib.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        return data.get("data") or None
-    except Exception as exc:
-        log.warning("requestdl failed torrent=%s file=%s: %s", torrent_id, file_id, exc)
-        return None
+    return _requestdl_get(url, params, f"requestdl torrent={torrent_id} file={file_id}")
 
 
 def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
@@ -176,15 +203,7 @@ def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
         "file_id": file_id,
         "zip_link": "false",
     }
-    try:
-        resp = req_lib.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        return data.get("data") or None
-    except Exception as exc:
-        log.warning("usenet requestdl failed usenet=%s file=%s: %s",
-                    usenet_id, file_id, exc)
-        return None
+    return _requestdl_get(url, params, f"usenet requestdl usenet={usenet_id} file={file_id}")
 
 
 def _extract_year(name: str) -> int | None:

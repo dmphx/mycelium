@@ -165,6 +165,15 @@ BACKUP_INTERVAL_HOURS = _env_int("BACKUP_INTERVAL_HOURS", 24)
 RETRY_BACKOFF_MINUTES = [int(x) for x in _env("RETRY_BACKOFF_MINUTES", "60,360,1440").split(",") if x.strip()]
 RETRY_QUEUE_INTERVAL_MINUTES = _env_int("RETRY_QUEUE_INTERVAL_MINUTES", 15)
 
+# TorBox requestdl is intermittently flaky: it returns HTTP 5xx (usually 500)
+# and recovers within seconds, so the same token succeeds on a quick retry.
+# Without retrying, a blip surfaces to Jellyfin as a fatal player error
+# (mycelium 404). Retry transient 5xx / network errors REQUESTDL_RETRIES times
+# (total attempts, incl. the first) with a linear backoff of BACKOFF_MS*attempt.
+# 4xx (auth / rate-limit / gone) are never retried.
+REQUESTDL_RETRIES = _env_int("REQUESTDL_RETRIES", 4)
+REQUESTDL_BACKOFF_MS = _env_int("REQUESTDL_BACKOFF_MS", 600)
+
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.
 AUTO_UPGRADE_ENABLED = _env("AUTO_UPGRADE_ENABLED", "true").lower() in ("1", "true", "yes")
