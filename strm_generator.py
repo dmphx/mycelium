@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.ts', '.m2ts', '.webm'}
 
 _EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
+# Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
+# Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
+_EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -77,13 +80,38 @@ def _pick_main_movie_file(files: list[dict]) -> dict | None:
     return max(big or non_trailer, key=lambda f: f.get('size') or 0)
 
 
+def _file_episode(name: str) -> tuple[int, int] | None:
+    """Parse (season, episode) from a file name. Handles SxxExx and NNxNN. None if absent."""
+    s = _clean(name)
+    m = _EP_RE.search(s) or _EP_ALT_RE.search(s)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | None:
-    """Find the file in a season pack matching SxxExx. Falls back to None if no match."""
-    ep_re = re.compile(rf'[Ss]0?{season}[Ee]0?{episode}\b', re.IGNORECASE)
-    videos = [f for f in files if _is_video(f.get('name') or '')]
-    matched = [f for f in videos if ep_re.search(f.get('name') or '')]
+    """Pick the file in a (season) pack for one episode.
+
+    Safest first:
+      1. A file whose name tags exactly this episode (SxxExx or NNxNN);
+         largest if several.
+      2. No tagged match: never return a file whose name tags a DIFFERENT
+         episode. That was the old 'largest file' fallback, which silently
+         served the wrong episode for packs where the wanted file lacked a
+         tag (e.g. an E01 carrying the generic release name). Only accept an
+         untagged file, and only when it is unambiguous (exactly one untagged
+         video). Otherwise return None so the caller re-scrapes instead of
+         playing the wrong episode.
+    """
+    want = (int(season), int(episode))
+    videos = [f for f in files
+              if _is_video(f.get('name') or '') and not _is_trailer(f)]
+    if not videos:
+        return None
+    matched = [f for f in videos if _file_episode(f.get('name') or '') == want]
     if matched:
         return max(matched, key=lambda f: f.get('size') or 0)
+    untagged = [f for f in videos if _file_episode(f.get('name') or '') is None]
+    if len(untagged) == 1:
+        return untagged[0]
     return None
 
 

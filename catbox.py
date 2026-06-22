@@ -245,29 +245,27 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
 def _pick_usenet_file_id(item: dict, virtual_item: dict) -> int | None:
     """Pick the right file inside a completed TorBox usenet download.
 
-    For movies: largest video file.
-    For episodes: the file whose name matches SxxExx of the virtual_item.
-    Falls back to file[0] if nothing matches (rare).
+    Movies: largest non-trailer video file.
+    Episodes: the shared episode matcher, which only returns a confident match
+    (never a file tagged as a different episode, and never a blind largest-file
+    guess).  Returns None when it cannot match, so the caller can re-scrape.
     """
+    import strm_generator
     files = item.get("files") or []
     if not files:
         return None
-    video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm", ".ts", ".m2ts")
-    videos = [f for f in files
-              if (f.get("name") or f.get("short_name") or "").lower().endswith(video_exts)]
-    pool = videos or files
+    # Some usenet entries expose only short_name; normalise to 'name'.
+    norm = [{**f, "name": (f.get("name") or f.get("short_name") or "")} for f in files]
     if virtual_item.get("media_type") == "movie":
-        return max(pool, key=lambda f: f.get("size") or 0).get("id")
+        main = strm_generator._pick_main_movie_file(norm)
+        return main.get("id") if main else None
     s_num = virtual_item.get("season")
     e_num = virtual_item.get("episode")
     if s_num and e_num:
-        import re as _re
-        ep_re = _re.compile(rf"[Ss]0?{s_num}[Ee]0?{e_num}\b", _re.IGNORECASE)
-        for f in pool:
-            name = f.get("name") or f.get("short_name") or ""
-            if ep_re.search(name):
-                return f.get("id")
-    return max(pool, key=lambda f: f.get("size") or 0).get("id")
+        main = strm_generator._pick_episode_file(norm, s_num, e_num)
+        return main.get("id") if main else None
+    vids = [f for f in norm if strm_generator._is_video(f["name"])]
+    return vids[0].get("id") if len(vids) == 1 else None
 
 
 def _materialize_usenet(token: str, item: dict) -> str | None:
@@ -336,21 +334,27 @@ def _materialize_usenet(token: str, item: dict) -> str | None:
 
 def _rd_get_url(item: dict, rd_id: str) -> str | None:
     """Get a playable URL from RealDebrid for this virtual item."""
-    import re as _re
     import realdebrid as _rd
+    import strm_generator
     if item["media_type"] == "movie":
         return _rd.get_main_video_url(rd_id)
-    # Episode: match SxxExx in filename
+    # Episode: confident match only (SxxExx or NNxNN); never a blind largest-file
+    # guess and never a file tagged as a different episode.
     pairs = _rd.get_video_files_with_urls(rd_id)
     if not pairs:
         return None
     s_num, e_num = item.get("season"), item.get("episode")
+    name = lambda f: f.get("path") or f.get("name") or ""
     if s_num and e_num:
-        ep_re = _re.compile(rf'[Ss]0?{s_num}[Ee]0?{e_num}\b', _re.IGNORECASE)
-        matched = [(f, u) for f, u in pairs if ep_re.search(f.get("path") or f.get("name") or "")]
+        want = (int(s_num), int(e_num))
+        matched = [(f, u) for f, u in pairs if strm_generator._file_episode(name(f)) == want]
         if matched:
-            return matched[0][1]
-    return max(pairs, key=lambda fu: fu[0].get("bytes") or 0)[1]
+            return max(matched, key=lambda fu: fu[0].get("bytes") or 0)[1]
+        untagged = [(f, u) for f, u in pairs if strm_generator._file_episode(name(f)) is None]
+        if len(untagged) == 1:
+            return untagged[0][1]
+        return None
+    return pairs[0][1] if len(pairs) == 1 else None
 
 
 def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
@@ -626,7 +630,6 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
     if not file_id:
         live = torbox.find_by_id(torbox_id)
         if live:
-            import re as _re
             import strm_generator
             if item["media_type"] == "movie":
                 main = strm_generator._pick_main_movie_file(live.get("files") or [])
@@ -640,22 +643,24 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                     log.info("Catbox: no files list for %s  -  using file_id=0 (auto)", item["title"])
                     file_id = 0
             else:
-                videos = [f for f in (live.get("files") or [])
-                          if strm_generator._is_video(f.get("name") or "")
-                          and not strm_generator._is_trailer(f)]
+                files = live.get("files") or []
                 s_num = item.get("season")
                 e_num = item.get("episode")
                 if s_num and e_num:
-                    ep_re = _re.compile(rf'[Ss]0?{s_num}[Ee]0?{e_num}\b', _re.IGNORECASE)
-                    matched = [f for f in videos if ep_re.search(f.get("name") or "")]
-                    main = matched[0] if matched else (
-                        max(videos, key=lambda f: f.get("size") or 0) if videos else None
-                    )
+                    main = strm_generator._pick_episode_file(files, s_num, e_num)
                 else:
-                    main = max(videos, key=lambda f: f.get("size") or 0) if videos else None
+                    vids = [f for f in files
+                            if strm_generator._is_video(f.get("name") or "")
+                            and not strm_generator._is_trailer(f)]
+                    main = vids[0] if len(vids) == 1 else None
                 if main:
                     file_id = main["id"]
                     db.update_virtual_file_id(token, file_id)
+                else:
+                    # No confident match.  Do NOT guess (the old largest-file guess
+                    # served the wrong episode).  Leave unresolved so it re-scrapes.
+                    log.warning("Catbox: no confident file match for %s S%sE%s in torrent %s; "
+                                "leaving unresolved", item["title"], s_num, e_num, torbox_id)
 
     if file_id is None or (not file_id and file_id != 0):
         log.error("Catbox: no playable file found for %s  -  keeping .strm, retry later", token)
