@@ -858,14 +858,19 @@ def _preload_spore(cdn_url: str, token: str, build_fsh: bool = True) -> None:
         streams = data.get("streams", [])
         audio   = [s for s in streams if s.get("codec_type") == "audio"]
         subs    = [s for s in streams if s.get("codec_type") == "subtitle"]
+        video   = [s for s in streams if s.get("codec_type") == "video"]
+        v_codec = (video[0].get("codec_name") if video else None)
         dur     = float(data.get("format", {}).get("duration", 0) or 0)
         preferred_idx = _preferred_audio_index(audio)
         db.save_spore_tracks(token, {
             "audio": audio, "subs": subs, "duration_s": dur,
             "video_extradata_hex": v_extra_hex,
+            "video_codec": v_codec,
             "preferred_audio_idx": preferred_idx,
         })
-        update_stub_from_probe(token, audio, subs, duration_s=dur or None)
+        update_stub_from_probe(token, audio, subs, duration_s=dur or None,
+                               video_codec=v_codec,
+                               video_extradata_hex=v_extra_hex)
         if preferred_idx > 0:
             update_minfo_preferred_audio(token, preferred_idx)
             log.info("Preload: preferred_audio=%d for token=%s (TrueHD -> fallback)",
@@ -1110,12 +1115,41 @@ def _ebml_el(id_bytes: bytes, data: bytes) -> bytes:
 
 def _codec_id_for_quality(quality: str | None) -> str:
     """Return MKV CodecID string based on quality hint.
-    4K content is virtually always HEVC; 1080p/720p defaults to H.264."""
+    4K content is virtually always HEVC; 1080p/720p defaults to H.264.
+    Used only as a fallback when the real probed codec is unknown."""
     if quality:
         q = quality.lower()
         if '2160' in q or '4k' in q or 'uhd' in q:
             return 'V_MPEGH/ISO/HEVC'
     return 'V_MPEG4/ISO/AVC'
+
+
+# Maps an ffprobe codec_name to the MKV CodecID written into the Spore stub
+# video track. The stub codec MUST match the real CDN file: Plex builds its
+# decode and bitstream pipeline from the stub, so a wrong codec (for example AVC
+# declared for an HEVC file) makes the transcoder read invalid NAL units and the
+# playback session dies (Plex web error s3014 / s3015).
+_FFCODEC_TO_MKV_VIDEO: dict[str, str] = {
+    "hevc":       "V_MPEGH/ISO/HEVC",
+    "h265":       "V_MPEGH/ISO/HEVC",
+    "h264":       "V_MPEG4/ISO/AVC",
+    "avc":        "V_MPEG4/ISO/AVC",
+    "av1":        "V_AV1",
+    "vp9":        "V_VP9",
+    "vp8":        "V_VP8",
+    "mpeg2video": "V_MPEG2",
+    "mpeg4":      "V_MPEG4/ISO/ASP",
+}
+
+
+def _codec_id_for_video(codec_name: str | None, quality: str | None) -> str:
+    """MKV CodecID from the probed ffprobe codec_name, falling back to the
+    quality based guess when the codec is not yet probed or unrecognised."""
+    if codec_name:
+        cid = _FFCODEC_TO_MKV_VIDEO.get(codec_name.lower())
+        if cid:
+            return cid
+    return _codec_id_for_quality(quality)
 
 
 _FFCODEC_TO_MKV_AUDIO: dict[str, str] = {
@@ -1518,12 +1552,15 @@ def regenerate_spore_stubs(token: str | None = None) -> dict:
             except ValueError:
                 log.debug("Spore regenerate: invalid extradata hex for %s, skipping", strm_path.name)
                 v_extra = None
+            codec_id = _codec_id_for_video(saved.get("video_codec"), item.get("quality"))
             stub = make_stub_mkv(
                 item.get("title") or strm_path.stem,
                 item.get("quality"),
                 duration_sec=dur,
+                codec_id=codec_id,
                 audio_tracks=None,
                 subtitle_tracks=sub_tracks,
+                video_codec_private=v_extra,
             )
             stub_dir.mkdir(parents=True, exist_ok=True)
             atomic_write_bytes(mkv_path, stub)
@@ -1636,7 +1673,9 @@ def probe_pending_stubs() -> dict:
 
 def update_stub_from_probe(token: str, audio_streams: list[dict],
                             subtitle_streams: list[dict],
-                            duration_s: float | None = None) -> bool:
+                            duration_s: float | None = None,
+                            video_codec: str | None = None,
+                            video_extradata_hex: str | None = None) -> bool:
     """Rewrite the stub MKV for token with real audio and subtitle tracks from ffprobe.
 
     Called after build_and_cache() completes so subsequent Plex analyses show
@@ -1677,30 +1716,49 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
         for s in subtitle_streams
     ]
 
-    # Write cdn_audio_codec to .minfo so the transcoder wrapper can inject a
-    # native (non-EAE) decoder hint, preventing EAE input-decode timeouts on
-    # heavy sessions (e.g. Shield TV + VAAPI video transcode).
-    cdn_codec = (audio_streams[0].get("codec_name") or "").lower() if audio_streams else ""
-    if cdn_codec:
+    # Write cdn_audio_codec / cdn_video_codec to .minfo so the transcoder wrapper
+    # can inject a native (non-EAE) decoder hint, and so the real codecs are
+    # visible for diagnosis without re-probing.
+    cdn_codec  = (audio_streams[0].get("codec_name") or "").lower() if audio_streams else ""
+    cdn_vcodec = (video_codec or "").lower()
+    if cdn_codec or cdn_vcodec:
         minfo_path = mkv_path.parent / (strm_path.stem + ".minfo")
         try:
             if minfo_path.exists():
                 lines = minfo_path.read_text(encoding="utf-8").splitlines()
-                lines = [l for l in lines if not l.startswith("cdn_audio_codec=")]
-                lines.append(f"cdn_audio_codec={cdn_codec}")
+                lines = [l for l in lines
+                         if not l.startswith("cdn_audio_codec=")
+                         and not l.startswith("cdn_video_codec=")]
+                if cdn_codec:
+                    lines.append(f"cdn_audio_codec={cdn_codec}")
+                if cdn_vcodec:
+                    lines.append(f"cdn_video_codec={cdn_vcodec}")
                 atomic_write_text(minfo_path, "\n".join(lines) + "\n")
-                log.info("Spore: cdn_audio_codec=%s saved to .minfo for token=%s", cdn_codec, token)
+                log.info("Spore: cdn_audio_codec=%s cdn_video_codec=%s saved to .minfo for token=%s",
+                         cdn_codec or "?", cdn_vcodec or "?", token)
         except Exception as exc:
-            log.warning("Spore: could not write cdn_audio_codec to .minfo for token=%s: %s", token, exc)
+            log.warning("Spore: could not write codec info to .minfo for token=%s: %s", token, exc)
+
+    # Derive the real video CodecID from the probe so the stub matches the CDN
+    # file. A mismatch (AVC stub for an HEVC file) makes Plex feed HEVC into an
+    # H.264 pipeline, producing invalid NAL units and a killed transcode session.
+    codec_id = _codec_id_for_video(video_codec, item.get("quality"))
+    v_priv = None
+    if video_extradata_hex:
+        try:
+            v_priv = bytes.fromhex(video_extradata_hex)
+        except ValueError:
+            v_priv = None
 
     try:
         stub = make_stub_mkv(
             item.get("title") or strm_path.stem,
             item.get("quality"),
             duration_sec=duration_s or 7200.0,
+            codec_id=codec_id,
             audio_tracks=audio_tracks,
             subtitle_tracks=subtitle_tracks or None,
-            # video_codec_private omitted: updated via update_stub_from_probe
+            video_codec_private=v_priv,
         )
         atomic_write_bytes(mkv_path, stub)
         log.info(

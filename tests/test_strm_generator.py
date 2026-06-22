@@ -156,6 +156,35 @@ class TestMakeStubMkv:
         assert b"A_EAC3" in data
         assert b"A_PCM/INT/LIT" not in data
 
+    def test_explicit_codec_id_overrides_quality_guess(self):
+        # A 1080p HEVC (x265) file must produce an HEVC stub, not the
+        # 1080p->H264 guess. Otherwise Plex feeds HEVC into an H264 pipeline
+        # and the transcode dies with invalid NAL units (web error s3014/s3015).
+        data = sg.make_stub_mkv("Test", quality="1080p",
+                                codec_id="V_MPEGH/ISO/HEVC")
+        assert b"V_MPEGH/ISO/HEVC" in data
+        assert b"V_MPEG4/ISO/AVC" not in data
+
+    def test_video_codec_private_embedded(self):
+        priv = bytes.fromhex("0123456789abcdef")
+        data = sg.make_stub_mkv("Test", quality="1080p",
+                                codec_id="V_MPEGH/ISO/HEVC",
+                                video_codec_private=priv)
+        assert priv in data
+
+
+class TestCodecIdForVideo:
+    def test_probed_codec_overrides_quality(self):
+        # The real probed codec wins over the resolution based guess.
+        assert sg._codec_id_for_video("hevc", "1080p") == "V_MPEGH/ISO/HEVC"
+        assert sg._codec_id_for_video("h264", "2160p") == "V_MPEG4/ISO/AVC"
+        assert sg._codec_id_for_video("av1", "1080p") == "V_AV1"
+
+    def test_falls_back_to_quality_when_unknown(self):
+        assert sg._codec_id_for_video(None, "1080p") == "V_MPEG4/ISO/AVC"
+        assert sg._codec_id_for_video(None, "2160p") == "V_MPEGH/ISO/HEVC"
+        assert sg._codec_id_for_video("weirdcodec", "1080p") == "V_MPEG4/ISO/AVC"
+
 
 class TestWriteSporeStubs:
     def test_creates_mkv_and_minfo(self, tmp_path, monkeypatch):

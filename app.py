@@ -1378,15 +1378,20 @@ def spore_stream_proxy(token: str):
             streams = data.get("streams", [])
             audio   = [s for s in streams if s.get("codec_type") == "audio"]
             subs    = [s for s in streams if s.get("codec_type") == "subtitle"]
+            video   = [s for s in streams if s.get("codec_type") == "video"]
+            v_codec = (video[0].get("codec_name") if video else None)
             dur     = float(data.get("format", {}).get("duration", 0) or 0)
             preferred_idx = _sg._preferred_audio_index(audio)
             _db.save_spore_tracks(tok, {
                 "audio": audio, "subs": subs, "duration_s": dur,
                 "video_extradata_hex": v_extra_hex,
+                "video_codec": v_codec,
                 "preferred_audio_idx": preferred_idx,
             })
             if audio or subs or dur or v_extra_hex:
-                _sg.update_stub_from_probe(tok, audio, subs, duration_s=dur or None)
+                _sg.update_stub_from_probe(tok, audio, subs, duration_s=dur or None,
+                                           video_codec=v_codec,
+                                           video_extradata_hex=v_extra_hex)
             if preferred_idx > 0:
                 _sg.update_minfo_preferred_audio(tok, preferred_idx)
                 log.info("spore-stream: preferred_audio=%d for token=%s (TrueHD -> fallback)",
