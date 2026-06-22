@@ -9,21 +9,7 @@ NNxNN-packs (The Bill, Forensic Files) matchten de SxxExx-regex nooit.
 
 Geen live DB of netwerk nodig; zware imports worden gemockt.
 """
-import os
-import sys
-from unittest.mock import MagicMock
-
-os.environ.setdefault("TORBOX_API_KEY", "test")
-os.environ.setdefault("MEDIA_PATH", "/tmp/mycelium-test-media")
-os.environ.setdefault("SPORE_MEDIA_PATH", "/tmp/mycelium-test-spore")
-os.environ.setdefault("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
-
-for _mod in ("db", "jellyfin", "settings", "torbox", "nfo_generator", "mp4_faststart"):
-    sys.modules.setdefault(_mod, MagicMock())
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-import strm_generator as sg  # noqa: E402  (imports na sys.path setup)
+import strm_generator as sg
 
 
 def _f(i, name, size=300_000_000):

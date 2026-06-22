@@ -1,9 +1,3 @@
-import os
-import sys
-
-os.environ.setdefault("TORBOX_API_KEY", "test")
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 import pytest
 
 from webhook_parser import IgnoreEvent, WebhookError, parse

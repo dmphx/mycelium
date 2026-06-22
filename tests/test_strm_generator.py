@@ -9,25 +9,9 @@ Secties:
   - Plex Spore        (make_stub_mkv, _write_spore_stubs)
   - Jellyfin .strm    (_write_strm inclusief duplicate-skip)
 """
-import os
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
-# Verplichte env vars voor config.py (wordt NIET gemockt)
-os.environ.setdefault("TORBOX_API_KEY", "test")
-os.environ.setdefault("MEDIA_PATH", "/tmp/mycelium-test-media")
-os.environ.setdefault("SPORE_MEDIA_PATH", "/tmp/mycelium-test-spore")
-os.environ.setdefault("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
-os.environ.setdefault("SPORE_ENABLED", "true")
-
-# Mock zware imports zodat strm_generator importeerbaar is zonder DB/netwerk
-for _mod in ("db", "jellyfin", "settings", "torbox", "nfo_generator", "mp4_faststart"):
-    sys.modules.setdefault(_mod, MagicMock())
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-import strm_generator as sg  # noqa: E402  (imports na sys.path setup)
+import strm_generator as sg
 
 
 # =============================================================================
