@@ -71,6 +71,22 @@ class TestPickEpisodeFile:
     def test_resolution_and_codec_not_parsed_as_episode(self):
         assert _pid([_f(0, "Show.S02E04.1920x1080.x265.mkv")], 2, 4) == 0
 
+    def test_absolute_numbered_pack(self):
+        # Anime-style pack: files numbered by absolute "E####", request stored
+        # in the same absolute scheme (season 1). Should match by number.
+        files = [_f(i, "E%04d.mkv" % i) for i in (1, 4, 5, 52, 92, 149)]
+        assert _pid(files, 1, 52) == 52
+        assert _pid(files, 1, 92) == 92
+        assert _pid(files, 1, 2361) is None   # not present in this pack -> fail closed
+
+    def test_absolute_does_not_hijack_seasonal_pack(self):
+        # A normal seasonal pack must never be matched via the absolute path.
+        files = [_f(0, "Show.S01E05.mkv"), _f(1, "Show.S01E06.mkv")]
+        assert _pid(files, 1, 5) == 0
+        # And a seasonal name must not be read as an absolute number.
+        assert sg._file_absolute("Show.S01E05.mkv") is None
+        assert sg._file_absolute("E0052.mkv") == 52
+
 
 class TestFileEpisodeParser:
     def test_parses_sxxexx_and_nnxnn(self):

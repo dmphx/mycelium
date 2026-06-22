@@ -26,6 +26,9 @@ _EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
 # Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
 # Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
 _EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')
+# Standalone absolute episode tag with no season, e.g. "E0052", "E283".
+# The lookbehind rejects the E of a seasonal "S01E05" (preceded by a digit).
+_ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(\d{2,4})(?![0-9])', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -87,6 +90,16 @@ def _file_episode(name: str) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def _file_absolute(name: str) -> int | None:
+    """Parse a standalone absolute episode number (e.g. 'E0052') from a file name.
+
+    Only for files with no SxxExx/NNxNN tag; used as a guarded fallback for
+    packs that number by a single running count (common in anime).
+    """
+    m = _ABS_RE.search(_clean(name))
+    return int(m.group(1)) if m else None
+
+
 def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | None:
     """Pick the file in a (season) pack for one episode.
 
@@ -109,6 +122,15 @@ def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | N
     matched = [f for f in videos if _file_episode(f.get('name') or '') == want]
     if matched:
         return max(matched, key=lambda f: f.get('size') or 0)
+    # Absolute numbering: packs that name files by a single running number with
+    # no SxxExx (e.g. anime "E0052").  Accept only when the request's episode
+    # number equals exactly one untagged file's absolute number, so the worst
+    # case is a miss (fail closed), never a wrong-episode guess.
+    abs_hits = [f for f in videos
+                if _file_episode(f.get('name') or '') is None
+                and _file_absolute(f.get('name') or '') == int(episode)]
+    if len(abs_hits) == 1:
+        return abs_hits[0]
     untagged = [f for f in videos if _file_episode(f.get('name') or '') is None]
     if len(untagged) == 1:
         return untagged[0]
