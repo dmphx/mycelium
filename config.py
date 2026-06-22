@@ -166,13 +166,19 @@ RETRY_BACKOFF_MINUTES = [int(x) for x in _env("RETRY_BACKOFF_MINUTES", "60,360,1
 RETRY_QUEUE_INTERVAL_MINUTES = _env_int("RETRY_QUEUE_INTERVAL_MINUTES", 15)
 
 # TorBox requestdl is intermittently flaky: it returns HTTP 5xx (usually 500)
-# and recovers within seconds, so the same token succeeds on a quick retry.
-# Without retrying, a blip surfaces to Jellyfin as a fatal player error
-# (mycelium 404). Retry transient 5xx / network errors REQUESTDL_RETRIES times
-# (total attempts, incl. the first) with a linear backoff of BACKOFF_MS*attempt.
-# 4xx (auth / rate-limit / gone) are never retried.
+# or 429 (rate-limit, typically when several ffmpeg probes hit the same file at
+# once on a first play) and recovers within seconds, so the same token succeeds
+# on a quick retry. Without retrying, a blip surfaces to Jellyfin as a fatal
+# player error (mycelium 404). Retry transient 5xx / 429 / network errors
+# REQUESTDL_RETRIES times (total attempts, incl. the first) with a linear
+# backoff of BACKOFF_MS*attempt. The other 4xx (auth / gone / bad request) are
+# deterministic and never retried.
 REQUESTDL_RETRIES = _env_int("REQUESTDL_RETRIES", 4)
 REQUESTDL_BACKOFF_MS = _env_int("REQUESTDL_BACKOFF_MS", 600)
+# On a 429 we honor the server's Retry-After header when present, but never wait
+# longer than this many seconds (a large suggested delay would stall playback
+# past ffmpeg's own timeout); above the cap we fall back to the linear backoff.
+REQUESTDL_RETRY_AFTER_CAP_SEC = _env_int("REQUESTDL_RETRY_AFTER_CAP_SEC", 5)
 
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.

@@ -196,26 +196,48 @@ def _strm_path(info: dict) -> Path:
     return media / 'series' / title / f"Season {s:02d}" / f"{title} S{s:02d}E{e:02d}.strm"
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header (delta-seconds form) into seconds.
+
+    TorBox sends an integer number of seconds; the rarer HTTP-date form is not
+    worth parsing here, so anything non-numeric returns None and the caller
+    falls back to its normal backoff.
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return secs if secs >= 0 else None
+
+
 def _requestdl_get(url: str, params: dict, label: str) -> str | None:
     """GET a TorBox requestdl endpoint, retrying transient failures.
 
-    TorBox's requestdl intermittently returns HTTP 5xx (usually 500) and
-    recovers within seconds (the same token then succeeds). A single attempt
-    surfaces to Jellyfin as a fatal player error (mycelium 404) and trips the
-    catbox fail-cooldown, so we retry 5xx and network/timeout errors with a
-    short linear backoff. 4xx (auth / rate-limit / gone) fail immediately and
-    are never retried. The happy path adds no latency (returns on attempt 1).
+    TorBox's requestdl intermittently returns HTTP 5xx (usually 500) or 429
+    (rate-limit) and recovers within seconds (the same token then succeeds). A
+    single attempt surfaces to Jellyfin as a fatal player error (mycelium 404)
+    and trips the catbox fail-cooldown, so we retry 5xx, 429 and network/timeout
+    errors with a short linear backoff (honoring Retry-After on a 429). The
+    other 4xx (auth / gone / bad request) are deterministic and fail
+    immediately. The happy path adds no latency (returns on attempt 1).
     """
     attempts = max(1, cfg.REQUESTDL_RETRIES)
     last = "no response"
     for attempt in range(1, attempts + 1):
+        retry_after = None
         try:
             resp = req_lib.get(url, params=params, timeout=15)
-            if resp.status_code < 500:
-                resp.raise_for_status()  # 4xx raises below; not retried
+            # 429 is transient like 5xx, so retry it. Every other 4xx is a hard
+            # failure (raise_for_status below) and is never retried.
+            if resp.status_code != 429 and resp.status_code < 500:
+                resp.raise_for_status()
                 data = resp.json() or {}
                 return data.get("data") or None
             last = f"HTTP {resp.status_code}"
+            if resp.status_code == 429:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
         except req_lib.HTTPError as exc:
             log.warning("%s: %s", label, exc)
             return None
@@ -223,11 +245,59 @@ def _requestdl_get(url: str, params: dict, label: str) -> str | None:
             last = str(exc)
         if attempt < attempts:
             delay = (cfg.REQUESTDL_BACKOFF_MS / 1000.0) * attempt
+            if retry_after is not None:
+                delay = max(delay, min(retry_after, float(cfg.REQUESTDL_RETRY_AFTER_CAP_SEC)))
             log.info("%s transient (%s); retry %d/%d in %.1fs",
                      label, last, attempt, attempts - 1, delay)
             time.sleep(delay)
     log.warning("%s failed after %d attempt(s): %s", label, attempts, last)
     return None
+
+
+# requestdl single-flight: on a first play Jellyfin fires several ffmpeg probes
+# at the same file at once. Without coalescing, each calls TorBox requestdl for
+# the same (torrent, file) simultaneously and the burst trips a 429. This lets
+# only the first caller per key hit TorBox; the rest wait and reuse its result
+# (a CDN URL, or None on failure, so a failed burst is one failure, not N).
+class _SFCall:
+    __slots__ = ("event", "result", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: str | None = None
+        self.error: BaseException | None = None
+
+
+_requestdl_sf_lock = threading.Lock()
+_requestdl_sf: dict[str, _SFCall] = {}
+
+
+def _requestdl_single_flight(key: str, fn) -> str | None:
+    with _requestdl_sf_lock:
+        call = _requestdl_sf.get(key)
+        leader = call is None
+        if leader:
+            call = _SFCall()
+            _requestdl_sf[key] = call
+    if not leader:
+        # Bound the wait so a dead leader cannot pin a follower forever; on
+        # timeout the follower degrades to its own direct call.
+        budget = float(max(1, cfg.REQUESTDL_RETRIES)) * 20.0 + 5.0
+        if call.event.wait(timeout=budget):
+            if call.error is not None:
+                raise call.error
+            return call.result
+        return fn()
+    try:
+        call.result = fn()
+        return call.result
+    except BaseException as exc:
+        call.error = exc
+        raise
+    finally:
+        with _requestdl_sf_lock:
+            _requestdl_sf.pop(key, None)
+        call.event.set()
 
 
 def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
@@ -238,7 +308,10 @@ def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
         "file_id": file_id,
         "zip_link": "false",
     }
-    return _requestdl_get(url, params, f"requestdl torrent={torrent_id} file={file_id}")
+    return _requestdl_single_flight(
+        f"t:{torrent_id}:{file_id}",
+        lambda: _requestdl_get(url, params, f"requestdl torrent={torrent_id} file={file_id}"),
+    )
 
 
 def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
@@ -253,7 +326,10 @@ def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
         "file_id": file_id,
         "zip_link": "false",
     }
-    return _requestdl_get(url, params, f"usenet requestdl usenet={usenet_id} file={file_id}")
+    return _requestdl_single_flight(
+        f"u:{usenet_id}:{file_id}",
+        lambda: _requestdl_get(url, params, f"usenet requestdl usenet={usenet_id} file={file_id}"),
+    )
 
 
 def _extract_year(name: str) -> int | None:

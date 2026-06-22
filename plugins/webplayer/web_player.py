@@ -287,10 +287,10 @@ def _get_cdn_url(stream: torrentio.TorrentioStream,
 def _request_dl(torrent_id: int, file_id: int) -> str | None:
     """Call TorBox requestdl and return the CDN URL.
 
-    Retries transient 5xx / network errors with a short linear backoff, since
-    TorBox's requestdl intermittently returns HTTP 500 and recovers within
-    seconds. 4xx (auth / rate-limit / gone) fail immediately. Tunable via
-    REQUESTDL_RETRIES / REQUESTDL_BACKOFF_MS.
+    Retries transient 5xx / 429 / network errors with a short linear backoff,
+    since TorBox's requestdl intermittently returns HTTP 500 or 429 and recovers
+    within seconds. The other 4xx (auth / gone / bad request) fail immediately.
+    Tunable via REQUESTDL_RETRIES / REQUESTDL_BACKOFF_MS.
     """
     import config as _config
     base = (_settings.get("TORBOX_BASE_URL") or _config.TORBOX_BASE_URL).rstrip("/")
@@ -306,7 +306,9 @@ def _request_dl(torrent_id: int, file_id: int) -> str | None:
     for attempt in range(1, attempts + 1):
         try:
             resp = req_lib.get(url, params=params, timeout=15)
-            if resp.status_code < 500:
+            # 429 (rate-limit) is transient like 5xx and is retried; every other
+            # 4xx is deterministic and fails immediately via raise_for_status.
+            if resp.status_code != 429 and resp.status_code < 500:
                 resp.raise_for_status()
                 return (resp.json() or {}).get("data") or None
             last = f"HTTP {resp.status_code}"
