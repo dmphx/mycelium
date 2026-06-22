@@ -100,7 +100,36 @@ def _file_absolute(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | None:
+_FORMAT_NUMS = {240, 264, 265, 360, 480, 576, 720, 1080, 1440, 2160}
+
+
+def _file_has_absolute(name: str, n: int) -> bool:
+    """True if the file name carries absolute number ``n`` as a standalone
+    episode token (handles '- 154', 'E0154', '154.', zero padding), but not
+    when the digits are part of a codec (h.264/x265), resolution (1080p),
+    bit depth (10bit) or another number.
+    """
+    n = int(n)
+    if n in _FORMAT_NUMS:          # never match on a codec/resolution number
+        return False
+    for m in re.finditer(r'(?<![0-9])0*%d(?![0-9])' % n, name):
+        i, j = m.start(), m.end()
+        before = name[i - 1] if i > 0 else ' '
+        after = name[j] if j < len(name) else ' '
+        if before not in ' -_.[(#eE':                  # require an episode delimiter
+            continue
+        if re.search(r'[hx]\.?$', name[:i], re.IGNORECASE):   # codec h.264 / x264
+            continue
+        if after in 'piPI':                            # resolution 1080p / 720i
+            continue
+        if name[j:j + 3].lower() == 'bit':             # 10bit / 8bit
+            continue
+        return True
+    return False
+
+
+def _pick_episode_file(files: list[dict], season: int, episode: int,
+                       absolute: int | None = None) -> dict | None:
     """Pick the file in a (season) pack for one episode.
 
     Safest first:
@@ -131,6 +160,15 @@ def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | N
                 and _file_absolute(f.get('name') or '') == int(episode)]
     if len(abs_hits) == 1:
         return abs_hits[0]
+    # Cross-scheme absolute (anime): the caller resolved this episode's absolute
+    # number via TheXEM. Match a file carrying that number in any scheme, e.g.
+    # request S20E15 -> absolute 446 -> "Naruto Shippuden - 446". Single hit only.
+    if absolute and int(absolute) != int(episode):
+        xem_hits = [f for f in videos
+                    if _file_episode(f.get('name') or '') is None
+                    and _file_has_absolute(f.get('name') or '', int(absolute))]
+        if len(xem_hits) == 1:
+            return xem_hits[0]
     untagged = [f for f in videos if _file_episode(f.get('name') or '') is None]
     if len(untagged) == 1:
         return untagged[0]

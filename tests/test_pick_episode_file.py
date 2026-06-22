@@ -21,6 +21,11 @@ def _pid(files, s, e):
     return f["id"] if f else None
 
 
+def _pid_abs(files, s, e, absolute):
+    f = sg._pick_episode_file(files, s, e, absolute=absolute)
+    return f["id"] if f else None
+
+
 class TestPickEpisodeFile:
     def test_untagged_e01_is_not_the_largest_file(self):
         # E01 carries the generic pack name (no SxxExx); E05 is the largest file.
@@ -82,3 +87,31 @@ class TestFileEpisodeParser:
     def test_ignores_resolution_codec_and_generic_names(self):
         assert sg._file_episode("Show 1920x1080 x265.mkv") is None
         assert sg._file_episode("Generic Pack Name 2020.mkv") is None
+
+
+class TestCrossSchemeAbsolute:
+    """The 'absolute' arg lets a TVDB request match an absolute-numbered file."""
+
+    NARUTO = "[Koten_Gars] Naruto Shippuden - 446 [iTunes][h.264][1080p][AC3] [33CB660A].mkv"
+
+    def test_has_absolute_token_matches(self):
+        assert sg._file_has_absolute(self.NARUTO, 446) is True
+        assert sg._file_has_absolute("Bleach - 047.mkv", 47) is True          # zero-padded
+        assert sg._file_has_absolute("Show E0154 1080p.mkv", 154) is True
+
+    def test_has_absolute_rejects_embedded_digits(self):
+        assert sg._file_has_absolute("Show.x264.1080p.mkv", 264) is False     # codec
+        assert sg._file_has_absolute("Show 1920x1080.mkv", 1080) is False     # resolution
+        assert sg._file_has_absolute(self.NARUTO, 264) is False               # codec inside name
+
+    def test_pick_matches_by_absolute_when_provided(self):
+        files = [_f(i, "[Grp] Naruto Shippuden - %d [1080p].mkv" % a)
+                 for i, a in enumerate([444, 445, 446, 447])]
+        # request S20E15 -> TheXEM absolute 446 (computed by caller)
+        assert _pid_abs(files, 20, 15, 446) == 2          # the "- 446" file
+        assert _pid_abs(files, 20, 15, 999) is None       # absolute not present -> fail closed
+        assert _pid(files, 20, 15) is None                # without absolute -> ambiguous, fail closed
+
+    def test_absolute_ignored_for_normal_seasonal_pack(self):
+        files = [_f(0, "Show.S01E05.mkv"), _f(1, "Show.S01E06.mkv")]
+        assert _pid_abs(files, 1, 5, 305) == 0            # seasonal match wins; absolute unused

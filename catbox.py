@@ -272,7 +272,13 @@ def _pick_usenet_file_id(item: dict, virtual_item: dict) -> int | None:
     s_num = virtual_item.get("season")
     e_num = virtual_item.get("episode")
     if s_num and e_num:
-        main = strm_generator._pick_episode_file(norm, s_num, e_num)
+        absolute = None
+        try:
+            import numbering
+            absolute = numbering.to_absolute(virtual_item.get("imdb_id"), s_num, e_num)
+        except Exception:
+            absolute = None
+        main = strm_generator._pick_episode_file(norm, s_num, e_num, absolute=absolute)
         return main.get("id") if main else None
     vids = [f for f in norm if strm_generator._is_video(f["name"])]
     return vids[0].get("id") if len(vids) == 1 else None
@@ -657,7 +663,13 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 s_num = item.get("season")
                 e_num = item.get("episode")
                 if s_num and e_num:
-                    main = strm_generator._pick_episode_file(files, s_num, e_num)
+                    absolute = None
+                    try:
+                        import numbering
+                        absolute = numbering.to_absolute(item.get("imdb_id"), s_num, e_num)
+                    except Exception:
+                        absolute = None
+                    main = strm_generator._pick_episode_file(files, s_num, e_num, absolute=absolute)
                 else:
                     vids = [f for f in files
                             if strm_generator._is_video(f.get("name") or "")
