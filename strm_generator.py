@@ -250,20 +250,22 @@ def _parse_retry_after(value: str | None) -> float | None:
     return secs if secs >= 0 else None
 
 
-# TorBox enforces an account-wide requestdl rate limit. When it trips, it returns
-# 429 with a Retry-After (observed as high as ~130s). Interactive playback must
-# still fail fast (a user is waiting and ffmpeg times out), so _requestdl_get
-# keeps its small Retry-After cap. But the background preload loop has nobody
-# waiting, and retrying every few seconds against a two minute cooldown just
-# burns 429s and keeps the limit tripped. So _requestdl_get records each 429
-# cooldown here and the preload path backs off for its duration.
+# TorBox enforces an account-wide requestdl rate limit (429 with a Retry-After,
+# observed as high as ~130s) and also throws transient 5xx storms on the same
+# endpoint. Interactive playback must still fail fast (a user is waiting and
+# ffmpeg times out), so _requestdl_get keeps its small Retry-After cap. But the
+# background loops (preload, probe) have nobody waiting, and hammering through a
+# 429 cooldown or a 5xx storm just keeps the endpoint saturated and starves the
+# interactive plays that share it. So _requestdl_get records a cooldown here on
+# any 429 or 5xx and the background loops back off for its duration.
 _torbox_throttle_lock = threading.Lock()
 _torbox_throttle_until = {"ts": 0.0}   # monotonic deadline; preload pauses until then
 
 
 def _note_torbox_throttle(retry_after_sec: float | None) -> None:
-    """Record a TorBox 429 cooldown window. Observational: this does not change
-    the interactive requestdl retry behavior, it only gates the preload loop."""
+    """Record a TorBox cooldown window (429 or 5xx). Observational: this does not
+    change the interactive requestdl retry behavior, it only gates the background
+    loops, which consult _preload_throttled_for() before each requestdl."""
     cap = cfg.PRELOAD_BREAKER_MAX_COOLDOWN_SEC
     if cap <= 0 or not retry_after_sec or retry_after_sec <= 0:
         return
@@ -305,7 +307,18 @@ def _requestdl_get(url: str, params: dict, label: str) -> str | None:
             last = f"HTTP {resp.status_code}"
             if resp.status_code == 429:
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                _note_torbox_throttle(retry_after)
+                # A 429 without a usable Retry-After still means we are over the
+                # account limit, so fall back to the default cooldown rather than
+                # leaving the background loops un-throttled.
+                _note_torbox_throttle(
+                    retry_after if retry_after is not None
+                    else cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
+            elif resp.status_code >= 500:
+                # 5xx is not a rate-limit signal, but pushing more requestdl into
+                # a TorBox 5xx storm keeps it saturated. Back the background loops
+                # off for the default window; interactive callers do not consult
+                # the throttle, so a live play still retries immediately below.
+                _note_torbox_throttle(cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
         except req_lib.HTTPError as exc:
             log.warning("%s: %s", label, exc)
             return None
@@ -1754,6 +1767,13 @@ def probe_pending_stubs() -> dict:
                     main = _pick_main_movie_file(files)
                     file_id = (main or files[0]).get("id")
 
+                throttled = _preload_throttled_for()
+                if throttled > 0:
+                    log.info("Probe pending: TorBox throttled %.0fs, stopping pass early "
+                             "(probed=%d skipped=%d errors=%d)",
+                             throttled, probed, skipped, errors)
+                    return {"probed": probed, "skipped": skipped, "errors": errors}
+                _preload_requestdl_pace()
                 cdn_url = _get_stream_url(torrent_id, file_id)
                 if not cdn_url:
                     skipped += 1
@@ -1762,7 +1782,6 @@ def probe_pending_stubs() -> dict:
                 _catbox.cache_url(token, cdn_url)
                 _preload_spore(cdn_url, token, build_fsh=False)
                 probed += 1
-                time.sleep(0.3)
 
         except Exception as exc:
             log.warning("Probe pending: error for hash %s: %s", info_hash, exc)

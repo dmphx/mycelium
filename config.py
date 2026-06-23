@@ -209,6 +209,14 @@ PRELOAD_CONCURRENCY = _env_int("PRELOAD_CONCURRENCY", 2)
 # disable the breaker. Interactive playback is never gated by this.
 PRELOAD_BREAKER_MAX_COOLDOWN_SEC = _env_int("PRELOAD_BREAKER_MAX_COOLDOWN_SEC", 600)
 
+# Default cooldown applied when requestdl fails without a usable Retry-After:
+# any 5xx, or a 429 whose Retry-After header is missing or unparseable. Without
+# this the breaker only armed on 429+Retry-After, so a TorBox 5xx storm sailed
+# straight through and the background loops kept hammering requestdl, starving
+# interactive playback that shares the endpoint. Capped by the max above; set to
+# 0 to disable the default-cooldown behavior.
+PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC = _env_int("PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC", 30)
+
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.
 AUTO_UPGRADE_ENABLED = _env("AUTO_UPGRADE_ENABLED", "true").lower() in ("1", "true", "yes")

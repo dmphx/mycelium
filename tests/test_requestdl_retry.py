@@ -115,3 +115,39 @@ def test_single_flight_coalesces_concurrent_calls():
     assert calls == [1]                       # fn ran exactly once
     assert results == ["cdn://ok"] * 5        # all callers got the URL
     assert sg._requestdl_sf == {}             # registry cleaned up
+
+
+def _reset_throttle():
+    sg._torbox_throttle_until["ts"] = 0.0
+
+
+def test_5xx_storm_arms_preload_throttle(monkeypatch):
+    # A sustained 5xx storm (every attempt fails) must arm the background
+    # back-off so the preload/probe loops stop hammering requestdl. Previously
+    # only 429+Retry-After armed it, so 500s sailed through and starved the
+    # interactive plays that share the endpoint.
+    _reset_throttle()
+    n = max(1, sg.cfg.REQUESTDL_RETRIES)
+    _patch_get(monkeypatch, [_Resp(500) for _ in range(n)])
+    assert sg._requestdl_get("u", {}, "lbl") is None
+    cooldown = sg._preload_throttled_for()
+    assert 0 < cooldown <= float(sg.cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
+
+
+def test_429_without_retry_after_arms_throttle(monkeypatch):
+    # A 429 with no usable Retry-After still means we are over the account
+    # limit, so the background loops back off on the default cooldown.
+    _reset_throttle()
+    _patch_get(monkeypatch, [_Resp(429), _Resp(200, data="cdn://ok")])
+    assert sg._requestdl_get("u", {}, "lbl") == "cdn://ok"
+    cooldown = sg._preload_throttled_for()
+    assert 0 < cooldown <= float(sg.cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
+
+
+def test_deterministic_4xx_does_not_arm_throttle(monkeypatch):
+    # A deterministic 4xx is a hard failure, not a rate-limit/overload signal,
+    # so it must never throttle the background loops.
+    _reset_throttle()
+    _patch_get(monkeypatch, [_Resp(404)])
+    assert sg._requestdl_get("u", {}, "lbl") is None
+    assert sg._preload_throttled_for() == 0.0
