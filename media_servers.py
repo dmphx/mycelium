@@ -79,12 +79,29 @@ def _top_folder(strm_path):
 
 def mark(strm_path):
     """Record a newly-written .strm so its folder gets a debounced targeted scan."""
+    _enqueue(strm_path, "scan")
+
+
+def request_reanalyze(strm_path):
+    """Queue a Plex re-analyze (and Jellyfin refresh) for an item whose media
+    changed on disk, e.g. a Spore stub rewritten with a corrected codec.
+
+    Plex caches the codec at scan time, so a rewritten stub stays stale until it
+    is re-analyzed; a plain scan only detects new files. The queue line carries an
+    'analyze' marker so the host-side scanner runs Plex Media Scanner --analyze
+    instead of --scan. Mycelium has no Plex creds, so this host queue is the only
+    lever (see module docstring)."""
+    _enqueue(strm_path, "analyze")
+
+
+def _enqueue(strm_path, mode):
     info = _top_folder(strm_path)
     if not info:
         return
+    kind, folder = info
     global _timer
     with _lock:
-        _pending.add(info)
+        _pending.add((kind, folder, mode))
         if _timer is None:
             _timer = threading.Timer(_DEBOUNCE, _flush)
             _timer.daemon = True
@@ -99,16 +116,22 @@ def _flush():
         _timer = None
     if not batch:
         return
-    jf_updates, plex_lines = [], []
-    for kind, folder in batch:
+    jf_updates, plex_queue_lines = [], []
+    for kind, folder, mode in batch:
         jf_updates.append({"Path": "%s/%s/%s" % (JF_LIBRARY_ROOT, kind, folder),
-                           "UpdateType": "Created"})
-        if kind == "series":
-            plex_lines.append("%s\t%s/%s" % (PLEX_SECTION_TV, PLEX_TV_ROOT, folder))
-        else:
-            plex_lines.append("%s\t%s/%s" % (PLEX_SECTION_MOVIE, PLEX_MOVIE_ROOT, folder))
+                           "UpdateType": "Modified" if mode == "analyze" else "Created"})
+        section = PLEX_SECTION_TV if kind == "series" else PLEX_SECTION_MOVIE
+        root    = PLEX_TV_ROOT if kind == "series" else PLEX_MOVIE_ROOT
+        plex_path = "%s/%s" % (root, folder)
+        # Prefer a direct Plex API partial scan: it re-reads changed files, so a
+        # stub rewritten with a corrected codec lands in Plex's DB (a rewritten
+        # stub otherwise stays stale and keeps the codec mismatch alive). Fall
+        # back to the host-drained queue file when no Plex token is configured.
+        if not _plex_api_scan(section, plex_path):
+            plex_queue_lines.append("%s\t%s" % (section, plex_path))
     _scan_jellyfin(jf_updates)
-    _queue_plex(plex_lines)
+    if plex_queue_lines:
+        _queue_plex(plex_queue_lines)
 
 
 def _scan_jellyfin(updates):
@@ -129,6 +152,31 @@ def _scan_jellyfin(updates):
             log.info("Targeted Jellyfin scan: %d folder(s)", len(updates))
     except Exception as exc:
         log.warning("Targeted Jellyfin scan failed (%s); full-refresh backstop will catch it", exc)
+
+
+def _plex_api_scan(section, plex_path):
+    """Trigger a Plex partial scan of one folder over the HTTP API.
+
+    Returns True when the scan was attempted (PLEX_URL + PLEX_TOKEN configured),
+    so the caller skips the host-queue fallback; returns False when no Plex creds
+    are set. A partial scan re-reads changed files, so a stub rewritten with a
+    corrected codec updates Plex's cached media info."""
+    url   = _cfg("PLEX_URL", "")
+    token = _cfg("PLEX_TOKEN", "")
+    if not url or not token:
+        return False
+    try:
+        resp = requests.get("%s/library/sections/%s/refresh" % (url.rstrip("/"), section),
+                            params={"path": plex_path, "X-Plex-Token": token},
+                            timeout=15)
+        if resp.status_code >= 400:
+            log.warning("Plex API scan HTTP %s for %s", resp.status_code, plex_path)
+        else:
+            log.info("Plex API partial scan: section %s path %s", section, plex_path)
+    except Exception as exc:
+        log.warning("Plex API scan failed for %s (%s); periodic refresh backstop will catch it",
+                    plex_path, exc)
+    return True
 
 
 def _queue_plex(lines):

@@ -186,6 +186,46 @@ class TestCodecIdForVideo:
         assert sg._codec_id_for_video("weirdcodec", "1080p") == "V_MPEG4/ISO/AVC"
 
 
+class TestCodecFromReleaseName:
+    def test_hevc_tokens(self):
+        assert sg._codec_from_release_name("Haunted Hotel S01 1080p 10bit WEBRip 6CH x265 HEVC-PSA") == "hevc"
+        assert sg._codec_from_release_name("Movie.2024.2160p.WEB.H.265-GRP") == "hevc"
+        assert sg._codec_from_release_name("Show.S01.1080p.x 265-GRP") == "hevc"
+
+    def test_h264_tokens(self):
+        assert sg._codec_from_release_name("Civil.War.2024.1080p.WEB-DL.x264-GRP") == "h264"
+        assert sg._codec_from_release_name("Movie.2024.1080p.H.264-GRP") == "h264"
+        assert sg._codec_from_release_name("Movie.2024.1080p.AVC-GRP") == "h264"
+
+    def test_av1(self):
+        assert sg._codec_from_release_name("Show.S01.1080p.WEB.AV1-GRP") == "av1"
+
+    def test_ambiguous_returns_none(self):
+        assert sg._codec_from_release_name("Movie.2024.1080p.WEB-DL.DD5.1-GRP") is None
+        assert sg._codec_from_release_name("") is None
+        assert sg._codec_from_release_name(None) is None
+
+
+class TestDnFromMagnet:
+    def test_plus_encoded(self):
+        m = "magnet:?xt=urn:btih:abc123&dn=Some.Release.S01.1080p.x265-GRP&tr=udp://t"
+        assert sg._dn_from_magnet(m) == "Some.Release.S01.1080p.x265-GRP"
+
+    def test_percent_encoded(self):
+        m = "magnet:?xt=urn:btih:abc&dn=Some%20Release%20x265%20HEVC"
+        assert sg._dn_from_magnet(m) == "Some Release x265 HEVC"
+
+    def test_non_magnet_returns_none(self):
+        assert sg._dn_from_magnet("https://indexer/file.nzb") is None
+        assert sg._dn_from_magnet(None) is None
+
+    def test_end_to_end_codec_id(self):
+        # The dn -> codec -> CodecID chain must yield HEVC for an x265 release at 1080p.
+        dn = sg._dn_from_magnet("magnet:?xt=urn:btih:x&dn=Show.S01.1080p.x265-GRP")
+        codec = sg._codec_from_release_name(dn)
+        assert sg._codec_id_for_video(codec, "1080p") == "V_MPEGH/ISO/HEVC"
+
+
 class TestWriteSporeStubs:
     def test_creates_mkv_and_minfo(self, tmp_path, monkeypatch):
         media_root = tmp_path / "media"
@@ -203,6 +243,28 @@ class TestWriteSporeStubs:
         minfo = (stub_dir / "Elevation (2024).minfo").read_text()
         assert "token=abc123" in minfo
         assert "size=" in minfo
+
+    def test_born_hevc_from_magnet_dn(self, tmp_path, monkeypatch):
+        # A 1080p x265 release must be born as an HEVC stub (from the magnet dn=),
+        # not the 1080p->AVC resolution default, so Plex never feeds HEVC into an
+        # H.264 pipeline. imdb_id=None keeps the TMDB duration lookup out of the way.
+        media_root = tmp_path / "media"
+        spore_root = tmp_path / "plex-media"
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(media_root))
+        monkeypatch.setattr(sg, "SPORE_MEDIA_PATH", str(spore_root))
+        sg.settings.get.return_value = True
+        monkeypatch.setattr(sg.db, "get_virtual_item", lambda token: {
+            "magnet": "magnet:?xt=urn:btih:x&dn=Show.S01.1080p.WEBRip.x265-HEVC-GRP",
+            "imdb_id": None, "season": None, "episode": None, "quality": "1080p",
+        })
+
+        strm_path = media_root / "series" / "Show" / "Season 01" / "Show S01E01.strm"
+        sg._write_spore_stubs(strm_path, token="tokH", title="Show S01E01",
+                              quality="1080p", size_gb=2.0)
+
+        mkv = (spore_root / "series" / "Show" / "Season 01" / "Show S01E01.mkv").read_bytes()
+        assert b"V_MPEGH/ISO/HEVC" in mkv
+        assert b"V_MPEG4/ISO/AVC" not in mkv
 
     def test_minfo_size_in_bytes(self, tmp_path, monkeypatch):
         media_root = tmp_path / "media"

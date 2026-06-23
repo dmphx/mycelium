@@ -1205,6 +1205,45 @@ def _codec_id_for_video(codec_name: str | None, quality: str | None) -> str:
     return _codec_id_for_quality(quality)
 
 
+def _dn_from_magnet(magnet: str | None) -> str | None:
+    """Extract the display name (dn=) from a magnet URI, URL-decoded.
+    This is normally the full release name (e.g. 'Show S01 1080p x265 HEVC-PSA'),
+    which lets us classify the real video codec before any CDN probe. Returns
+    None for non-magnet sources (e.g. the magnet slot holds an NZB URL)."""
+    if not magnet or "magnet:" not in magnet:
+        return None
+    try:
+        from urllib.parse import parse_qs, urlsplit, unquote_plus
+        dn = (parse_qs(urlsplit(magnet).query).get("dn") or [None])[0]
+        return unquote_plus(dn) if dn else None
+    except Exception:
+        return None
+
+
+# Release-name tokens that reliably reveal the real video codec. Checked at stub
+# creation so a 1080p HEVC release is born with an HEVC stub instead of the AVC
+# resolution default (which feeds HEVC into Plex's H.264 pipeline and kills the
+# session with invalid NAL units, web error s3014 / s3015).
+_RELEASE_CODEC_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("av1",  r"\bav1\b"),
+    ("hevc", r"\b(?:x ?265|h\.?265|hevc)\b"),
+    ("h264", r"\b(?:x ?264|h\.?264|avc)\b"),
+)
+
+
+def _codec_from_release_name(name: str | None) -> str | None:
+    """Classify the video codec ('hevc' | 'h264' | 'av1') from a release name.
+    Returns None when no codec token is present, so callers fall back to the
+    quality based guess."""
+    if not name:
+        return None
+    low = name.lower()
+    for codec, pat in _RELEASE_CODEC_PATTERNS:
+        if re.search(pat, low):
+            return codec
+    return None
+
+
 _FFCODEC_TO_MKV_AUDIO: dict[str, str] = {
     "eac3":     "A_EAC3",
     "ac3":      "A_AC3",
@@ -1468,6 +1507,7 @@ def _write_spore_stubs(strm_path: Path, token: str,
     if not mkv_path.exists():
         try:
             duration_sec = 7200.0
+            vi = None
             try:
                 vi = db.get_virtual_item(token)
                 imdb_id = vi.get("imdb_id") if vi else None
@@ -1485,10 +1525,19 @@ def _write_spore_stubs(strm_path: Path, token: str,
             except Exception as _e:
                 log.debug("Spore: TMDB duration lookup failed for %s: %s", title, _e)
 
-            stub = make_stub_mkv(title, quality, duration_sec=duration_sec)
+            # Born-correct codec: classify from the release name (magnet dn=) so an
+            # HEVC release gets an HEVC stub up front instead of the AVC resolution
+            # default. Falls back to the quality guess when the name is ambiguous.
+            release_name = _dn_from_magnet((vi or {}).get("magnet"))
+            video_codec  = _codec_from_release_name(release_name or title)
+            codec_id     = _codec_id_for_video(video_codec, quality)
+
+            stub = make_stub_mkv(title, quality, duration_sec=duration_sec,
+                                  codec_id=codec_id)
             atomic_write_bytes(mkv_path, stub)
-            log.debug("Spore: wrote stub MKV %s (%d bytes, quality=%s dur=%.0fs)",
-                      mkv_path.name, len(stub), quality or "?", duration_sec)
+            log.debug("Spore: wrote stub MKV %s (%d bytes, quality=%s codec=%s dur=%.0fs)",
+                      mkv_path.name, len(stub), quality or "?",
+                      video_codec or "guess", duration_sec)
         except Exception as exc:
             log.warning("Spore: could not write stub MKV %s: %s", mkv_path, exc)
             return
@@ -1796,6 +1845,17 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
     # file. A mismatch (AVC stub for an HEVC file) makes Plex feed HEVC into an
     # H.264 pipeline, producing invalid NAL units and a killed transcode session.
     codec_id = _codec_id_for_video(video_codec, item.get("quality"))
+
+    # Detect a codec flip versus the stub Plex last scanned. Plex caches the codec
+    # at scan time, so when the probe corrects an AVC-guess stub to HEVC we must
+    # ask Plex to re-analyze or it keeps feeding HEVC into an H.264 pipeline.
+    codec_changed = False
+    try:
+        if mkv_path.exists():
+            codec_changed = codec_id.encode("ascii") not in mkv_path.read_bytes()
+    except Exception:
+        codec_changed = False
+
     v_priv = None
     if video_extradata_hex:
         try:
@@ -1818,6 +1878,14 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
             "Spore: updated stub for token=%s with %d audio + %d subs",
             token, len(audio_streams), len(subtitle_tracks),
         )
+        if codec_changed:
+            try:
+                import media_servers
+                media_servers.request_reanalyze(strm_path)
+                log.info("Spore: codec corrected to %s for token=%s; queued Plex re-analyze",
+                         video_codec or "?", token)
+            except Exception as _ms_exc:
+                log.debug("Spore: re-analyze enqueue failed for token=%s: %s", token, _ms_exc)
         # Also update the NFO sidecar so Plex sees the real codec / language info
         # This applies to both stub MKV library and .strm library
         try:
