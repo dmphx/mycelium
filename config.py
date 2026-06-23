@@ -201,6 +201,13 @@ REQUESTDL_RETRY_AFTER_CAP_SEC = _env_int("REQUESTDL_RETRY_AFTER_CAP_SEC", 5)
 # restore the old un-paced behavior.
 PRELOAD_REQUESTDL_MIN_INTERVAL_SEC = _env_float("PRELOAD_REQUESTDL_MIN_INTERVAL_SEC", 1.5)
 PRELOAD_CONCURRENCY = _env_int("PRELOAD_CONCURRENCY", 2)
+# Preload circuit breaker. When TorBox trips its account-wide requestdl rate
+# limit it returns 429 with a Retry-After (observed up to ~130s). Rather than
+# the preload loop poking it every few seconds for the whole window, record the
+# cooldown and pause preload requestdl until it passes, capped at this many
+# seconds so a pathological Retry-After cannot freeze preload. Set to 0 to
+# disable the breaker. Interactive playback is never gated by this.
+PRELOAD_BREAKER_MAX_COOLDOWN_SEC = _env_int("PRELOAD_BREAKER_MAX_COOLDOWN_SEC", 600)
 
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.

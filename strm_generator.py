@@ -250,6 +250,35 @@ def _parse_retry_after(value: str | None) -> float | None:
     return secs if secs >= 0 else None
 
 
+# TorBox enforces an account-wide requestdl rate limit. When it trips, it returns
+# 429 with a Retry-After (observed as high as ~130s). Interactive playback must
+# still fail fast (a user is waiting and ffmpeg times out), so _requestdl_get
+# keeps its small Retry-After cap. But the background preload loop has nobody
+# waiting, and retrying every few seconds against a two minute cooldown just
+# burns 429s and keeps the limit tripped. So _requestdl_get records each 429
+# cooldown here and the preload path backs off for its duration.
+_torbox_throttle_lock = threading.Lock()
+_torbox_throttle_until = {"ts": 0.0}   # monotonic deadline; preload pauses until then
+
+
+def _note_torbox_throttle(retry_after_sec: float | None) -> None:
+    """Record a TorBox 429 cooldown window. Observational: this does not change
+    the interactive requestdl retry behavior, it only gates the preload loop."""
+    cap = cfg.PRELOAD_BREAKER_MAX_COOLDOWN_SEC
+    if cap <= 0 or not retry_after_sec or retry_after_sec <= 0:
+        return
+    deadline = time.monotonic() + min(float(retry_after_sec), float(cap))
+    with _torbox_throttle_lock:
+        if deadline > _torbox_throttle_until["ts"]:
+            _torbox_throttle_until["ts"] = deadline
+
+
+def _preload_throttled_for() -> float:
+    """Seconds left in the current TorBox throttle window, or 0.0 if clear."""
+    with _torbox_throttle_lock:
+        return max(0.0, _torbox_throttle_until["ts"] - time.monotonic())
+
+
 def _requestdl_get(url: str, params: dict, label: str) -> str | None:
     """GET a TorBox requestdl endpoint, retrying transient failures.
 
@@ -276,6 +305,7 @@ def _requestdl_get(url: str, params: dict, label: str) -> str | None:
             last = f"HTTP {resp.status_code}"
             if resp.status_code == 429:
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                _note_torbox_throttle(retry_after)
         except req_lib.HTTPError as exc:
             log.warning("%s: %s", label, exc)
             return None
@@ -773,6 +803,11 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
                 main = _pick_main_movie_file(files)
                 file_id = (main or files[0]).get("id")
 
+            throttled = _preload_throttled_for()
+            if throttled > 0:
+                log.info("Preload: TorBox throttled %.0fs, backing off %s (%d/%d cached)",
+                         throttled, title, cached_count, len(all_items))
+                break
             _preload_requestdl_pace()
             cdn_url = _get_stream_url(torrent_id, file_id)
             if not cdn_url:
