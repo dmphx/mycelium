@@ -329,7 +329,48 @@ if [ "$spore_replaced" = "1" ]; then
         fi
     done
 
+    # Pre-input -codec:0 is Plex's decoder hint for the source; it reflects the
+    # stub video codec, which now matches the real CDN codec. Compare its codec
+    # family to the chosen output encoder family. When they match (or the source
+    # is unknown), the client accepts the source codec, so copy it through
+    # untouched (pristine, no GPU). When they differ (e.g. HEVC source but H264
+    # output for a client that cannot decode HEVC), let Plex transcode instead of
+    # force-copying, so the stream actually plays on that client.
+    _vcodec_pre=""
+    for idx in "${!newargs[@]}"; do
+        [ "${newargs[$idx]}" = "-i" ] && break
+        [ "${newargs[$idx]}" = "-codec:0" ] && _vcodec_pre="${newargs[$((idx+1))]:-}"
+    done
+    _codec_family() {
+        case "$1" in
+            *hevc*|*h265*|*265*) echo "hevc" ;;
+            *h264*|*264*|*avc*)  echo "h264" ;;
+            *av1*)               echo "av1" ;;
+            *vp9*)               echo "vp9" ;;
+            *)                   echo "$1" ;;
+        esac
+    }
+    _src_fam=$(_codec_family "$_vcodec_pre")
+    _out_fam=$(_codec_family "$_vcodec_post")
+
+    # By default copy the source through (the efficient passthrough capable
+    # clients want). Transcode ONLY when Plex downgraded to H.264 from an advanced
+    # source codec (HEVC / AV1 / VP9): that means the client cannot decode the
+    # source, so a copy would fail and a real re-encode is needed. Same-codec
+    # outputs, "upgrades" the client merely prefers (e.g. H264 source to HEVC),
+    # and unknown sources all stay copy, so currently working playback is
+    # untouched.
+    _do_video_copy=0
     if [ -n "$_vcodec_post" ] && [ "$_vcodec_post" != "copy" ]; then
+        if [ "$_out_fam" = "h264" ] && { [ "$_src_fam" = "hevc" ] || [ "$_src_fam" = "av1" ] || [ "$_src_fam" = "vp9" ]; }; then
+            echo "$(date '+%H:%M:%S') WRAP letting Plex transcode video (src=${_src_fam:-?} -> h264; client cannot decode source)" >> "$SPORE_LOG"
+            echo "SPORE-WRAP: letting Plex transcode video (src=${_src_fam:-?} -> ${_out_fam:-?})" >&2
+        else
+            _do_video_copy=1
+        fi
+    fi
+
+    if [ "$_do_video_copy" = "1" ]; then
         echo "$(date '+%H:%M:%S') WRAP force video copy (was: $_vcodec_post)" >> "$SPORE_LOG"
         echo "SPORE-WRAP: forcing video copy (was: $_vcodec_post)" >&2
         _vhl=""
