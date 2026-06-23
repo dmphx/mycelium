@@ -21,6 +21,16 @@ def _env_int(name: str, default: int) -> int:
         raise RuntimeError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be a number, got {raw!r}") from exc
+
+
 TORBOX_API_KEY = _env("TORBOX_API_KEY", "")
 TORBOX_BASE_URL = _env("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
 
@@ -179,6 +189,18 @@ REQUESTDL_BACKOFF_MS = _env_int("REQUESTDL_BACKOFF_MS", 600)
 # longer than this many seconds (a large suggested delay would stall playback
 # past ffmpeg's own timeout); above the cap we fall back to the linear backoff.
 REQUESTDL_RETRY_AFTER_CAP_SEC = _env_int("REQUESTDL_RETRY_AFTER_CAP_SEC", 5)
+
+# Preload CDN-cache pacing. The catbox preload loop calls requestdl once per
+# episode token with no spacing, and up to PRELOAD_CONCURRENCY shows preload at
+# once, so a few season packs stampede TorBox requestdl into a sustained 429.
+# A failed (429) requestdl skips the slow spore probe, so the loop then fires
+# the next file almost instantly, which keeps the rate limit tripped (a feedback
+# loop). Gate preload requestdl calls to one per MIN_INTERVAL globally, and cap
+# concurrent preload threads. Interactive playback (/stream and /spore-stream)
+# does NOT go through this gate and stays low latency. Set INTERVAL to 0 to
+# restore the old un-paced behavior.
+PRELOAD_REQUESTDL_MIN_INTERVAL_SEC = _env_float("PRELOAD_REQUESTDL_MIN_INTERVAL_SEC", 1.5)
+PRELOAD_CONCURRENCY = _env_int("PRELOAD_CONCURRENCY", 2)
 
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.

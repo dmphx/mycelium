@@ -700,12 +700,29 @@ def _find_movie_folder_by_imdb(imdb_id: str) -> Path | None:
     return None
 
 
-_preload_semaphore = threading.Semaphore(3)   # max 3 concurrent preload threads
+_preload_semaphore = threading.Semaphore(max(1, cfg.PRELOAD_CONCURRENCY))  # max concurrent preload threads
 _preload_in_flight: set[str] = set()
 _preload_lock = threading.Lock()
 _preload_add_lock = threading.Lock()          # gate around add_magnet to respect rate limit
 _preload_state = {"last_add": 0.0}            # mutable so no global keyword needed
 _PRELOAD_MIN_INTERVAL = 7.0                   # seconds between add_magnet calls (~8/min, limit is 10/min)
+
+# Pace the preload CDN-cache requestdl calls so the loop never stampedes TorBox
+# into a sustained 429. Serializes to one requestdl per interval across all
+# preload threads. Interactive playback does not use this gate. See config.py.
+_preload_requestdl_lock = threading.Lock()
+_preload_requestdl_state = {"last": 0.0}
+
+
+def _preload_requestdl_pace() -> None:
+    iv = cfg.PRELOAD_REQUESTDL_MIN_INTERVAL_SEC
+    if iv <= 0:
+        return
+    with _preload_requestdl_lock:
+        elapsed = time.monotonic() - _preload_requestdl_state["last"]
+        if elapsed < iv:
+            time.sleep(iv - elapsed)
+        _preload_requestdl_state["last"] = time.monotonic()
 
 
 # ── Catbox: CDN URL cache ─────────────────────────────────────────────────────
@@ -756,6 +773,7 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
                 main = _pick_main_movie_file(files)
                 file_id = (main or files[0]).get("id")
 
+            _preload_requestdl_pace()
             cdn_url = _get_stream_url(torrent_id, file_id)
             if not cdn_url:
                 continue
