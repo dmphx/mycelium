@@ -467,9 +467,16 @@ def title_exists(title: str) -> bool:
 
 
 def _is_ready(item: dict) -> bool:
+    state = (item.get("download_state") or "").lower()
+    # A torrent TorBox has purged (expired) or lost (reported missing) still
+    # reports download_finished=True, but its files are gone so requestdl returns
+    # HTTP 500. Treat these terminal-dead states as not ready BEFORE the
+    # download_finished short-circuit: the probe then skips the item instead of
+    # poisoning the whole pass, and a live play re-adds it via catbox.
+    if state in ("expired", "reported missing"):
+        return False
     if item.get("download_finished"):
         return True
-    state = (item.get("download_state") or "").lower()
     return state in ("cached", "completed", "uploading", "metadl_done")
 
 
