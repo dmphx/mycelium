@@ -15,7 +15,7 @@ import jellyfin
 import settings
 import torbox as torbox_mod
 import config as cfg
-from config import MEDIA_PATH, TORBOX_BASE_URL, SPORE_MEDIA_PATH
+from config import MEDIA_PATH, TORBOX_BASE_URL as _TORBOX_BASE_URL_DEFAULT, SPORE_MEDIA_PATH
 from io_utils import atomic_write_bytes, atomic_write_text
 
 log = logging.getLogger(__name__)
@@ -382,7 +382,8 @@ def _requestdl_single_flight(key: str, fn) -> str | None:
 
 
 def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/requestdl"
+    torbox_base_url = settings.get("TORBOX_BASE_URL", _TORBOX_BASE_URL_DEFAULT)
+    url = f"{torbox_base_url.rstrip('/')}/torrents/requestdl"
     params = {
         "token": settings.get("TORBOX_API_KEY", ""),
         "torrent_id": torrent_id,
@@ -400,7 +401,7 @@ def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
 
     Mirrors _get_stream_url but hits /usenet/requestdl with usenet_id instead
     of torrent_id."""
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/requestdl"
+    url = f"{settings.get('TORBOX_BASE_URL', _TORBOX_BASE_URL_DEFAULT).rstrip('/')}/usenet/requestdl"
     params = {
         "token": settings.get("TORBOX_API_KEY", ""),
         "usenet_id": usenet_id,
@@ -1093,6 +1094,13 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     import catbox
     safe_title = _safe(title)
     if not safe_title:
+        return False
+    # DB-level dedup guard: the path check below only catches the case where
+    # the .strm already lives at the exact same computed path. If the title
+    # was sanitized differently since the episode was first registered (folder
+    # rename, title fix, etc.) that check misses it and we'd register a second
+    # token for the same episode. Checking imdb_id+season+episode catches that.
+    if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
         return False
     season_dir = f"Season {season:02d}"
     ep_name = f"{safe_title} S{season:02d}E{episode:02d}"
@@ -1975,8 +1983,19 @@ def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_typ
     return _get_stream_url(torrent_id, file_id)
 
 
-def process_torrent(item: dict) -> int:
-    """Create .strm files for all video files in a ready torrent. Returns new file count."""
+def process_torrent(item: dict, canonical_title: str | None = None,
+                     imdb_id: str | None = None, tmdb_id: int | None = None) -> int:
+    """Create .strm files for all video files in a ready torrent. Returns new file count.
+
+    canonical_title/imdb_id/tmdb_id: when the caller already knows which show/movie
+    this torrent belongs to (e.g. right after adding it for a specific request),
+    pass them so the folder uses the known canonical title instead of whatever
+    _parse_info() derives from this particular torrent's raw name. Different
+    torrent uploaders name the same show differently, so leaving every add to
+    parse its own folder name is how the same series ends up in 5+ separate
+    folders. A tvshow.nfo is also written so later duplicate-merge passes can
+    match reliably by IMDb id instead of by fuzzy title guessing.
+    """
     torrent_id = item.get('id')
     torrent_name = _clean_torrent_name(item.get('name') or '')
     files = item.get('files') or []
@@ -2012,6 +2031,7 @@ def process_torrent(item: dict) -> int:
         return 0
 
     written = 0
+    nfo_written = False
     for f in video_files:
         file_id = f.get('id')
         file_name = f.get('name') or ''
@@ -2019,6 +2039,10 @@ def process_torrent(item: dict) -> int:
         if info is None:
             log.warning("Cannot determine placement: torrent=%r file=%r", torrent_name, file_name)
             continue
+        if canonical_title and info['type'] != 'movie':
+            clean_canonical = _safe(canonical_title)
+            if clean_canonical:
+                info = dict(info, title=clean_canonical)
         path = _strm_path(info)
         if path.exists():
             continue
@@ -2027,6 +2051,12 @@ def process_torrent(item: dict) -> int:
             continue
         if _write_strm(path, url):
             written += 1
+            if imdb_id and info['type'] != 'movie' and not nfo_written:
+                series_root = path.parent.parent
+                tvshow_nfo = series_root / "tvshow.nfo"
+                if not tvshow_nfo.exists():
+                    _write_nfo(path, imdb_id, tmdb_id=tmdb_id, nfo_path=tvshow_nfo, media_type="series")
+                nfo_written = True
 
     return written
 
@@ -2042,6 +2072,9 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
     item = torbox_mod.find_by_id(torrent_id)
     if not item:
         log.warning("Torrent %s not found in mylist for strm creation", torrent_id)
+        return 0
+    if not torbox_mod._is_ready(item):
+        log.info("Torrent %s (%s) not ready yet  -  skipping strm creation for now", torrent_id, title)
         return 0
 
     if media_type == 'movie':
@@ -2063,7 +2096,67 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
             _write_nfo(path, imdb_id, tmdb_id)
         return 1 if written else 0
 
-    return process_torrent(item)
+    return process_torrent(item, canonical_title=title, imdb_id=imdb_id, tmdb_id=tmdb_id)
+
+
+def scan_torbox_library() -> dict:
+    """Reconcile TorBox's own library against ours: find torrents TorBox already
+    has cached that we have no record of (e.g. after a DB reset, or content
+    added outside Mycelium) and materialize .strm files for them.
+
+    For each unknown torrent, guesses title/year/season/episode from the
+    release name, resolves a real title via TMDB when possible so the item
+    lands in a properly named, deduplicated folder (same canonical-title path
+    normal requests use), and falls back to the raw parsed name otherwise.
+    """
+    import torbox as torbox_mod
+    import tmdb
+    items = torbox_mod.list_torrents(force_refresh=True)
+    scanned = imported = skipped = failed = 0
+    for item in items:
+        if not torbox_mod._is_ready(item):
+            continue
+        scanned += 1
+        info_hash = (item.get('hash') or '').lower()
+        if not info_hash:
+            skipped += 1
+            continue
+        if db.get_virtual_item_by_hash(info_hash):
+            skipped += 1
+            continue
+        try:
+            torrent_name = _clean_torrent_name(item.get('name') or '')
+            guess = _parse_info(torrent_name, torrent_name)
+            if not guess:
+                skipped += 1
+                continue
+            media_type = 'series' if guess['type'] == 'episode' else 'movie'
+            imdb_id = None
+            try:
+                if media_type == 'movie':
+                    imdb_id = tmdb.search_movie(guess['title'], guess.get('year'))
+                else:
+                    imdb_id = tmdb.search_tv(guess['title'])
+            except Exception as exc:
+                log.debug("scan_torbox_library: TMDB lookup failed for %r: %s", guess['title'], exc)
+            resolved_title = tmdb.display_title(imdb_id, media_type) if imdb_id else None
+            if resolved_title:
+                title = resolved_title
+            elif guess['type'] == 'movie' and guess.get('year'):
+                title = f"{guess['title']} ({guess['year']})"
+            else:
+                title = guess['title']
+            written = create_strm_for_torrent(item['id'], title, media_type, imdb_id=imdb_id)
+            if written:
+                imported += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            log.warning("scan_torbox_library: failed for %s: %s", item.get('name'), exc)
+            failed += 1
+    log.info("scan_torbox_library: scanned=%d imported=%d skipped=%d failed=%d",
+              scanned, imported, skipped, failed)
+    return {"scanned": scanned, "imported": imported, "skipped": skipped, "failed": failed}
 
 
 def create_series_strms_from_files(torrent_name: str, files_with_urls: list) -> int:

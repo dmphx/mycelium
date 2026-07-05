@@ -402,6 +402,41 @@ def _migrate() -> None:
         if "library_click_jellyfin" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN library_click_jellyfin INTEGER NOT NULL DEFAULT 0")
             log.info("Migration: added users.library_click_jellyfin")
+        for col in ("discover_language_include", "discover_language_exclude"):
+            if col not in user_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                log.info("Migration: added users.%s", col)
+        for col in ("mdblist_api_key", "mdblist_list_ids"):
+            if col not in user_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                log.info("Migration: added users.%s", col)
+
+        # plugins/trakt owns trakt_watched (created by its own run_migrations(),
+        # which runs after this function via plugin_loader.load_all()). An earlier
+        # version of this migration also created a trakt_watched table with an
+        # incompatible schema (extra tmdb_id NOT NULL/season/episode columns, no
+        # UNIQUE(user_id, imdb_id)); since db.init() runs before plugin loading,
+        # that wrong-shaped table would win the CREATE TABLE IF NOT EXISTS race and
+        # the plugin's own inserts (ON CONFLICT(user_id, imdb_id)) would then fail.
+        # Drop it here if it's still in that shape so the plugin can recreate it
+        # correctly on next startup.
+        _cols = {r["name"] for r in conn.execute("PRAGMA table_info(trakt_watched)")}
+        if _cols and "season" in _cols:
+            conn.execute("DROP TABLE trakt_watched")
+            log.info("Migration: dropped trakt_watched (wrong schema from a removed "
+                     "duplicate integration); plugins/trakt will recreate it correctly")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorite_actors (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                person_id   INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                profile_path TEXT,
+                added_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+                UNIQUE(user_id, person_id)
+            )
+        """)
 
         conn.commit()
 
@@ -471,7 +506,12 @@ def insert_request(title: str, imdb_id: str, media_type: str, seasons: list[int]
                     tmdb_id: int | None = None) -> int:
     seasons_str = ",".join(str(s) for s in (seasons or []))
     with _connect() as conn:
-        cur = conn.execute(
+        # cursor.lastrowid is unreliable here: on the ON CONFLICT/UPDATE path
+        # (i.e. every retry of an existing imdb_id) SQLite does NOT update
+        # last_insert_rowid(), so it can return a stale id left over from some
+        # unrelated row's last real INSERT on this connection. Look the row up
+        # explicitly instead of trusting lastrowid.
+        conn.execute(
             "INSERT INTO requests (title, imdb_id, media_type, seasons, tmdb_id) VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(imdb_id) DO UPDATE SET "
             "title=excluded.title, seasons=COALESCE(excluded.seasons, seasons), "
@@ -479,8 +519,9 @@ def insert_request(title: str, imdb_id: str, media_type: str, seasons: list[int]
             "updated_at=strftime('%Y-%m-%d %H:%M:%S', 'now')",
             (title, imdb_id, media_type, seasons_str or None, tmdb_id),
         )
+        row = conn.execute("SELECT id FROM requests WHERE imdb_id=?", (imdb_id,)).fetchone()
         conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        return row["id"]
 
 
 def update_request(row_id: int, status: str, quality: str | None = None,
@@ -1093,6 +1134,12 @@ def delete_virtual_item(token: str) -> None:
         conn.commit()
 
 
+def delete_virtual_item_by_strm_path(strm_path: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM virtual_items WHERE strm_path=?", (strm_path,))
+        conn.commit()
+
+
 def rename_virtual_item_paths(old_dir: str, new_dir: str) -> int:
     """Bulk-update strm_path in virtual_items when a folder is renamed.
     Replaces the old directory prefix with the new one. Returns rows updated."""
@@ -1431,6 +1478,36 @@ def touch_user_login(user_id: int) -> None:
 def delete_user(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+
+def add_favorite_actor(user_id: int, person_id: int, name: str, profile_path: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO favorite_actors (user_id, person_id, name, profile_path) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, person_id, name, profile_path),
+        )
+        conn.commit()
+
+
+def remove_favorite_actor(user_id: int, person_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM favorite_actors WHERE user_id=? AND person_id=?", (user_id, person_id))
+        conn.commit()
+
+
+def get_favorite_actors(user_id: int) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM favorite_actors WHERE user_id=? ORDER BY added_at DESC", (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_favorite_actors() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT DISTINCT person_id, name FROM favorite_actors").fetchall()
+        return [dict(r) for r in rows]
 
 
 def user_count() -> int:

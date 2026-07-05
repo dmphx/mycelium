@@ -36,6 +36,18 @@ TORBOX_BASE_URL = _env("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
 
 ZILEAN_URL = _env("ZILEAN_URL", "")
 ZILEAN_ENABLED = _env("ZILEAN_ENABLED", "false").lower() in ("1", "true", "yes")
+# "external": call an existing iPromKnight/zilean HTTP service (ZILEAN_URL above).
+# "native": run a built-in DMM hashlist index in SQLite, no separate service needed.
+ZILEAN_MODE = _env("ZILEAN_MODE", "external")
+ZILEAN_DB_PATH = _env("ZILEAN_DB_PATH", "/data/zilean_native.db")
+# One-time bulk import from an existing external Zilean's Postgres database,
+# for users switching to native mode who don't want to re-scrape from scratch.
+# Only used when explicitly triggered (see /ui/api/zilean/import).
+ZILEAN_PG_HOST = _env("ZILEAN_PG_HOST", "")
+ZILEAN_PG_PORT = _env_int("ZILEAN_PG_PORT", 5432)
+ZILEAN_PG_DB = _env("ZILEAN_PG_DB", "zilean")
+ZILEAN_PG_USER = _env("ZILEAN_PG_USER", "postgres")
+ZILEAN_PG_PASSWORD = _env("ZILEAN_PG_PASSWORD", "")
 
 TORRENTIO_BASE_URL = _env("TORRENTIO_BASE_URL", "https://torrentio.strem.fun")
 TORRENTIO_OPTS = _env("TORRENTIO_OPTS", "")
@@ -66,6 +78,18 @@ SEERR_API_KEY = _env("SEERR_API_KEY", "")
 
 TMDB_API_KEY = _env("TMDB_API_KEY", "")
 
+# Trakt.tv OAuth app credentials (create one at https://trakt.tv/oauth/applications).
+# Per-user access/refresh tokens are stored in the users table after the device-code
+# flow completes; these are only the app-level client id/secret.
+TRAKT_CLIENT_ID = _env("TRAKT_CLIENT_ID", "")
+TRAKT_CLIENT_SECRET = _env("TRAKT_CLIENT_SECRET", "")
+# Cap on how many watchlist items a single sync run will auto-request, so a huge
+# imported watchlist can't flood TorBox's createtorrent quota in one go.
+TRAKT_AUTO_REQUEST_CAP = _env_int("TRAKT_AUTO_REQUEST_CAP", 10)
+
+# MDBList: per-user API key (mdblist.com/preferences), no app-level credentials needed.
+MDBLIST_AUTO_REQUEST_CAP = _env_int("MDBLIST_AUTO_REQUEST_CAP", 10)
+
 LISTEN_HOST = _env("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = _env_int("LISTEN_PORT", 8088)
 
@@ -84,6 +108,11 @@ EXCLUDE_DV_P5 = _env("EXCLUDE_DV_P5", "true").lower() in ("1", "true", "yes")
 # "only cam available, allowing them" fallback). When false, cam is allowed
 # only if it's the sole option.
 STRICT_NO_CAM = _env("STRICT_NO_CAM", "false").lower() in ("1", "true", "yes")
+# Reject candidates whose file size is implausibly small for their claimed
+# quality and the title's real (TMDB) runtime  -  catches releases that lie
+# about their quality (a cam mislabeled as "2160p") or aren't the full title
+# at all (a trailer standing in for the movie).
+EXCLUDE_UNDERSIZED_RELEASES = _env("EXCLUDE_UNDERSIZED_RELEASES", "true").lower() in ("1", "true", "yes")
 PREFER_WEBDL = _env("PREFER_WEBDL", "true").lower() in ("1", "true", "yes")
 PREFER_HEVC = _env("PREFER_HEVC", "true").lower() in ("1", "true", "yes")
 # Minimum seeders to include a candidate (0 = no filter; unknown seeders always pass).
@@ -245,6 +274,13 @@ DISNEY_NL_TOP_COUNT = _env_int("DISNEY_NL_TOP_COUNT", 0)
 AUTO_ADD_MIN_RATING = float(_env("AUTO_ADD_MIN_RATING", "6.0"))
 AUTO_ADD_MIN_VOTES = _env_int("AUTO_ADD_MIN_VOTES", 100)
 AUTO_ADD_REGION = _env("AUTO_ADD_REGION", "NL")
+
+# Per-genre auto-approve (year-ranged genre fill) + favorite-actor auto-request.
+# Genre rules themselves are configured at runtime (AUTO_APPROVE_GENRE_RULES,
+# a JSON list) since they're a variable-length list, not a scalar env var.
+AUTO_APPROVE_DAILY_LIMIT = _env_int("AUTO_APPROVE_DAILY_LIMIT", 5)
+AUTO_APPROVE_ACTOR_DAILY_LIMIT = _env_int("AUTO_APPROVE_ACTOR_DAILY_LIMIT", 5)
+AUTO_APPROVE_INTERVAL_HOURS = _env_int("AUTO_APPROVE_INTERVAL_HOURS", 24)
 
 # ── Radarr / Sonarr import ────────────────────────────────────────────────────
 RADARR_URL = _env("RADARR_URL", "")

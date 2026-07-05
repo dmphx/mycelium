@@ -9,6 +9,7 @@ import type {
   MediaType,
   WantedMovie,
   WantedEpisode,
+  PersonDetail,
 } from './types';
 
 const csrfToken = (): string => {
@@ -66,8 +67,35 @@ export const api = {
     http<{ results: TmdbItem[] }>(
       `/ui/api/discover/by-provider?type=${type}&provider_id=${providerId}${sortBy ? `&sort_by=${sortBy}` : ''}`,
     ),
+  byGenre: (type: MediaType, genreId: number, yearFrom?: number | null, yearTo?: number | null) =>
+    http<{ results: TmdbItem[] }>(
+      `/ui/api/discover/by-genre?type=${type}&genre_id=${genreId}` +
+      (yearFrom ? `&year_from=${yearFrom}` : '') + (yearTo ? `&year_to=${yearTo}` : ''),
+    ),
+  genreTabs: () =>
+    http<{ tabs: GenreRule[] }>('/ui/api/discover/genre-tabs'),
+  genreTabsConfig: () =>
+    http<{ tabs: GenreRule[] }>('/ui/api/discover/genre-tabs/config'),
+  setGenreTabsConfig: (tabs: GenreRule[]) =>
+    http<{ ok: boolean }>('/ui/api/discover/genre-tabs/config', {
+      method: 'POST',
+      body: JSON.stringify({ tabs }),
+    }),
   details: (type: MediaType, id: number) =>
     http<TmdbDetail>(`/ui/api/discover/details?type=${type}&id=${id}`),
+  person: (id: number) =>
+    http<PersonDetail>(`/ui/api/person/${id}`),
+  favoriteActors: () =>
+    http<{ actors: Array<{ person_id: number; name: string; profile_path: string | null }> }>(
+      '/ui/api/favorite-actors',
+    ),
+  followActor: (personId: number, name: string, profilePath: string | null) =>
+    http<{ ok: boolean }>(`/ui/api/favorite-actors/${personId}`, {
+      method: 'POST',
+      body: JSON.stringify({ name, profile_path: profilePath }),
+    }),
+  unfollowActor: (personId: number) =>
+    http<{ ok: boolean }>(`/ui/api/favorite-actors/${personId}/remove`, { method: 'POST' }),
   addToLibrary: (
     tmdb_id: number,
     media_type: MediaType,
@@ -156,7 +184,7 @@ export const api = {
     }),
 
   // User preferences
-  setPreferences: (prefs: Record<string, boolean>) =>
+  setPreferences: (prefs: Record<string, boolean | string>) =>
     http<{ ok: boolean }>('/ui/api/me/preferences', {
       method: 'POST',
       body: JSON.stringify(prefs),
@@ -261,7 +289,72 @@ export const api = {
     http<{ scanned: number; ok: number; orphaned_tokens: number; relinked: number; deleted: number; skipped: number }>(
       '/ui/api/repair-strms', { method: 'POST' }
     ),
+  scanTorboxLibrary: () =>
+    http<{ scanned: number; imported: number; skipped: number; failed: number }>(
+      '/ui/api/torbox/scan-library', { method: 'POST' }
+    ),
+
+  // Auto-approve (genre rules + favorite actors)
+  genres: (type: 'movie' | 'tv') =>
+    http<{ genres: Array<{ id: number; name: string }> }>(`/ui/api/genres?type=${type}`),
+  autoApproveGenreRules: () =>
+    http<{ rules: GenreRule[] }>('/ui/api/auto-approve/genre-rules'),
+  setAutoApproveGenreRules: (rules: GenreRule[]) =>
+    http<{ ok: boolean }>('/ui/api/auto-approve/genre-rules', {
+      method: 'POST',
+      body: JSON.stringify({ rules }),
+    }),
+  runAutoApproveNow: () =>
+    http<{ ok: boolean; started: boolean }>('/ui/api/auto-approve/run-now', { method: 'POST' }),
+
+  // MDBList
+  mdblistStatus: () =>
+    http<{ connected: boolean; list_ids: string }>('/ui/api/mdblist/status'),
+  mdblistConnect: (apiKey: string) =>
+    http<{ ok: boolean }>('/ui/api/mdblist/connect', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  mdblistDisconnect: () =>
+    http<{ ok: boolean }>('/ui/api/mdblist/disconnect', { method: 'POST' }),
+  mdblistLists: () =>
+    http<{ lists: Array<{ id: number; name: string }> }>('/ui/api/mdblist/lists'),
+  mdblistSetLists: (listIds: (string | number)[]) =>
+    http<{ ok: boolean }>('/ui/api/mdblist/lists', {
+      method: 'POST',
+      body: JSON.stringify({ list_ids: listIds }),
+    }),
+  mdblistSync: () =>
+    http<{ ok: boolean; added: number }>('/ui/api/mdblist/sync', { method: 'POST' }),
+
+  // Settings (admin)
+  settings: () =>
+    http<{ groups: Array<{ id: string; title: string; items: SettingItem[] }>; hot_reload: string[] }>(
+      '/ui/api/settings',
+    ),
+  setNotificationSettings: (values: Record<string, boolean | string>) =>
+    http<{ ok: boolean }>('/ui/api/settings/notifications', {
+      method: 'POST',
+      body: JSON.stringify(values),
+    }),
 };
+
+export interface SettingItem {
+  key: string;
+  value: any;
+  kind: 'bool' | 'list' | 'int' | 'float' | 'str';
+  overridden: boolean;
+  hot_reload: boolean;
+}
+
+export interface GenreRule {
+  media_type: 'movie' | 'tv';
+  genre_id: number;
+  genre_name: string;
+  year_from: number | null;
+  year_to: number | null;
+  enabled: boolean;
+}
 
 // Image helpers  -  TMDB image CDN
 export const tmdbImg = {

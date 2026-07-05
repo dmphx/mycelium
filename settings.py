@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 # Type hints per key  -  drives parsing of stored strings.
 _BOOL_KEYS = {
+    "EXCLUDE_UNDERSIZED_RELEASES",
     "CATBOX_MODE",
     "CATBOX_PRELOAD",
     "ALLOW_4K",
@@ -47,7 +48,16 @@ _LIST_KEYS = {
     "EXCLUDE_LANGUAGES",
     "OPENSUBTITLES_LANGUAGES",
 }
+_FLOAT_KEYS = {
+    "AUTO_ADD_MIN_RATING",
+}
+# Keys with a fixed set of valid values  -  rendered as a <select> in the UI
+# instead of free text, so a typo can't silently produce an invalid setting.
+_ENUM_KEYS: dict[str, list[str]] = {
+    "ZILEAN_MODE": ["external", "native"],
+}
 _INT_KEYS = {
+    "ZILEAN_PG_PORT",
     "MIN_SEEDERS",
     "MAX_SIZE_GB",
     "WEB_PLAYER_MAX_SIZE_GB",
@@ -80,6 +90,11 @@ _INT_KEYS = {
     "CONTINUE_WATCHING_INTERVAL_MINUTES",
     "CATCHUP_DELAY_SEC",
     "CATCHUP_TAKE",
+    "TRAKT_AUTO_REQUEST_CAP",
+    "MDBLIST_AUTO_REQUEST_CAP",
+    "AUTO_APPROVE_DAILY_LIMIT",
+    "AUTO_APPROVE_ACTOR_DAILY_LIMIT",
+    "AUTO_APPROVE_INTERVAL_HOURS",
 }
 
 # Keys that take effect on the next access (no restart).
@@ -93,6 +108,8 @@ HOT_RELOAD = {
     "TMDB_API_KEY",
     "ZILEAN_URL",
     "ZILEAN_ENABLED",
+    "ZILEAN_MODE",
+    "ZILEAN_PG_HOST", "ZILEAN_PG_PORT", "ZILEAN_PG_DB", "ZILEAN_PG_USER", "ZILEAN_PG_PASSWORD",
     "CATBOX_MODE",
     "CATBOX_LAZY_ADD",
     "CATBOX_IDLE_MINUTES",
@@ -102,6 +119,7 @@ HOT_RELOAD = {
     "EXCLUDE_BLURAY",
     "EXCLUDE_CAM",
     "STRICT_NO_CAM",
+    "EXCLUDE_UNDERSIZED_RELEASES",
     "PREFER_WEBDL",
     "PREFER_HEVC",
     "MIN_SEEDERS",
@@ -109,6 +127,8 @@ HOT_RELOAD = {
     "AUDIO_LANGUAGE_PREFERENCE",
     "EXCLUDE_LANGUAGES",
     "OPENSUBTITLES_LANGUAGES",
+    "OPENSUBTITLES_API_KEY",
+    "OPENSUBTITLES_USER_AGENT",
     "BLACKLIST_FAIL_THRESHOLD",
     "WEB_PLAYER_MAX_SIZE_GB",
     "NOTIFY_ON_SUCCESS",
@@ -131,8 +151,11 @@ HOT_RELOAD = {
     "TRENDING_TV_COUNT", "POPULAR_MOVIE_COUNT", "POPULAR_TV_COUNT",
     "NETFLIX_NL_TOP_COUNT", "PRIME_NL_TOP_COUNT", "DISNEY_NL_TOP_COUNT",
     "AUTO_ADD_MIN_RATING", "AUTO_ADD_MIN_VOTES", "AUTO_ADD_REGION",
+    "AUTO_APPROVE_DAILY_LIMIT", "AUTO_APPROVE_ACTOR_DAILY_LIMIT", "AUTO_APPROVE_GENRE_RULES",
+    "DISCOVER_GENRE_TABS",
     "RADARR_URL", "RADARR_API_KEY", "SONARR_URL", "SONARR_API_KEY",
-    "TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET",
+    "TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET", "TRAKT_AUTO_REQUEST_CAP",
+    "MDBLIST_AUTO_REQUEST_CAP",
 }
 
 # Logical groups for the Settings UI tab.
@@ -150,9 +173,18 @@ SETTING_GROUPS = [
             "JELLYFIN_URL", "JELLYFIN_API_KEY",
             "SEERR_URL", "SEERR_API_KEY",
             "TMDB_API_KEY",
-            "TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET",
+            "TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET", "TRAKT_AUTO_REQUEST_CAP",
             "ZILEAN_ENABLED", "ZILEAN_URL",
             "REALDEBRID_API_KEY", "MULTI_DEBRID_ENABLED",
+        ],
+    },
+    {
+        "id": "zilean_native",
+        "title": "Zilean (external service vs. native built-in index)",
+        "keys": [
+            "ZILEAN_MODE",
+            "ZILEAN_PG_HOST", "ZILEAN_PG_PORT", "ZILEAN_PG_DB",
+            "ZILEAN_PG_USER", "ZILEAN_PG_PASSWORD",
         ],
     },
     {
@@ -166,13 +198,15 @@ SETTING_GROUPS = [
         "keys": [
             "QUALITY_PREFERENCE", "ALLOW_4K", "EXCLUDE_REMUX", "EXCLUDE_BLURAY", "EXCLUDE_CAM",
             "PREFER_WEBDL", "PREFER_HEVC", "MIN_SEEDERS", "MAX_SIZE_GB", "STRICT_NO_CAM",
+            "EXCLUDE_UNDERSIZED_RELEASES",
             "WEB_PLAYER_MAX_SIZE_GB",
         ],
     },
     {
         "id": "languages",
         "title": "Languages & subtitles",
-        "keys": ["AUDIO_LANGUAGE_PREFERENCE", "EXCLUDE_LANGUAGES", "OPENSUBTITLES_LANGUAGES", "OPENSUBTITLES_API_KEY"],
+        "keys": ["AUDIO_LANGUAGE_PREFERENCE", "EXCLUDE_LANGUAGES", "OPENSUBTITLES_LANGUAGES",
+                 "OPENSUBTITLES_API_KEY", "OPENSUBTITLES_USER_AGENT"],
     },
     {
         "id": "auto",
@@ -193,6 +227,12 @@ SETTING_GROUPS = [
             "NETFLIX_NL_TOP_COUNT", "PRIME_NL_TOP_COUNT", "DISNEY_NL_TOP_COUNT",
             "AUTO_ADD_MIN_RATING", "AUTO_ADD_MIN_VOTES", "AUTO_ADD_REGION",
         ],
+    },
+    {
+        "id": "auto_approve",
+        "title": "Auto-approve (genres + favorite actors)",
+        "keys": ["AUTO_APPROVE_DAILY_LIMIT", "AUTO_APPROVE_ACTOR_DAILY_LIMIT",
+                 "TRAKT_AUTO_REQUEST_CAP", "MDBLIST_AUTO_REQUEST_CAP"],
     },
     {
         "id": "arr_import",
@@ -226,6 +266,7 @@ SETTING_GROUPS = [
             "MONITOR_INTERVAL_HOURS", "MOVIE_SYNC_INTERVAL_MINUTES",
             "MERGE_VERSIONS_INTERVAL_HOURS", "BACKUP_INTERVAL_HOURS",
             "RETRY_QUEUE_INTERVAL_MINUTES", "CONTINUE_WATCHING_INTERVAL_MINUTES",
+            "AUTO_APPROVE_INTERVAL_HOURS",
         ],
     },
 ]
@@ -243,6 +284,13 @@ def _coerce(key: str, raw: str | None):
             return int(raw)
         except (TypeError, ValueError):
             return None
+    if key in _FLOAT_KEYS:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    if key in _ENUM_KEYS:
+        return raw if raw in _ENUM_KEYS[key] else None
     return raw
 
 
@@ -265,6 +313,8 @@ def set(key: str, value) -> None:
     if value is None or value == "":
         db.set_setting(key, None)
         return
+    if key in _ENUM_KEYS and str(value) not in _ENUM_KEYS[key]:
+        raise ValueError(f"{key} must be one of {_ENUM_KEYS[key]}, got {value!r}")
     if isinstance(value, bool):
         stored = "true" if value else "false"
     elif isinstance(value, (list, tuple)):
@@ -287,12 +337,15 @@ def all_for_ui() -> list[dict]:
                 "bool" if key in _BOOL_KEYS
                 else "list" if key in _LIST_KEYS
                 else "int" if key in _INT_KEYS
+                else "float" if key in _FLOAT_KEYS
+                else "enum" if key in _ENUM_KEYS
                 else "str"
             )
             items.append({
                 "key": key,
                 "value": current,
                 "kind": kind,
+                "options": _ENUM_KEYS.get(key),
                 "overridden": override_raw is not None,
                 "hot_reload": key in HOT_RELOAD,
             })

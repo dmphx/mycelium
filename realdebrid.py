@@ -8,14 +8,19 @@ import time
 
 import requests
 
+import settings as _settings
 from config import (
-    REALDEBRID_API_KEY,
+    REALDEBRID_API_KEY as _REALDEBRID_API_KEY_DEFAULT,
     REALDEBRID_BASE_URL,
     TORBOX_POLL_INTERVAL_SEC,
     TORBOX_POLL_TIMEOUT_SEC,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _api_key() -> str:
+    return _settings.get("REALDEBRID_API_KEY", _REALDEBRID_API_KEY_DEFAULT)
 
 
 class RateLimited(Exception):
@@ -25,11 +30,11 @@ class RateLimited(Exception):
 
 
 def is_configured() -> bool:
-    return bool(REALDEBRID_API_KEY)
+    return bool(_api_key())
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {REALDEBRID_API_KEY}"}
+    return {"Authorization": f"Bearer {_api_key()}"}
 
 
 def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:

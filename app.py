@@ -8,6 +8,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, stream_with_context, url_for
 
+import auto_approve
 import backup
 import catbox
 import nfo_generator
@@ -35,6 +36,7 @@ import upgrader
 import watchdog
 import zilean
 from config import (
+    AUTO_APPROVE_INTERVAL_HOURS,
     AUTO_UPGRADE_ENABLED,
     AUTO_UPGRADE_INTERVAL_HOURS,
     BACKUP_INTERVAL_HOURS,
@@ -82,7 +84,7 @@ if not (cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH or cfg.IN
     )
     _sys.exit(1)
 
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.6.0"
 
 with open(_path.join(_path.dirname(__file__), "releases.json"), encoding="utf-8") as _f:
     RELEASES: list[dict] = _json.load(_f)
@@ -388,6 +390,15 @@ def _start_scheduler() -> BackgroundScheduler:
             log.info("Scheduled auto-add every %dh (total slots: %d)",
                      TRENDING_CHECK_INTERVAL_HOURS, _auto_add_total)
 
+        if AUTO_APPROVE_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                auto_approve.run,
+                trigger="interval", hours=AUTO_APPROVE_INTERVAL_HOURS,
+                id="auto_approve", next_run_time=None,
+            )
+            log.info("Scheduled auto-approve (genres + favorite actors) every %dh",
+                     AUTO_APPROVE_INTERVAL_HOURS)
+
         if CONTINUE_WATCHING_INTERVAL_MINUTES > 0:
             scheduler.add_job(
                 continue_watching.prioritize_next_episodes,
@@ -411,6 +422,16 @@ def _start_scheduler() -> BackgroundScheduler:
             id="quota_warn", next_run_time=None,
         )
         log.info("Scheduled TorBox quota check every %dh", QUOTA_CHECK_INTERVAL_HOURS)
+
+    def _zilean_native_sync():
+        if _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE) != "native":
+            return
+        import zilean_index
+        zilean_index.sync()
+
+    scheduler.add_job(_zilean_native_sync, trigger="interval", hours=6,
+                       id="zilean_native_sync", next_run_time=None, max_instances=1)
+    log.info("Scheduled Zilean native index sync every 6h (no-op unless ZILEAN_MODE=native)")
 
     # Watchdogs + maintenance
     scheduler.add_job(watchdog.deadman_check, trigger="interval", hours=2,
@@ -785,14 +806,17 @@ def setup_save():
         if key not in _SETUP_ALLOWED_KEYS:
             rejected.append(key)
             continue
-        # Treat empty strings as "clear override"
-        if value == "":
-            _settings.set(key, None)
-        elif key in _settings._BOOL_KEYS:
-            _settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
-        else:
-            _settings.set(key, value)
-        saved += 1
+        try:
+            # Treat empty strings as "clear override"
+            if value == "":
+                _settings.set(key, None)
+            elif key in _settings._BOOL_KEYS:
+                _settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
+            else:
+                _settings.set(key, value)
+            saved += 1
+        except ValueError as exc:
+            log.warning("setup_save: rejected invalid value for %s: %s", key, exc)
     if rejected:
         log.warning("Setup wizard rejected non-whitelisted keys: %s",
                     ", ".join(sorted(rejected)))
@@ -948,12 +972,13 @@ def ui_submit():
     if media_type == "series" and not seasons:
         seasons = [1]
 
+    display_title = tmdb.display_title(imdb_id, media_type) or imdb_id
     media_request = MediaRequest(
-        title=imdb_id, media_type=media_type, imdb_id=imdb_id, seasons=seasons,
+        title=display_title, media_type=media_type, imdb_id=imdb_id, seasons=seasons,
     )
     threading.Thread(target=processor.process, args=(media_request,),
                      name=f"manual-{imdb_id}", daemon=True).start()
-    flash(f"Queued: {imdb_id} ({media_type})", "ok")
+    flash(f"Queued: {display_title} ({media_type})", "ok")
     return redirect(url_for("ui_dashboard"))
 
 
@@ -976,13 +1001,14 @@ def ui_search_episode():
 @auth.require_role("admin")
 def ui_download_movie():
     imdb_id = request.form.get("imdb_id", "")
+    display_title = tmdb.display_title(imdb_id, "movie") or imdb_id
     media_request = MediaRequest(
-        title=imdb_id, media_type="movie", imdb_id=imdb_id, seasons=[],
+        title=display_title, media_type="movie", imdb_id=imdb_id, seasons=[],
     )
     db.update_media_item_status(imdb_id, "movie", "processing")
     threading.Thread(target=processor.process, args=(media_request,),
                      name=f"movie-{imdb_id}", daemon=True).start()
-    flash(f"Download queued for {imdb_id}", "ok")
+    flash(f"Download queued for {display_title}", "ok")
     return redirect(url_for("ui_dashboard") + "#movies")
 
 
@@ -1092,6 +1118,19 @@ def ui_api_repair_strms():
     if not auth.is_admin():
         return jsonify(error="unauthorized"), 401
     result = strm_generator.repair_expired_strms(media_type="movie")
+    return jsonify(**result)
+
+
+@app.post("/ui/api/torbox/scan-library")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_torbox_scan_library():
+    """Scan TorBox's own library for torrents we have no record of (e.g. after
+    a DB reset) and materialize .strm files for them, resolving titles via
+    TMDB where possible."""
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    result = strm_generator.scan_torbox_library()
     return jsonify(**result)
 
 
@@ -1233,13 +1272,13 @@ def ui_api_search_candidates():
         return jsonify(error="invalid imdb id"), 400
 
     if media_type == "movie":
-        streams = zilean.fetch_streams(imdb_id) if cfg.ZILEAN_ENABLED else []
+        streams = zilean.fetch_streams(imdb_id) if _settings_mod.get("ZILEAN_ENABLED", cfg.ZILEAN_ENABLED) else []
         candidates = torrentio.rank_streams(streams)
         if not candidates:
             streams = torrentio.fetch_streams("movie", imdb_id)
             candidates = torrentio.rank_streams(streams)
     else:
-        streams = zilean.fetch_streams(imdb_id, season=season, episode=episode) if cfg.ZILEAN_ENABLED else []
+        streams = zilean.fetch_streams(imdb_id, season=season, episode=episode) if _settings_mod.get("ZILEAN_ENABLED", cfg.ZILEAN_ENABLED) else []
         candidates = torrentio.rank_streams(streams)
         if not candidates:
             streams = torrentio.fetch_streams("series", imdb_id, season=season, episode=episode)
@@ -1300,24 +1339,100 @@ def ui_api_poster(imdb_id: str):
     return jsonify(poster=f"https://image.tmdb.org/t/p/w154{path}" if path else None)
 
 
+@app.get("/ui/api/person/<int:person_id>")
+def ui_api_person(person_id: int):
+    """Actor/person detail: bio + combined filmography, for the clickable-cast view."""
+    person = tmdb.person_details(person_id)
+    if not person:
+        return jsonify(error="not found"), 404
+    return jsonify(**person)
+
+
+@app.get("/ui/api/favorite-actors")
+@auth.require_auth
+def ui_api_favorite_actors_list():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    return jsonify(actors=db.get_favorite_actors(rec["id"]))
+
+
+@app.post("/ui/api/favorite-actors/<int:person_id>")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_favorite_actors_add(person_id: int):
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    db.add_favorite_actor(rec["id"], person_id, p.get("name") or str(person_id), p.get("profile_path"))
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/favorite-actors/<int:person_id>/remove")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_favorite_actors_remove(person_id: int):
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    db.remove_favorite_actor(rec["id"], person_id)
+    return jsonify(ok=True)
+
+
+@app.get("/ui/api/genres")
+def ui_api_genres():
+    media_type = request.args.get("type", "movie")
+    return jsonify(genres=tmdb.list_genres(media_type))
+
+
+@app.get("/ui/api/auto-approve/genre-rules")
+@auth.require_auth
+def ui_api_auto_approve_genre_rules_get():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    return jsonify(rules=auto_approve._genre_rules())
+
+
+@app.post("/ui/api/auto-approve/genre-rules")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_auto_approve_genre_rules_set():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    p = request.get_json(silent=True) or {}
+    rules = p.get("rules")
+    if not isinstance(rules, list):
+        return jsonify(error="rules must be a list"), 400
+    auto_approve.set_genre_rules(rules)
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/auto-approve/run-now")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_auto_approve_run_now():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import threading
+    threading.Thread(target=auto_approve.run, name="auto-approve-manual", daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
 # ── Catbox lazy materialization ───────────────────────────────────────────────
 
 @app.get("/stream/<token>")
 def stream_redirect(token: str):
-    """Jellyfin catbox endpoint: always 302 → CDN. Zero server bandwidth."""
-    import time as _t
-    started = _t.monotonic()
+    """Catbox endpoint: 302 → /spore-stream/<token> (moov-first proxy).
+
+    Redirecting to spore-stream instead of the raw CDN URL ensures all clients
+    (Jellyfin, Plex direct-stream, Android TV) get moov-first MP4 so playback
+    starts immediately. spore-stream handles catbox materialization itself.
+    """
     ua  = request.headers.get("User-Agent", "?")[:80]
     rng = request.headers.get("Range", "-")
-    url = catbox.materialize(token)
-    elapsed = _t.monotonic() - started
-    if not url:
-        log.warning("stream: materialize FAILED token=%s ua=%r range=%s (%.1fs)",
-                    token, ua, rng, elapsed)
-        abort(404)
-    log.info("stream: token=%s → 302 CDN (%.1fs) ua=%r range=%s",
-             token, elapsed, ua, rng)
-    return redirect(url, code=302)
+    log.info("stream: token=%s → /spore-stream/ ua=%r range=%s", token, ua, rng)
+    return redirect(f"/spore-stream/{token}", code=302)
 
 
 import cachetools as _cachetools
@@ -1477,11 +1592,14 @@ def spore_stream_proxy(token: str):
 
         return resp
 
-    # CDN file is already moov-first (or MKV redirect sentinel): redirect to CDN.
-    # For MKV files _build_then_probe is never triggered by the cold-cache path,
-    # so we trigger it here once to probe audio streams and detect TrueHD.
+    # CDN file is already moov-first (or MKV redirect sentinel).
+    # MKV files (ftyp_size == 0): redirect to CDN — FFmpeg reads MKV from byte 0,
+    #   no seeking needed, and CDN redirect avoids unnecessary proxy bandwidth.
+    # Already fast-start MP4 (ftyp_size > 0): proxy bytes through our server so
+    #   Plex Server cannot cache the raw CDN URL. Plex stores our /spore-stream/
+    #   URL instead; when any client (MiTV, Shield, etc.) plays, they always hit
+    #   our server which resolves a fresh CDN URL — expired URLs never reach clients.
     if info.get("already_fast"):
-        _spore_cold_sizes.pop(token, None)
         existing = db.load_spore_tracks(token)
         if (not existing or "preferred_audio_idx" not in existing) and token not in _spore_probing:
             _spore_probing.add(token)
@@ -1492,8 +1610,15 @@ def spore_stream_proxy(token: str):
                 name=f"probe-{token[:8]}",
             ).start()
             log.info("spore-stream: token=%s triggering background probe", token)
-        log.info("spore-stream: token=%s already fast-start, 302 to CDN", token)
-        return redirect(cdn_url, code=302)
+        if info["ftyp_size"] == 0:
+            # Non-MP4 sentinel (MKV/other): 302 to CDN, no moov seeking required.
+            _spore_cold_sizes.pop(token, None)
+            log.info("spore-stream: token=%s non-MP4 sentinel, 302 to CDN", token)
+            return redirect(cdn_url, code=302)
+        # Already fast-start MP4: proxy bytes; Plex stores our URL not the CDN URL.
+        log.info("spore-stream: token=%s already fast-start MP4, proxying bytes", token)
+        _spore_cold_sizes[token] = info["cdn_size"]
+        info = None  # fall through to cold-proxy path below
 
     file_size = info["cdn_size"]
     range_hdr = request.headers.get("Range")
@@ -1600,6 +1725,50 @@ def ui_api_integrity():
     return jsonify(db.integrity_report())
 
 
+@app.get("/ui/api/zilean/status")
+def ui_api_zilean_status():
+    """Status of the native Zilean index (mode, hash count, last sync/import)."""
+    mode = _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE)
+    status = {"mode": mode}
+    if mode == "native":
+        import zilean_index
+        status.update(zilean_index.get_status())
+    return jsonify(status)
+
+
+@app.post("/ui/api/zilean/sync")
+@_csrf.exempt
+def ui_api_zilean_sync():
+    """Trigger an immediate native Zilean hashlist sync in the background."""
+    import threading as _threading
+    import zilean_index
+    force = bool(request.get_json(silent=True) and request.get_json(silent=True).get("force"))
+    _threading.Thread(target=zilean_index.sync, kwargs={"force": force}, daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
+@app.post("/ui/api/zilean/import")
+@_csrf.exempt
+def ui_api_zilean_import():
+    """One-time bulk import from an existing external Zilean's Postgres database
+    into the native index. Connection settings come from the Zilean native
+    settings group (Postgres host/port/db/user/password)."""
+    host = _settings_mod.get("ZILEAN_PG_HOST", cfg.ZILEAN_PG_HOST)
+    if not host:
+        return jsonify(error="ZILEAN_PG_HOST not configured"), 400
+    import threading as _threading
+    import zilean_index
+    kwargs = dict(
+        host=host,
+        port=_settings_mod.get("ZILEAN_PG_PORT", cfg.ZILEAN_PG_PORT),
+        dbname=_settings_mod.get("ZILEAN_PG_DB", cfg.ZILEAN_PG_DB),
+        user=_settings_mod.get("ZILEAN_PG_USER", cfg.ZILEAN_PG_USER),
+        password=_settings_mod.get("ZILEAN_PG_PASSWORD", cfg.ZILEAN_PG_PASSWORD),
+    )
+    _threading.Thread(target=zilean_index.import_from_postgres, kwargs=kwargs, daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
 @app.post("/ui/catbox-gc")
 @auth.require_role("admin")
 def ui_catbox_gc():
@@ -1686,6 +1855,29 @@ def ui_api_settings():
     return jsonify(groups=settings.all_for_ui(), hot_reload=list(settings.HOT_RELOAD))
 
 
+_NOTIFICATION_KEYS = {"NOTIFY_ON_SUCCESS", "NOTIFY_ON_FAILURE",
+                      "DISCORD_WEBHOOK_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+
+
+@app.post("/ui/api/settings/notifications")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_settings_notifications_set():
+    """Focused write endpoint for the React Settings page's Notifications card."""
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import settings as _s
+    p = request.get_json(silent=True) or {}
+    for key, value in p.items():
+        if key not in _NOTIFICATION_KEYS:
+            continue
+        if key in _s._BOOL_KEYS:
+            _s.set(key, bool(value))
+        else:
+            _s.set(key, value)
+    return jsonify(ok=True)
+
+
 @app.post("/ui/settings")
 @auth.require_role("admin")
 def ui_save_settings():
@@ -1699,13 +1891,16 @@ def ui_save_settings():
         # before each checkbox so the value always arrives. Handle multi-value here.
         values = request.form.getlist(raw_key)
         value = values[-1] if values else raw_value
-        if key in settings._BOOL_KEYS:
-            settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
-        elif value == "":
-            settings.set(key, None)
-        else:
-            settings.set(key, value)
-        saved += 1
+        try:
+            if key in settings._BOOL_KEYS:
+                settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
+            elif value == "":
+                settings.set(key, None)
+            else:
+                settings.set(key, value)
+            saved += 1
+        except ValueError as exc:
+            flash(str(exc), "error")
     flash(f"Saved {saved} setting(s). Hot-reload settings apply immediately; others need a restart.", "ok")
     return redirect(url_for("ui_dashboard") + "#settings")
 
@@ -1902,6 +2097,7 @@ def ui_api_discover_search():
         return jsonify(results=[])
     page = int(request.args.get("page") or "1")
     results = tmdb.multi_search(q, page=page)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1962,6 +2158,33 @@ def _enrich_library_status(items: list[dict]) -> None:
             it["imdb_id"] = imdb_map.get(it.get("tmdb_id"))
 
 
+def _filter_by_language(items: list[dict]) -> list[dict]:
+    """Apply the logged-in user's Discover language include/exclude preference
+    to a list of normalized TMDB items (in place semantics via return value).
+    Include wins when both are set for the same language. Items with no
+    original_language (rare) are never filtered out."""
+    rec = auth.current_user_record()
+    if not rec:
+        return items
+    include = {l.strip().lower() for l in (rec.get("discover_language_include") or "").split(",") if l.strip()}
+    exclude = {l.strip().lower() for l in (rec.get("discover_language_exclude") or "").split(",") if l.strip()}
+    if not include and not exclude:
+        return items
+    out = []
+    for it in items:
+        lang = (it.get("original_language") or "").lower()
+        if not lang:
+            out.append(it)
+            continue
+        if include:
+            if lang in include:
+                out.append(it)
+            continue
+        if lang not in exclude:
+            out.append(it)
+    return out
+
+
 def _user_region() -> str:
     """Region from ?region= param, or from the logged-in user's profile, or system default."""
     r = request.args.get("region")
@@ -1978,6 +2201,7 @@ def ui_api_discover_trending():
     media = request.args.get("type", "all")  # all | movie | tv
     window = request.args.get("window", "week")  # day | week
     results = tmdb.trending(media, window)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1987,6 +2211,7 @@ def ui_api_discover_popular():
     media = request.args.get("type", "movie")
     region = _user_region()
     results = tmdb.popular(media, region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1995,6 +2220,7 @@ def ui_api_discover_popular():
 def ui_api_discover_top_rated():
     media = request.args.get("type", "movie")
     results = tmdb.top_rated(media)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -2003,6 +2229,7 @@ def ui_api_discover_top_rated():
 def ui_api_discover_now_playing():
     region = _user_region()
     results = tmdb.now_playing(region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -2011,6 +2238,7 @@ def ui_api_discover_now_playing():
 def ui_api_discover_upcoming():
     region = _user_region()
     results = tmdb.upcoming(region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -2018,6 +2246,7 @@ def ui_api_discover_upcoming():
 @app.get("/ui/api/discover/on-the-air")
 def ui_api_discover_on_the_air():
     results = tmdb.on_the_air()
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -2038,8 +2267,71 @@ def ui_api_discover_by_provider():
     if not pid:
         return jsonify(error="provider_id required"), 400
     results = tmdb.discover_by_provider(media, pid, region=region, sort_by=sort)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
+
+
+@app.get("/ui/api/discover/by-genre")
+def ui_api_discover_by_genre():
+    media = request.args.get("type", "movie")
+    genre_id = int(request.args.get("genre_id") or "0")
+    if not genre_id:
+        return jsonify(error="genre_id required"), 400
+    year_from = request.args.get("year_from")
+    year_to = request.args.get("year_to")
+    results = tmdb.discover_by_genre(
+        media, genre_id,
+        year_from=int(year_from) if year_from else None,
+        year_to=int(year_to) if year_to else None,
+    )
+    results = _filter_by_language(results)
+    _enrich_library_status(results)
+    return jsonify(results=results)
+
+
+@app.get("/ui/api/discover/genre-tabs")
+def ui_api_discover_genre_tabs():
+    """Public: enabled genre-tab configs for the Discover page rows."""
+    import json
+    import settings as _s
+    raw = _s.get("DISCOVER_GENRE_TABS", "[]")
+    try:
+        tabs = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except (TypeError, ValueError):
+        tabs = []
+    return jsonify(tabs=[t for t in tabs if t.get("enabled")])
+
+
+@app.get("/ui/api/discover/genre-tabs/config")
+@auth.require_auth
+def ui_api_discover_genre_tabs_config_get():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import json
+    import settings as _s
+    raw = _s.get("DISCOVER_GENRE_TABS", "[]")
+    try:
+        tabs = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except (TypeError, ValueError):
+        tabs = []
+    return jsonify(tabs=tabs)
+
+
+@app.post("/ui/api/discover/genre-tabs/config")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_discover_genre_tabs_config_set():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import json
+    import settings as _s
+    p = request.get_json(silent=True) or {}
+    tabs = p.get("tabs")
+    if not isinstance(tabs, list):
+        return jsonify(error="tabs must be a list"), 400
+    _s.set("DISCOVER_GENRE_TABS", json.dumps(tabs))
+    return jsonify(ok=True)
 
 
 @app.get("/ui/api/discover/details")
@@ -2462,6 +2754,8 @@ def ui_api_session():
         "auto_approve": bool(rec.get("auto_approve")),
         "region": rec.get("region", "NL"),
         "library_click_jellyfin": bool(rec.get("library_click_jellyfin")),
+        "discover_language_include": rec.get("discover_language_include") or "",
+        "discover_language_exclude": rec.get("discover_language_exclude") or "",
     }
     user.update(plugin_loader.session_fields(rec))
     jellyfin_url = (_settings.get("JELLYFIN_URL") or cfg.JELLYFIN_URL or "").rstrip("/")
@@ -2579,12 +2873,98 @@ def ui_api_me_preferences():
     if not rec:
         return jsonify(error="not authenticated"), 401
     p = request.get_json(silent=True) or {}
-    _ALLOWED = {"library_click_jellyfin"}
-    fields = {k: (1 if v else 0) for k, v in p.items() if k in _ALLOWED}
+    _BOOL_FIELDS = {"library_click_jellyfin"}
+    _TEXT_FIELDS = {"discover_language_include", "discover_language_exclude"}
+    fields = {}
+    for k, v in p.items():
+        if k in _BOOL_FIELDS:
+            fields[k] = 1 if v else 0
+        elif k in _TEXT_FIELDS:
+            fields[k] = ",".join(l.strip().lower() for l in str(v or "").split(",") if l.strip())
     if not fields:
         return jsonify(error="no valid fields"), 400
     db.update_user(rec["id"], **fields)
     return jsonify(ok=True)
+
+
+## Trakt OAuth/sync/watched/scrobble routes live in plugins/trakt/routes.py
+## (a pre-existing plugin - see PLUGIN_META in plugins/trakt/__init__.py).
+
+
+@app.get("/ui/api/mdblist/status")
+@auth.require_auth
+def ui_api_mdblist_status():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    import mdblist
+    return jsonify(
+        connected=mdblist.is_configured(rec),
+        list_ids=rec.get("mdblist_list_ids") or "",
+    )
+
+
+@app.post("/ui/api/mdblist/connect")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_mdblist_connect():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    api_key = (p.get("api_key") or "").strip()
+    if not api_key:
+        return jsonify(error="api_key required"), 400
+    db.update_user(rec["id"], mdblist_api_key=api_key)
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/mdblist/disconnect")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_mdblist_disconnect():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    db.update_user(rec["id"], mdblist_api_key="", mdblist_list_ids="")
+    return jsonify(ok=True)
+
+
+@app.get("/ui/api/mdblist/lists")
+@auth.require_auth
+def ui_api_mdblist_lists():
+    rec = auth.current_user_record()
+    if not rec or not rec.get("mdblist_api_key"):
+        return jsonify(error="MDBList not connected"), 400
+    import mdblist
+    return jsonify(lists=mdblist.get_user_lists(rec["mdblist_api_key"]))
+
+
+@app.post("/ui/api/mdblist/lists")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_mdblist_set_lists():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    list_ids = p.get("list_ids")
+    if not isinstance(list_ids, list):
+        return jsonify(error="list_ids must be a list"), 400
+    db.update_user(rec["id"], mdblist_list_ids=",".join(str(i) for i in list_ids))
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/mdblist/sync")
+@_csrf.exempt
+@auth.require_auth
+def ui_api_mdblist_sync():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    import mdblist
+    added = mdblist.sync_auto_request(rec)
+    return jsonify(ok=True, added=added)
 
 
 # Cache Jellyfin item IDs: imdb_id -> jellyfin_item_id (or None if not found).

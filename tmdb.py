@@ -2,36 +2,41 @@ import logging
 
 import requests as req_lib
 
-from config import TMDB_API_KEY
+import settings as _settings
+from config import TMDB_API_KEY as _TMDB_API_KEY_DEFAULT
 
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.themoviedb.org/3"
 
 
+def _api_key() -> str:
+    return _settings.get("TMDB_API_KEY", _TMDB_API_KEY_DEFAULT)
+
+
 def _is_v4_token() -> bool:
     # TMDB v4 read-access-tokens are JWTs ("eyJ..."); v3 API keys are 32-char hex.
     # tmdb.py historically only sent the v4 Bearer header, which 401s when the
-    # configured key is a v3 key — silently breaking number_of_seasons lookups
+    # configured key is a v3 key, silently breaking number_of_seasons lookups
     # (and thus all-seasons expansion). Detect and auth accordingly.
-    return bool(TMDB_API_KEY) and TMDB_API_KEY.startswith("eyJ")
+    return _api_key().startswith("eyJ")
 
 
 def _headers() -> dict:
     h = {"Accept": "application/json"}
     if _is_v4_token():
-        h["Authorization"] = f"Bearer {TMDB_API_KEY}"
+        h["Authorization"] = f"Bearer {_api_key()}"
     return h
 
 
 def _get(path: str, params: dict | None = None, timeout: int = 10) -> dict | None:
-    if not TMDB_API_KEY:
+    if not _api_key():
         log.warning("TMDB_API_KEY not set; skipping %s", path)
         return None
     try:
         p = dict(params or {})
         if not _is_v4_token():
-            p["api_key"] = TMDB_API_KEY  # v3 auth via query param
+            p["api_key"] = _api_key()  # v3 auth via query param
         resp = req_lib.get(f"{_BASE}{path}", headers=_headers(), params=p, timeout=timeout)
         resp.raise_for_status()
         return resp.json() or {}
@@ -69,6 +74,52 @@ def find_by_imdb(imdb_id: str, kind: str = "tv") -> int | None:
 def get_show_info(tmdb_id: int) -> dict | None:
     """Return top-level show info including number_of_seasons."""
     return _get(f"/tv/{tmdb_id}")
+
+
+def release_date(imdb_id: str | None = None, tmdb_id: int | None = None,
+                  media_type: str = "movie") -> str | None:
+    """Return the YYYY-MM-DD theatrical/first-air date for a title, or None if
+    unknown. Prefers a direct tmdb_id lookup; falls back to /find by imdb_id."""
+    if media_type == "movie":
+        if tmdb_id:
+            data = _get(f"/movie/{tmdb_id}")
+            if data:
+                return data.get("release_date") or None
+        if imdb_id:
+            data = _get(f"/find/{imdb_id}", params={"external_source": "imdb_id"})
+            results = (data or {}).get("movie_results") or []
+            if results:
+                return results[0].get("release_date") or None
+    else:
+        if tmdb_id:
+            data = _get(f"/tv/{tmdb_id}")
+            if data:
+                return data.get("first_air_date") or None
+        if imdb_id:
+            data = _get(f"/find/{imdb_id}", params={"external_source": "imdb_id"})
+            results = (data or {}).get("tv_results") or []
+            if results:
+                return results[0].get("first_air_date") or None
+    return None
+
+
+def display_title(imdb_id: str, media_type: str = "movie") -> str | None:
+    """Return 'Title (Year)' resolved from an IMDb id via /find, or None if
+    TMDB has no metadata for it. Used to keep raw 'tt...' ids out of
+    user-facing text (notifications, DB rows, admin UI) when a webhook or
+    manual request doesn't supply a real title."""
+    key = "movie_results" if media_type == "movie" else "tv_results"
+    data = _get(f"/find/{imdb_id}", params={"external_source": "imdb_id"})
+    results = (data or {}).get(key) or []
+    if not results:
+        return None
+    item = results[0]
+    title = item.get("title") or item.get("name")
+    if not title:
+        return None
+    date_value = item.get("release_date") or item.get("first_air_date") or ""
+    year = date_value[:4] if date_value else None
+    return f"{title} ({year})" if year else title
 
 
 def get_season_episodes(tmdb_id: int, season: int) -> list[dict]:
@@ -207,6 +258,7 @@ def _norm_item(item: dict, media_type: str | None = None) -> dict:
         "title": item.get("title") or item.get("name") or "",
         "original_title": item.get("original_title") or item.get("original_name") or "",
         "year": ((item.get("release_date") or item.get("first_air_date") or "")[:4]) or None,
+        "release_date": item.get("release_date") or item.get("first_air_date") or "",
         "rating": round(float(item.get("vote_average") or 0), 1),
         "votes": item.get("vote_count") or 0,
         "popularity": item.get("popularity") or 0,
@@ -214,6 +266,7 @@ def _norm_item(item: dict, media_type: str | None = None) -> dict:
         "poster_path": item.get("poster_path"),
         "backdrop_path": item.get("backdrop_path"),
         "genre_ids": item.get("genre_ids") or [],
+        "original_language": item.get("original_language") or "",
     }
 
 
@@ -302,6 +355,33 @@ def discover_by_provider(media_type: str, provider_id: int, region: str = "NL",
     return [_norm_item(i, media_type=media_type) for i in (data.get("results") or [])]
 
 
+def discover_by_genre(media_type: str, genre_id: int, year_from: int | None = None,
+                       year_to: int | None = None, page: int = 1,
+                       sort_by: str = "popularity.desc") -> list[dict]:
+    """Discover content in a genre, optionally bounded by release/air year."""
+    date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
+    params: dict = {
+        "with_genres": genre_id,
+        "sort_by": sort_by,
+        "page": page,
+        "include_adult": "false",
+    }
+    if year_from:
+        params[f"{date_field}.gte"] = f"{year_from}-01-01"
+    if year_to:
+        params[f"{date_field}.lte"] = f"{year_to}-12-31"
+    data = _get(f"/discover/{media_type}", params=params)
+    if not data:
+        return []
+    return [_norm_item(i, media_type=media_type) for i in (data.get("results") or [])]
+
+
+def list_genres(media_type: str = "movie") -> list[dict]:
+    """Return TMDB's genre list for movies or tv: [{"id", "name"}, ...]."""
+    data = _get(f"/genre/{media_type}/list")
+    return (data or {}).get("genres") or []
+
+
 def list_providers(media_type: str = "movie", region: str = "NL") -> list[dict]:
     """List streaming providers available in a region."""
     data = _get(f"/watch/providers/{media_type}", params={"watch_region": region})
@@ -363,7 +443,7 @@ def details(media_type: str, tmdb_id: int, region: str = "NL") -> dict | None:
         item["number_of_seasons"] = data.get("number_of_seasons")
         item["number_of_episodes"] = data.get("number_of_episodes")
     cast = ((data.get("credits") or {}).get("cast") or [])[:12]
-    item["cast"] = [{"name": c.get("name"), "character": c.get("character"),
+    item["cast"] = [{"id": c.get("id"), "name": c.get("name"), "character": c.get("character"),
                      "profile_path": c.get("profile_path")} for c in cast]
     videos = ((data.get("videos") or {}).get("results") or [])
     item["trailers"] = [{"key": v.get("key"), "name": v.get("name"), "site": v.get("site")}
@@ -378,6 +458,38 @@ def details(media_type: str, tmdb_id: int, region: str = "NL") -> dict | None:
     item["recommendations"] = [_norm_item(r, media_type=media_type)
                                 for r in (data.get("recommendations") or {}).get("results", [])[:12]]
     return item
+
+
+def person_details(person_id: int) -> dict | None:
+    """Return a person's bio + filmography (movies and TV combined, sorted by
+    popularity), normalized for the actor detail view."""
+    data = _get(f"/person/{person_id}", params={"append_to_response": "combined_credits"})
+    if not data:
+        return None
+    credits = (data.get("combined_credits") or {}).get("cast") or []
+    seen: set[tuple[str, int]] = set()
+    filmography = []
+    for c in credits:
+        media_type = c.get("media_type")
+        if media_type not in ("movie", "tv"):
+            continue
+        key = (media_type, c.get("id"))
+        if key in seen or not c.get("id"):
+            continue
+        seen.add(key)
+        item = _norm_item(c, media_type="movie" if media_type == "movie" else "tv")
+        item["character"] = c.get("character") or ""
+        filmography.append(item)
+    filmography.sort(key=lambda x: x.get("popularity") or 0, reverse=True)
+    return {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "biography": data.get("biography") or "",
+        "profile_path": data.get("profile_path"),
+        "birthday": data.get("birthday"),
+        "place_of_birth": data.get("place_of_birth"),
+        "filmography": filmography[:40],
+    }
 
 
 # Common Dutch / European providers  -  IDs from TMDB

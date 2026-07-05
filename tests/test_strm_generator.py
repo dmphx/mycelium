@@ -72,6 +72,95 @@ class TestStrmPath:
         assert "S01E10" in str(p)
 
 
+class TestScanTorboxLibrary:
+    """scan_torbox_library() backfills .strm files for torrents TorBox already
+    has cached that we have no virtual_item record of (e.g. after a DB reset)."""
+
+    def test_imports_unknown_ready_torrent_with_tmdb_title(self, tmp_path, monkeypatch):
+        import tmdb as real_tmdb
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)  # CATBOX_MODE off
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        monkeypatch.setattr(sg.db, "get_virtual_item_by_hash", lambda info_hash: None)
+        monkeypatch.setattr(real_tmdb, "search_movie", lambda title, year=None: "tt0110912")
+        monkeypatch.setattr(real_tmdb, "display_title", lambda imdb_id, media_type: "Pulp Fiction (1994)")
+
+        item = {
+            "id": 1, "name": "Pulp.Fiction.1994.1080p.WEB-DL", "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Pulp.Fiction.1994.1080p.WEB-DL.mkv"}],
+        }
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: True
+        sg.torbox_mod.find_by_id = lambda torrent_id: item
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 1, "imported": 1, "skipped": 0, "failed": 0}
+        path = Path(tmp_path) / "movies" / "Pulp Fiction (1994)" / "Pulp Fiction (1994).strm"
+        assert path.exists()
+
+    def test_skips_torrent_already_known(self, monkeypatch):
+        monkeypatch.setattr(sg.db, "get_virtual_item_by_hash", lambda info_hash: {"token": "existing"})
+        item = {"id": 2, "name": "Known.Movie.2020", "hash": "b" * 40, "files": []}
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: True
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 1, "imported": 0, "skipped": 1, "failed": 0}
+
+    def test_skips_not_ready_torrents(self, monkeypatch):
+        item = {"id": 3, "name": "Still.Downloading.2020", "hash": "c" * 40, "files": []}
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: False
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 0, "imported": 0, "skipped": 0, "failed": 0}
+
+
+class TestProcessTorrentCanonicalTitle:
+    """A canonical_title/imdb_id lets a fresh torrent add land in the same
+    series folder every time instead of re-deriving a (possibly different)
+    folder name from each torrent's own raw release name  -  the cause of a
+    show ending up split across several duplicate library entries."""
+
+    def test_uses_canonical_title_and_writes_tvshow_nfo(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.torbox_mod, "_is_ready", lambda item: True)
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)  # CATBOX_MODE off
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        item = {
+            "id": 1,
+            "name": "Full.House.S02.1080p.WEB-DL",
+            "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Full.House.S02E01.mkv"}],
+        }
+        written = sg.process_torrent(item, canonical_title="Full House", imdb_id="tt0092359")
+        assert written == 1
+        folder = Path(tmp_path) / "series" / "Full House"
+        assert (folder / "Season 02" / "Full House S02E01.strm").exists()
+        nfo = folder / "tvshow.nfo"
+        assert nfo.exists()
+        assert "tt0092359" in nfo.read_text()
+
+    def test_two_differently_named_torrents_land_in_same_folder(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.torbox_mod, "_is_ready", lambda item: True)
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        item1 = {
+            "id": 1, "name": "Full.House.S01.1080p.WEB-DL", "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Full.House.S01E01.mkv"}],
+        }
+        item2 = {
+            "id": 2, "name": "[SITE] FULL HOUSE S02 COMPLETE", "hash": "b" * 40,
+            "files": [{"id": 2, "name": "Full House S02E01.mkv"}],
+        }
+        sg.process_torrent(item1, canonical_title="Full House", imdb_id="tt0092359")
+        sg.process_torrent(item2, canonical_title="Full House", imdb_id="tt0092359")
+        series_dir = Path(tmp_path) / "series"
+        show_folders = [p for p in series_dir.iterdir() if p.is_dir()]
+        assert [p.name for p in show_folders] == ["Full House"]
+
+
 class TestNormTitle:
     def test_strips_year(self):
         assert sg._norm_title("The Dark Knight (2008)") == sg._norm_title("dark knight (2008)")

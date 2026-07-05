@@ -655,22 +655,6 @@
       </div>
     </form>
 
-    <div class="card" style="margin-top:20px">
-      <div class="card-title">Radarr / Sonarr bulk import</div>
-      <p class="dim" style="font-size:12px;margin-bottom:10px">
-        Configure RADARR_URL/SONARR_URL + API keys above, save, then click test → import.
-        Import skips items already in your Mycelium library and runs in the background.
-      </p>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-        <button type="button" class="btn btn-secondary btn-sm" onclick="arrTest('radarr')">Test Radarr</button>
-        <button type="button" class="btn btn-primary btn-sm" onclick="arrRun('radarr')">▶ Import Radarr</button>
-        <button type="button" class="btn btn-secondary btn-sm" onclick="arrTest('sonarr')">Test Sonarr</button>
-        <button type="button" class="btn btn-primary btn-sm" onclick="arrRun('sonarr')">▶ Import Sonarr</button>
-        <button type="button" class="btn btn-secondary btn-sm" onclick="arrStatus()">↻ Status</button>
-      </div>
-      <div id="arr-status" class="dim" style="font-size:12px;font-family:monospace"></div>
-    </div>
-
     <div class="card" style="margin-top:16px">
       <div class="card-title">Auto-add now</div>
       <p class="dim" style="font-size:12px;margin-bottom:10px">
@@ -1239,6 +1223,10 @@
                      </label>`;
           } else if (it.kind === 'int') {
             input = `<input type="number" name="setting_${it.key}" value="${val}" style="width:140px">`;
+          } else if (it.kind === 'enum') {
+            const opts = (it.options || []).map(o =>
+              `<option value="${o}" ${o === val ? 'selected' : ''}>${o}</option>`).join('');
+            input = `<select name="setting_${it.key}" style="width:200px">${opts}</select>`;
           } else if (it.kind === 'list') {
             input = `<input type="text" name="setting_${it.key}" value="${val}" placeholder="comma,separated" style="width:280px">`;
           } else {
@@ -1261,6 +1249,54 @@
         body += '</table>';
         card.innerHTML = body;
         root.appendChild(card);
+
+        // Action buttons that belong to this specific settings group  -  shown
+        // right below the fields they act on instead of scattered elsewhere.
+        if (g.id === 'arr_import') {
+          const actions = document.createElement('div');
+          actions.className = 'card';
+          actions.style.cssText = 'margin-bottom:12px;margin-top:-4px';
+          actions.innerHTML = `
+            <p class="dim" style="font-size:12px;margin-bottom:10px">
+              Save the fields above first, then test → import. Import skips items already in your Mycelium library and runs in the background.
+            </p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="arrTest('radarr')">Test Radarr</button>
+              <button type="button" class="btn btn-primary btn-sm" onclick="arrRun('radarr')">▶ Import Radarr</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="arrTest('sonarr')">Test Sonarr</button>
+              <button type="button" class="btn btn-primary btn-sm" onclick="arrRun('sonarr')">▶ Import Sonarr</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="arrStatus()">↻ Status</button>
+            </div>
+            <div id="arr-status" class="dim" style="font-size:12px;font-family:monospace"></div>
+          `;
+          root.appendChild(actions);
+        }
+        if (g.id === 'zilean_native') {
+          const actions = document.createElement('div');
+          actions.className = 'card';
+          actions.style.cssText = 'margin-bottom:12px;margin-top:-4px';
+          actions.innerHTML = `
+            <p class="dim" style="font-size:12px;margin-bottom:10px">
+              Set ZILEAN_MODE above to <code>native</code> and save first. Sync downloads the
+              community hashlist snapshot (may take a while the first time). If you already run
+              an external Zilean + Postgres and don't want to re-scrape, fill in the Postgres
+              connection fields above and use Import instead.
+              <br><b style="color:var(--amber)">Import needs Postgres reachable from this Mycelium
+              container.</b> Most Zilean docker-compose setups only expose Postgres internally  -
+              add a <code>ports:</code> entry to the <code>postgres</code> service in your Zilean
+              compose file (e.g. <code>"&lt;this-host-ip&gt;:5433:5432"</code>), restart it, then
+              point ZILEAN_PG_HOST/PORT at that address. If Import fails, click Status again  -
+              the exact error is shown below the buttons.
+            </p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+              <button type="button" class="btn btn-primary btn-sm" onclick="zileanSync()">▶ Sync now</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="zileanImport()">⬇ Import from Postgres</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="zileanStatus()">↻ Status</button>
+            </div>
+            <div id="zilean-status" class="dim" style="font-size:12px;font-family:monospace"></div>
+          `;
+          root.appendChild(actions);
+        }
       });
       // Live banner: show when a restart-required field changes from initial
       const form = document.getElementById('settings-form');
@@ -2119,6 +2155,47 @@
     const r = await fetch('/ui/api/auto-add-now', { method: 'POST' });
     const j = await r.json();
     alert(j.message || j.error || 'OK');
+  }
+
+  // ── Zilean native index helpers ───────────────────────────────────────
+  async function zileanSync() {
+    if (!confirm('Start a Zilean native hashlist sync? The first run can take a while.')) return;
+    const r = await fetch('/ui/api/zilean/sync', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})
+    });
+    const j = await r.json();
+    if (j.error) { alert(j.error); return; }
+    document.getElementById('zilean-status').textContent = 'Sync started…';
+    setTimeout(zileanStatus, 2000);
+  }
+  async function zileanImport() {
+    if (!confirm('Import from the external Zilean Postgres database configured above? This can take a while for 1M+ rows.')) return;
+    const r = await fetch('/ui/api/zilean/import', { method: 'POST' });
+    const j = await r.json();
+    if (j.error) { alert(j.error); return; }
+    document.getElementById('zilean-status').textContent = 'Import started…';
+    setTimeout(zileanStatus, 2000);
+  }
+  async function zileanStatus() {
+    const r = await fetch('/ui/api/zilean/status');
+    const j = await r.json();
+    if (j.mode !== 'native') {
+      document.getElementById('zilean-status').textContent = `mode: ${j.mode} (native index inactive)`;
+      return;
+    }
+    const s = `${j.total_hashes} hash(es) · last sync: ${j.last_synced_at || 'never'} (${j.last_status}, +${j.last_new_hashes})` +
+      (j.last_import_at ? ` · last import: ${j.last_import_at} (${j.last_import_count} rows)` : '') +
+      (j.syncing ? ' · syncing…' : '') + (j.importing ? ' · importing…' : '');
+    const el = document.getElementById('zilean-status');
+    el.textContent = s;
+    const err = j.last_import_error || j.last_error;
+    if (err && !j.syncing && !j.importing) {
+      const errLine = document.createElement('div');
+      errLine.style.cssText = 'color:var(--red);margin-top:4px';
+      errLine.textContent = `✗ ${err}`;
+      el.appendChild(errLine);
+    }
+    if (j.syncing || j.importing) setTimeout(zileanStatus, 3000);
   }
 </script>
 </body>

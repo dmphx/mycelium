@@ -1,5 +1,6 @@
 import pytest
 
+import webhook_parser
 from webhook_parser import IgnoreEvent, WebhookError, parse
 
 
@@ -53,3 +54,28 @@ def test_series_defaults_to_season_1():
     }
     req = parse(payload)
     assert req.seasons == [1]
+
+
+def test_parse_resolves_raw_imdb_subject_to_display_title(monkeypatch):
+    monkeypatch.setattr(webhook_parser.tmdb, "display_title",
+                         lambda imdb_id, media_type: "Dune: Part Two (2024)")
+    payload = {
+        "notification_type": "MEDIA_AUTO_APPROVED",
+        "subject": "tt15239678",
+        "media": {"media_type": "movie", "imdbId": "tt15239678"},
+    }
+    req = parse(payload)
+    assert req.title == "Dune: Part Two (2024)"
+
+
+def test_parse_keeps_real_title_without_tmdb_lookup(monkeypatch):
+    def _fail(*args, **kwargs):
+        raise AssertionError("display_title should not be called when a real title is present")
+    monkeypatch.setattr(webhook_parser.tmdb, "display_title", _fail)
+    payload = {
+        "notification_type": "MEDIA_AUTO_APPROVED",
+        "subject": "Dune (2024)",
+        "media": {"media_type": "movie", "imdbId": "tt15239678"},
+    }
+    req = parse(payload)
+    assert req.title == "Dune (2024)"

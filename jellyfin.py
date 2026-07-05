@@ -61,7 +61,12 @@ def _refresh_worker() -> None:
             time.sleep(debounce)
         _refresh_event.clear()
         try:
-            _do_refresh()
+            # Skip if Jellyfin is already mid-scan (upstream guard): firing now
+            # would just cancel and restart its in-progress scan.
+            if is_scanning():
+                log.debug("Jellyfin refresh worker: scan already running, skipping")
+            else:
+                _do_refresh()
         except Exception as exc:  # never let the worker thread die
             log.error("Jellyfin refresh worker error: %s", exc)
         # Cooldown: cap scan frequency so overlapping full scans can't pile up.
@@ -101,6 +106,22 @@ def _jf_headers() -> dict:
     if JELLYFIN_API_KEY:
         h["X-Emby-Token"] = JELLYFIN_API_KEY
     return h
+
+
+def is_scanning(timeout: int = 10) -> bool:
+    """True if Jellyfin is currently running a library scan task."""
+    JELLYFIN_URL = settings.get("JELLYFIN_URL")
+    if not JELLYFIN_URL:
+        return False
+    try:
+        resp = requests.get(f"{JELLYFIN_URL.rstrip('/')}/ScheduledTasks",
+                            headers=_jf_headers(), timeout=timeout)
+        resp.raise_for_status()
+        tasks = resp.json()
+    except Exception as exc:
+        log.debug("Jellyfin is_scanning check failed: %s", exc)
+        return False
+    return any(t.get("Category") == "Library" and t.get("State") == "Running" for t in tasks)
 
 
 def merge_duplicate_versions(timeout: int = 60) -> bool:
