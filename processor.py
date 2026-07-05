@@ -417,7 +417,21 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
         pack = packs[0]
         ep_count = _get_season_episode_count(req.imdb_id, season)
         if ep_count == 0:
-            ep_count = 24  # safe upper bound when TMDB unavailable
+            # TMDB couldn't tell us how many episodes this season has (missing or
+            # invalid key, rate-limit, transient error, or no imdb->tmdb match).
+            # Do NOT blind-register a fixed 1..24 here: that invents phantom
+            # episodes past the real count (an 8-episode season written as
+            # E01..E24), which then fail to materialise ("no confident file
+            # match") and crash the Plex transcoder. Defer instead  -  mark the
+            # season wanted so it retries and registers with the real count once
+            # TMDB resolves (monitor also re-derives episodes from TMDB). Better
+            # an empty season briefly than a run of phantom episodes.
+            reason = "TMDB episode count unavailable  -  deferring season pack (will retry)"
+            log.warning("Lazy: TMDB episode count unavailable for %s S%02d  -  "
+                        "deferring instead of blind-registering 1..24", req.title, season)
+            _LAST_FAIL_REASON[req.imdb_id] = reason
+            _WANTED[req.imdb_id] = reason
+            return False, None
         log.info("Lazy: cached season pack for %s S%02d (%d ep), registering %d episode(s)",
                  req.title, season, ep_count, ep_count)
         written = 0
