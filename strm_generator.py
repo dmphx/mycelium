@@ -887,10 +887,16 @@ def _preferred_audio_index(audio_streams: list[dict]) -> int:
 
 
 def update_minfo_preferred_audio(token: str, audio_index: int) -> None:
-    """Add or update preferred_audio=N in the .minfo sidecar for token.
+    """Deprecated: strip any stale preferred_audio= line from the .minfo.
 
-    The Plex transcoder wrapper reads this to remap '-map 0:a:0' to the
-    specified stream index, skipping a corrupt primary TrueHD track.
+    The old '-map 0:a:0' wrapper remap this drove is incompatible with Plex's
+    EAE-only EAC3 decoder: it injected a non-existent plain 'eac3' decoder with
+    no -eae_prefix, which kills the transcode ("Conversion failed"). Audio
+    preference is now expressed by marking the preferred track as the MKV
+    default in the stub itself (make_stub_mkv default_audio_idx), which Plex
+    honours natively and which also lets the viewer switch tracks. This helper
+    now only removes any leftover preferred_audio= line so the dead remap path
+    can never fire. audio_index is kept for call-site compatibility.
     """
     item = db.get_virtual_item(token)
     if not item or not item.get("strm_path"):
@@ -901,11 +907,10 @@ def update_minfo_preferred_audio(token: str, audio_index: int) -> None:
         return
     try:
         lines = minfo_path.read_text(encoding="utf-8").splitlines()
-        lines = [l for l in lines if not l.startswith("preferred_audio=")]
-        if audio_index > 0:
-            lines.append(f"preferred_audio={audio_index}")
-        atomic_write_text(minfo_path, "\n".join(lines) + "\n")
-        log.info("Spore: preferred_audio=%d saved to .minfo for token=%s", audio_index, token)
+        new_lines = [l for l in lines if not l.startswith("preferred_audio=")]
+        if new_lines != lines:
+            atomic_write_text(minfo_path, "\n".join(new_lines) + "\n")
+            log.info("Spore: stripped deprecated preferred_audio from .minfo for token=%s", token)
     except Exception as exc:
         log.warning("Spore: could not update .minfo for token=%s: %s", token, exc)
 
@@ -1353,10 +1358,14 @@ def make_stub_mkv(title: str, quality: str | None = None,
                    codec_id: str | None = None,
                    audio_tracks: list[dict] | None = None,
                    subtitle_tracks: list[dict] | None = None,
-                   video_codec_private: bytes | None = None) -> bytes:
+                   video_codec_private: bytes | None = None,
+                   default_audio_idx: int = 0) -> bytes:
     """Generate a minimal valid MKV file for Plex scanning.
 
     audio_tracks: list of dicts with keys codec, language, channels, sample_rate.
+    Written in CDN file order (so Plex -map 0:N references forward correctly);
+    default_audio_idx marks which of them carries the MKV default flag, so Plex
+    auto-selects e.g. the English track without reordering the streams.
     subtitle_tracks: list of dicts with keys codec, language.
     When audio_tracks is None, a PCM 16ch placeholder is used so Plex
     always invokes the transcoder (never direct-plays the stub).
@@ -1452,7 +1461,7 @@ def make_stub_mkv(title: str, quality: str | None = None,
                 lang=(at.get("language") or "und")[:3],
                 channels=int(at.get("channels") or 2),
                 sample_rate=float(at.get("sample_rate") or 48000),
-                is_default=(i == 0),
+                is_default=(i == default_audio_idx),
             )
             next_num += 1
     else:
@@ -1858,6 +1867,12 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
         for s in audio_streams
     ] or None
 
+    # Mark the preferred (English when present) audio track as the MKV default
+    # so Plex auto-selects it. Streams stay in CDN order so the wrapper's
+    # -map 0:N forwarding to the real file stays correct; only the default flag
+    # moves. Viewers can still switch to any other track in the Plex UI.
+    default_idx = _preferred_audio_index(audio_streams) if audio_streams else 0
+
     subtitle_tracks = [
         {
             "codec":    s.get("codec_name", "subrip"),
@@ -1920,6 +1935,7 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
             audio_tracks=audio_tracks,
             subtitle_tracks=subtitle_tracks or None,
             video_codec_private=v_priv,
+            default_audio_idx=default_idx,
         )
         atomic_write_bytes(mkv_path, stub)
         log.info(
