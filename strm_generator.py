@@ -849,18 +849,39 @@ _SAFE_AUDIO_CODECS = frozenset({
 def _preferred_audio_index(audio_streams: list[dict]) -> int:
     """Return 0-based audio stream index to prefer for FFmpeg -map 0:a:N.
 
-    If the first audio track is TrueHD/MLP and a decode-safe fallback exists
-    (EAC3, AC3, AAC, ...), return the fallback's index. Otherwise return 0.
+    Selection priority:
+    1. Prefer an English-language track when one exists. Many foreign scene
+       releases put a non-English dub first while the stub still advertises
+       a single "English" track, so the default 0:a:0 plays the wrong
+       language and the viewer cannot switch (only one track is exposed).
+    2. Among English tracks, avoid TrueHD/MLP when a decode-safe English
+       track is present.
+    3. With no English track, keep the original behaviour: if the first
+       track is TrueHD/MLP and a decode-safe fallback exists, return that
+       fallback, else return 0.
+
     TrueHD decode often fails mid-stream on CDN files due to missing major-sync
     frames after seeks, causing HLS transcoding (Android/Shield) to stall.
     """
     if not audio_streams:
         return 0
-    first_codec = (audio_streams[0].get("codec_name") or "").lower()
+
+    def _lang(s: dict) -> str:
+        return ((s.get("tags") or {}).get("language") or "").lower()
+
+    def _codec(s: dict) -> str:
+        return (s.get("codec_name") or "").lower()
+
+    eng = [i for i, s in enumerate(audio_streams) if _lang(s).startswith("eng")]
+    if eng:
+        safe_eng = [i for i in eng if _codec(audio_streams[i]) not in _TRUEHD_CODECS]
+        return safe_eng[0] if safe_eng else eng[0]
+
+    first_codec = _codec(audio_streams[0])
     if first_codec not in _TRUEHD_CODECS:
         return 0
     for i, s in enumerate(audio_streams[1:], 1):
-        if (s.get("codec_name") or "").lower() in _SAFE_AUDIO_CODECS:
+        if _codec(s) in _SAFE_AUDIO_CODECS:
             return i
     return 0
 
