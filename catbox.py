@@ -334,7 +334,7 @@ def _materialize_usenet(token: str, item: dict) -> str | None:
             return None
 
     file_id = _pick_usenet_file_id(live, item)
-    if not file_id:
+    if file_id is None:
         log.warning("Catbox/usenet: no video file in TorBox usenet id=%s", usenet_id)
         _fail_put(token, _FAIL_COOLDOWN_SEC)
         return None

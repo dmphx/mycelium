@@ -636,6 +636,39 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
     return ""
 
 
+_PLACEHOLDER_TITLE_RE = re.compile(r"^(tt\d{6,10}|tmdb[:_\- ]?\d+)$", re.IGNORECASE)
+
+
+def _looks_like_placeholder_title(title: str | None) -> bool:
+    """True when the title is not a real show name but an id placeholder
+    (a raw IMDB id like 'tt10231312', or 'tmdb:97727'), or empty. These leak in
+    from request paths that never resolved the human title (webhook without a
+    subject, /ui/submit passing the imdb id, retry-queue replays, etc.)."""
+    if not title or not title.strip():
+        return True
+    return bool(_PLACEHOLDER_TITLE_RE.match(title.strip()))
+
+
+def _canonical_series_folder(imdb_id: str | None,
+                              fallback_title: str | None = None) -> str:
+    """Return the canonical show-folder name from TMDB for this imdb_id (TV).
+
+    Mirrors _canonical_movie_folder so series get a real, matchable folder name
+    instead of an id placeholder. Falls back to fallback_title if the TMDB
+    lookup fails or imdb_id is missing."""
+    if imdb_id:
+        try:
+            import tmdb as _tmdb
+            results = _tmdb._get(f"/find/{imdb_id}",
+                                 params={"external_source": "imdb_id"}) or {}
+            hits = results.get("tv_results") or []
+            if hits and hits[0].get("name"):
+                return _safe(hits[0]["name"])
+        except Exception as exc:
+            log.debug("_canonical_series_folder TMDB lookup failed for %s: %s", imdb_id, exc)
+    return _safe(fallback_title) if fallback_title else ""
+
+
 def fix_imdb_titles() -> dict:
     """Find requests whose title is still a raw IMDB code (e.g. tt0096697), fetch the
     real title from TMDB, rename the folder on disk, and update the DB + strm paths."""
@@ -1118,6 +1151,14 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     Atomically writes tvshow.nfo and series poster/fanart on first episode.
     Returns True if a new .strm was written."""
     import catbox
+    # Resolve a real show name when the caller passed an id placeholder
+    # (raw imdb id, "tmdb:NNN", empty). Otherwise the folder/NFO get named after
+    # the placeholder and Plex stores the show as an unmatched "TmdbNNNNN".
+    # Movies already do this via _canonical_movie_folder.
+    if _looks_like_placeholder_title(title):
+        resolved = _canonical_series_folder(imdb_id, fallback_title=title)
+        if resolved:
+            title = resolved
     safe_title = _safe(title)
     if not safe_title:
         return False

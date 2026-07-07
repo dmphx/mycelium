@@ -131,15 +131,19 @@ def add_magnet(magnet: str, timeout: int = 30, reason: str = "unknown") -> dict:
 
 def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
             reason: str = "unknown") -> dict:
-    """POST /usenet/createusenetdownload with link=<nzb-url>.
+    """POST /usenet/createusenetdownload, uploading the NZB file content.
 
     TorBox usenet API mirrors createtorrent: same 60/hour + 10/minute rate
     limits, returns the same payload shape. We reuse the createtorrent
     counter because TorBox enforces these limits jointly on the account.
-    The `link` field accepts any HTTP(S) URL that returns NZB XML; Prowlarr
-    indexer download URLs work directly.
+
+    We fetch the NZB from `nzb_url` ourselves and upload it as a multipart
+    file. Passing `link=<nzb_url>` does NOT work when the indexer URL is
+    internal (e.g. http://prowlarr:9696/...) because TorBox's cloud cannot
+    reach it (it 500s). The link form is kept only as a fallback for when the
+    NZB cannot be fetched locally.
     """
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/createusenetdownload"
+    url = f"{_base_url().rstrip('/')}/usenet/createusenetdownload"
     usage_hour = createtorrent_usage(window_sec=3600)
     usage_min  = createtorrent_usage(window_sec=60)
     if usage_hour["count"] >= _CREATETORRENT_LIMIT_HOUR - 2:
@@ -154,10 +158,28 @@ def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
     _record_createtorrent(reason)
     log.info("createusenetdownload [%s] (%d/60h, %d/10m): %s",
              reason, usage_hour["count"] + 1, usage_min["count"] + 1, nzb_url[:80])
-    data = {"link": nzb_url}
-    if name:
-        data["name"] = name
-    resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
+    # Prefer uploading the NZB *content* over passing a link. Indexer download
+    # URLs are frequently internal (e.g. http://prowlarr:9696/...) and therefore
+    # unreachable from TorBox's cloud, which makes the link-based add fail with a
+    # 500. We are on the same network as the indexer, so fetch the NZB ourselves
+    # and upload the file; fall back to the link only if the fetch fails.
+    data = {"name": name} if name else {}
+    nzb_bytes = None
+    try:
+        nzb_resp = requests.get(nzb_url, timeout=timeout)
+        nzb_resp.raise_for_status()
+        nzb_bytes = nzb_resp.content or None
+    except requests.RequestException as exc:
+        log.warning("createusenetdownload [%s] could not fetch NZB (%s)  -  falling back to link",
+                    reason, exc)
+    if nzb_bytes:
+        fname = (name or "download").replace("/", "_")[:80] + ".nzb"
+        resp = requests.post(url, headers=_headers(),
+                             files={"file": (fname, nzb_bytes, "application/x-nzb")},
+                             data=data, timeout=timeout)
+    else:
+        data["link"] = nzb_url
+        resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
     if resp.status_code == 429:
         retry_after = int(resp.headers.get("Retry-After", 60))
         log.warning("createusenetdownload [%s] got 429 from TorBox (Retry-After=%ds)",
@@ -284,7 +306,7 @@ def list_usenet(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
         cached = _usenet_cache["items"]
         if cached is not None and (_t.monotonic() - _usenet_cache["ts"]) < _USENET_MYLIST_TTL_SECONDS:
             return cached
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/mylist"
+    url = f"{_base_url().rstrip('/')}/usenet/mylist"
     all_items: list[dict] = []
     seen_ids: set[int] = set()
     offset = 0
@@ -324,7 +346,7 @@ def invalidate_usenet_mylist_cache() -> None:
 
 
 def find_usenet_by_id(usenet_id: int, timeout: int = 15) -> dict | None:
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/usenet/mylist"
+    url = f"{_base_url().rstrip('/')}/usenet/mylist"
     try:
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"id": usenet_id})
@@ -472,9 +494,16 @@ def title_exists(title: str) -> bool:
 
 
 def _is_ready(item: dict) -> bool:
+    state = (item.get("download_state") or "").lower()
+    # A torrent TorBox has purged (expired) or lost (reported missing) still
+    # reports download_finished=True, but its files are gone so requestdl returns
+    # HTTP 500. Treat these terminal-dead states as not ready BEFORE the
+    # download_finished short-circuit: the probe then skips the item instead of
+    # poisoning the whole pass, and a live play re-adds it via catbox.
+    if state in ("expired", "reported missing"):
+        return False
     if item.get("download_finished"):
         return True
-    state = (item.get("download_state") or "").lower()
     return state in ("cached", "completed", "uploading", "metadl_done")
 
 
