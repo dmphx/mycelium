@@ -69,6 +69,16 @@ for a in "$@"; do
             spore_minfo="$_strm_tmp_minfo"
             echo "$(date '+%H:%M:%S') WRAP stream URL: token=$tok minfo fetched" >> "$SPORE_LOG"
         fi
+        # TorBox CDN intermittently 429s bursts of input opens (every Plex seek
+        # re-opens the input through mycelium's 302) and a bare 4XX at open is
+        # fatal to the session. Retry with backoff instead: pop the already-
+        # appended -i and re-append it behind HTTP reconnect flags (input
+        # options must precede -i).
+        if [[ "$a" == "http://${SPORE_HOST}/spore-stream/"* ]]; then
+            unset "newargs[$((${#newargs[@]}-1))]"
+            newargs+=(-reconnect 1 -reconnect_on_network_error 1 -reconnect_on_http_error 429,5xx -reconnect_delay_max 10 -i)
+            echo "$(date '+%H:%M:%S') WRAP injected HTTP reconnect flags before -i" >> "$SPORE_LOG"
+        fi
     fi
     [ "$a" = "-i" ] && found_i=1
     newargs+=("$a")
