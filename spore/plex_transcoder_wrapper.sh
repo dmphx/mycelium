@@ -564,6 +564,23 @@ if [ "$spore_replaced" = "1" ]; then
     [ "$_sub_optional_count" -gt 0 ] && \
         echo "$(date '+%H:%M:%S') WRAP made $_sub_optional_count sub-map(s) optional" >> "$SPORE_LOG"
 
+    # ── Trim oversized probe for spore inputs ────────────────────────────────
+    # Plex passes -analyzeduration/-probesize 20000000 (20 MB / 20 s), sized for
+    # blind network sources. Spore inputs are served moov-first (or via the
+    # hardened cold proxy), so FFmpeg gets full stream info from the moov up
+    # front and needn't buffer 20 MB before emitting the first segment — which
+    # just delays playback start. Trim the oversized default to a still-safe
+    # 5 MB / 5 s. Only rewrites the exact 20000000 default, nothing else.
+    for idx in "${!newargs[@]}"; do
+        case "${newargs[$idx]}" in
+            -analyzeduration|-probesize)
+                if [ "${newargs[$((idx+1))]:-}" = "20000000" ]; then
+                    newargs[$((idx+1))]="5000000"
+                fi ;;
+        esac
+    done
+    echo "$(date '+%H:%M:%S') WRAP trimmed probe/analyzeduration 20M->5M (moov-first)" >> "$SPORE_LOG"
+
     # ── Muxer error tolerance ──────────────────────────────────────────────────
     # -max_interleave_delta 0 : video keeps flowing even if audio stalls
     # -max_muxing_queue_size  : bigger buffer for audio seek-sync recovery

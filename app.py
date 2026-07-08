@@ -1516,6 +1516,36 @@ def spore_stream_proxy(token: str):
         finally:
             _spore_probing.discard(tok)
 
+    if info is None and token not in _spore_cold_sizes:
+        # First play of a cold catalog item (most of the backfilled library was
+        # probed with build_fsh=False, so its .fsh is unbuilt). Build the
+        # fast-start header synchronously but *bounded*: if it finishes quickly
+        # this play uses the moov-first path (fast start, no seek-to-EOF for the
+        # moov). If it is slow or fails, fall through to the hardened cold proxy
+        # — the join timeout guarantees we never block the request thread long.
+        _warm: dict = {}
+
+        def _warm_build() -> None:
+            try:
+                if mp4_faststart.build_and_cache(cdn_url, token):
+                    _warm["info"] = mp4_faststart.load(token)
+            except Exception as exc:
+                log.warning("spore-stream: sync warm failed token=%s: %s", token, exc)
+
+        _wt = threading.Thread(target=_warm_build, daemon=True, name=f"warm-{token[:8]}")
+        _wt.start()
+        _wt.join(5.0)
+        warm_info = _warm.get("info")
+        if warm_info is not None:
+            info = warm_info
+            log.info("spore-stream: token=%s warmed synchronously (%.1fs)",
+                     token, _t.monotonic() - started)
+            # Header is built; run the audio/subtitle probe in the background.
+            if token not in _spore_probing:
+                _spore_probing.add(token)
+                threading.Thread(target=_build_then_probe, args=(cdn_url, token),
+                                 daemon=True, name=f"probe-{token[:8]}").start()
+
     if info is None:
         # Cold cache: build .fsh in background, immediately proxy Range requests
         # to CDN so FFmpeg doesn't stall. _spore_cold_sizes caches file_size so
@@ -1555,23 +1585,35 @@ def spore_stream_proxy(token: str):
 
         length = r_end - r_start + 1
 
-        import requests as _req
-
         def _gen_passthrough():
             CHUNK = 2 << 20
             pos = r_start
+            url_ref = cdn_url
             while pos <= r_end:
                 end = min(pos + CHUNK - 1, r_end)
-                hdrs = {"Range": f"bytes={pos}-{end}"}
                 try:
-                    resp = _req.get(cdn_url, headers=hdrs, timeout=(10, 60), stream=True)
-                    for chunk in resp.iter_content(65536):
-                        yield chunk
-                    pos = end + 1
+                    data = mp4_faststart.fetch_range(url_ref, pos, end)
                 except Exception as exc:
-                    log.warning("spore-stream cold proxy: error pos=%d token=%s: %s",
-                                pos, token, exc)
+                    # A stale/expired CDN URL or a TorBox hiccup: re-materialize a
+                    # fresh URL once and retry this chunk before giving up, so a
+                    # transient failure doesn't truncate the stream mid-playback.
+                    fresh = catbox.materialize(token)
+                    if fresh and fresh != url_ref:
+                        url_ref = fresh
+                        try:
+                            data = mp4_faststart.fetch_range(url_ref, pos, end)
+                        except Exception as exc2:
+                            log.warning("spore-stream cold proxy: giving up pos=%d token=%s: %s",
+                                        pos, token, exc2)
+                            break
+                    else:
+                        log.warning("spore-stream cold proxy: error pos=%d token=%s: %s",
+                                    pos, token, exc)
+                        break
+                if not data:
                     break
+                yield data
+                pos += len(data)
 
         resp = Response(
             stream_with_context(_gen_passthrough()),
@@ -1641,13 +1683,27 @@ def spore_stream_proxy(token: str):
     def _generate():
         CHUNK = 2 << 20
         pos = v_start
+        url_ref = cdn_url
         while pos <= v_end:
             end = min(pos + CHUNK - 1, v_end)
             try:
-                data = mp4_faststart.serve_bytes(info, cdn_url, pos, end)
+                data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
             except Exception as exc:
-                log.warning("spore-stream proxy: error v=%d token=%s: %s", pos, token, exc)
-                break
+                # Re-materialize a fresh CDN URL once (handles mid-stream URL
+                # expiry / transient TorBox errors) and retry before giving up,
+                # rather than truncating the response or serving garbage.
+                fresh = catbox.materialize(token)
+                if fresh and fresh != url_ref:
+                    url_ref = fresh
+                    try:
+                        data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
+                    except Exception as exc2:
+                        log.warning("spore-stream proxy: giving up v=%d token=%s: %s",
+                                    pos, token, exc2)
+                        break
+                else:
+                    log.warning("spore-stream proxy: error v=%d token=%s: %s", pos, token, exc)
+                    break
             if not data:
                 break
             yield data

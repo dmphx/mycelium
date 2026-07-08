@@ -25,11 +25,21 @@ from __future__ import annotations
 import logging
 import struct
 import threading
+import time
 from pathlib import Path
 
 import requests as req_lib
 
 log = logging.getLogger(__name__)
+
+
+class SporeFetchError(Exception):
+    """A CDN byte-range fetch could not be satisfied correctly.
+
+    Raised instead of silently returning wrong/partial bytes, so callers can
+    re-materialize a fresh CDN URL and retry rather than streaming garbage
+    (misaligned bytes) into FFmpeg's decoder.
+    """
 
 _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT    = 60
@@ -118,18 +128,87 @@ def _find_box_in(data: bytes, typ: bytes) -> int:
 
 # ── Fetch + cache ─────────────────────────────────────────────────────────────
 
-def _get(url: str, start: int, end: int) -> bytes:
-    headers = {"Range": f"bytes={start}-{end}"}
-    resp = req_lib.get(
-        url,
-        headers=headers,
-        timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-        stream=True,
-    )
-    data = bytearray()
-    for chunk in resp.iter_content(1 << 17):
-        data += chunk
-    return bytes(data)
+def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
+    """Fetch CDN bytes [start, end] inclusive, *validated*.
+
+    The naive version returned whatever the CDN sent — including a 500 error
+    body, or a full-file HTTP 200 when the CDN ignored the Range header. Those
+    bytes then got spliced into the video stream, misaligning FFmpeg's decoder
+    (the "Invalid NAL unit size", "Could not find ref with POC", "Number of
+    bands exceeds limit" corruption). This version guarantees the bytes it
+    returns actually correspond to the requested range:
+
+      * rejects any non-206 response for a mid-file range (a 200 means the CDN
+        ignored Range and would serve from offset 0) and retries;
+      * on a short read / mid-range connection drop, re-requests the remaining
+        tail instead of returning a truncated buffer;
+      * retries transient CDN failures (timeouts, 5xx, 429) with backoff.
+
+    Returns exactly (end-start+1) bytes, or fewer only at genuine end-of-file
+    (HTTP 416). Raises SporeFetchError if the range cannot be satisfied.
+    """
+    count = end - start + 1
+    if count <= 0:
+        return b""
+    buf = bytearray()
+    attempts = 0
+    rounds = 0
+    max_rounds = tries + 16
+    while len(buf) < count:
+        rounds += 1
+        if rounds > max_rounds:
+            raise SporeFetchError(
+                f"too many partial reads ({len(buf)}/{count}) for {url[:60]}"
+            )
+        want_start = start + len(buf)
+        headers = {"Range": f"bytes={want_start}-{end}"}
+        try:
+            resp = req_lib.get(
+                url,
+                headers=headers,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                stream=True,
+            )
+            sc = resp.status_code
+            if sc == 416:
+                resp.close()
+                break  # requested past EOF — a legitimate short read
+            if sc == 200 and want_start != 0:
+                # CDN ignored the Range header and is serving from byte 0.
+                # Streaming that as if it were bytes at `want_start` corrupts
+                # the video — reject and retry.
+                resp.close()
+                raise SporeFetchError(
+                    f"CDN ignored Range (HTTP 200) at offset {want_start}"
+                )
+            if sc not in (200, 206):
+                resp.close()
+                raise SporeFetchError(f"CDN HTTP {sc}")
+            got_before = len(buf)
+            for chunk in resp.iter_content(1 << 17):
+                if chunk:
+                    buf += chunk
+                    if len(buf) >= count:
+                        break
+            if len(buf) == got_before:
+                raise SporeFetchError("CDN returned no data")
+            # Progress made. If still short (connection dropped mid-range) the
+            # while-loop re-requests the remaining tail without burning a retry.
+        except SporeFetchError:
+            attempts += 1
+            if attempts >= tries:
+                raise
+            time.sleep(min(0.3 * (2 ** (attempts - 1)), 2.0))
+        except req_lib.RequestException as exc:
+            attempts += 1
+            if attempts >= tries:
+                raise SporeFetchError(f"CDN fetch error: {exc}") from exc
+            time.sleep(min(0.3 * (2 ** (attempts - 1)), 2.0))
+    return bytes(buf[:count])
+
+
+# Public alias for callers outside this module (app.py cold/warm proxy paths).
+fetch_range = _get
 
 
 def _locate_moov(cdn_url: str, cdn_size: int) -> tuple[int, int] | None:
