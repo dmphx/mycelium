@@ -47,6 +47,15 @@ _MOOV_FETCH_MB   = 32          # fetch last N MB looking for moov
 _CACHE_DIR: Path | None = None # set by init()
 _cache_lock = threading.Lock()
 
+# TorBox's CDN enforces a per-file download rate limit and answers 429 with an
+# `X-Ratelimit-After: <seconds>` hint (typically 5). Retrying faster than that
+# just keeps the bucket drained — a single transcode's request burst can trip it
+# indefinitely. So on 429 we WAIT the hinted interval (capped) and retry, and we
+# bound how many such waits we tolerate before giving up on a chunk.
+_RATE_LIMIT_WAIT_DEFAULT = 5.0   # used when the server sends no usable hint
+_RATE_LIMIT_WAIT_CAP     = 10.0  # never sleep longer than this on one 429
+_MAX_RATE_WAITS          = 5     # ~ up to 5 paced retries before giving up
+
 
 def init(cache_dir: str | Path) -> None:
     global _CACHE_DIR
@@ -152,8 +161,9 @@ def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
         return b""
     buf = bytearray()
     attempts = 0
+    rate_waits = 0
     rounds = 0
-    max_rounds = tries + 16
+    max_rounds = tries + _MAX_RATE_WAITS + 16
     while len(buf) < count:
         rounds += 1
         if rounds > max_rounds:
@@ -170,6 +180,23 @@ def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
                 stream=True,
             )
             sc = resp.status_code
+            if sc == 429:
+                # Per-file CDN rate limit. Honor the server's hint and wait
+                # rather than hammering (fast retries keep the bucket empty).
+                hint = resp.headers.get("X-Ratelimit-After") \
+                    or resp.headers.get("Retry-After")
+                resp.close()
+                rate_waits += 1
+                if rate_waits > _MAX_RATE_WAITS:
+                    raise SporeFetchError("CDN rate-limited (429) — gave up after waiting")
+                wait = _RATE_LIMIT_WAIT_DEFAULT
+                if hint:
+                    try:
+                        wait = float(hint) + 0.5
+                    except (TypeError, ValueError):
+                        pass
+                time.sleep(min(max(wait, 0.5), _RATE_LIMIT_WAIT_CAP))
+                continue  # retry the same offset; do not burn a normal attempt
             if sc == 416:
                 resp.close()
                 break  # requested past EOF — a legitimate short read

@@ -1441,6 +1441,12 @@ import cachetools as _cachetools
 _spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=86400)
 _spore_probing: set  = set()  # tokens currently running a background probe
 
+# Per-CDN-fetch chunk size. TorBox's CDN rate-limits per *request*, so fetching
+# in large gulps (vs many small ones) keeps a single transcode — which reads the
+# file in bursts — under the per-file limit. 16 MiB cuts request count ~8x vs the
+# old 2 MiB while staying well within mycelium's memory budget.
+_SPORE_CHUNK = 16 << 20
+
 
 @app.get("/spore-stream/<token>")
 def spore_stream_proxy(token: str):
@@ -1586,7 +1592,7 @@ def spore_stream_proxy(token: str):
         length = r_end - r_start + 1
 
         def _gen_passthrough():
-            CHUNK = 2 << 20
+            CHUNK = _SPORE_CHUNK
             pos = r_start
             url_ref = cdn_url
             while pos <= r_end:
@@ -1681,7 +1687,7 @@ def spore_stream_proxy(token: str):
     length = v_end - v_start + 1
 
     def _generate():
-        CHUNK = 2 << 20
+        CHUNK = _SPORE_CHUNK
         pos = v_start
         url_ref = cdn_url
         while pos <= v_end:
