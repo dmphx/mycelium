@@ -158,6 +158,33 @@ app.config["SESSION_COOKIE_SECURE"] = cfg.COOKIE_SECURE
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 _csrf = CSRFProtect(app)
 
+# Some admin/UI POST endpoints below are @_csrf.exempt so non-browser automation
+# (ops/Cronicle scripts, curl on the trusted network authing via the trusted-proxy
+# header) can call them without a rotating CSRF token. That exemption must NOT
+# cover browser callers: a browser always sends the session cookie, so a cross-site
+# POST could ride it. @_browser_csrf re-imposes CSRF validation only when the request
+# carries our session cookie (a browser). Cookieless automation is unaffected. The
+# SPA already sends X-CSRFToken on every non-GET (frontend/src/api.ts), so the UI is
+# unchanged. (SESSION_COOKIE_SAMESITE=Lax above already blocks the cross-site cookie;
+# this is defense in depth.)
+from flask_wtf.csrf import validate_csrf as _validate_csrf
+from functools import wraps as _wraps
+_SESSION_COOKIE = app.config.get("SESSION_COOKIE_NAME") or "session"
+
+def _browser_csrf(view):
+    @_wraps(view)
+    def _wrapped(*args, **kwargs):
+        if request.cookies.get(_SESSION_COOKIE):
+            token = (request.headers.get("X-CSRFToken")
+                     or request.headers.get("X-CSRF-Token")
+                     or (request.form.get("csrf_token") if request.form else None))
+            try:
+                _validate_csrf(token)
+            except Exception:
+                abort(400, description="CSRF token missing or invalid")
+        return view(*args, **kwargs)
+    return _wrapped
+
 
 @app.after_request
 def _security_headers(response):
@@ -1126,6 +1153,7 @@ def ui_generate_nfos():
 
 @app.post("/api/run-cleanup")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def api_run_cleanup():
     if not auth.is_admin():
@@ -1136,6 +1164,7 @@ def api_run_cleanup():
 
 @app.post("/api/generate-nfos")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def api_generate_nfos():
     if not auth.is_admin():
@@ -1149,6 +1178,7 @@ def api_generate_nfos():
 
 @app.post("/ui/api/repair-strms")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_repair_strms():
     """Scan movie .strm files for expired direct TorBox CDN URLs and repair them.
@@ -1194,6 +1224,7 @@ def ui_api_spore_regenerate():
 
 @app.post("/ui/api/migrate-canonical")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_migrate_canonical():
     """Rename all movie folders to TMDB canonical names and merge duplicates."""
@@ -1205,6 +1236,7 @@ def ui_api_migrate_canonical():
 
 @app.post("/ui/api/cleanup-duplicate-strms")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_cleanup_duplicate_strms():
     """Remove extra .strm files from folders that have more than one."""
@@ -1216,6 +1248,7 @@ def ui_api_cleanup_duplicate_strms():
 
 @app.post("/ui/api/series-backfill")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_series_backfill():
     """Import all Sonarr series + run series check to create .strm files for all episodes."""
@@ -1883,6 +1916,7 @@ def ui_api_virtual_items():
 
 @app.post("/ui/api/virtual-items/<token>/re-resolve")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_re_resolve(token: str):
     """Clear fail state for a token and trigger a fresh materialize attempt."""
@@ -2240,6 +2274,7 @@ def ui_api_failed_requests():
 
 @app.post("/ui/api/requests/<int:row_id>/retry")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_retry_request(row_id: int):
     if not auth.is_admin():
@@ -2260,6 +2295,7 @@ def ui_api_retry_request(row_id: int):
 
 @app.post("/ui/api/requests/<int:row_id>/delete")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_delete_request(row_id: int):
     if not auth.is_admin():
@@ -2796,6 +2832,7 @@ def ui_api_wanted_movies():
 
 @app.post("/ui/api/wanted-recheck")
 @_csrf.exempt
+@_browser_csrf
 @auth.require_role("admin")
 def ui_api_wanted_recheck():
     if not auth.is_admin():
