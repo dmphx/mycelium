@@ -7,6 +7,10 @@ services:
     ports:
       - "8088:8088"
       - "8089:8089"
+      # spore-nfs: unauthenticated NFSv3 export. Pin to host loopback so it is
+      # reachable only by Plex (network_mode: host mounts 127.0.0.1:/), never
+      # from the LAN. Do not widen this without adding auth in front.
+      - "127.0.0.1:2049:2049"
     env_file:
       - .env
     environment:

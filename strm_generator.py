@@ -750,7 +750,7 @@ def fix_imdb_titles() -> dict:
                     old_folder_path.rmdir() if not any(old_folder_path.iterdir()) else None
                 else:
                     old_folder_path.rename(new_folder_path)
-                db.update_virtual_strm_path_prefix(str(old_folder_path), str(new_folder_path))
+                db.rename_virtual_item_paths(str(old_folder_path), str(new_folder_path))
                 renamed = True
 
             fixed.append({'imdb_id': imdb_id, 'old': old_title, 'new': new_title,
@@ -1109,6 +1109,11 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
         usenet_id=usenet_id,
     )
     written = _write_strm(path, catbox.proxy_url(token))
+    if not written:
+        # Don't leave a virtual_item row with no backing .strm - it would
+        # permanently block retries via the "already exists" guard above.
+        db.delete_virtual_item(token)
+        return False
     if written:
         _write_spore_stubs(path, token, folder, quality, size_gb)
         if imdb_id or tmdb_id:
@@ -1190,6 +1195,11 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         episode=episode,
     )
     written = _write_strm(path, catbox.proxy_url(token))
+    if not written:
+        # Don't leave a virtual_item row with no backing .strm - it would
+        # permanently block retries via the imdb_id+season+episode guard above.
+        db.delete_virtual_item(token)
+        return False
     if written:
         _write_spore_stubs(path, token, ep_name, quality, size_gb)
         if imdb_id:
@@ -1380,14 +1390,16 @@ def _ebml_audio_track_entry(track_num: int, codec_mkv: str, lang: str,
     return _ebml_el(b'\xAE', body)
 
 
-def _ebml_subtitle_track_entry(track_num: int, codec_mkv: str, lang: str) -> bytes:
+def _ebml_subtitle_track_entry(track_num: int, codec_mkv: str, lang: str,
+                                is_default: bool = False, is_forced: bool = False) -> bytes:
     lang_bytes = lang.encode("ascii", errors="replace")[:3].ljust(3)[:3]
     body = (
         _ebml_el(b'\xD7', _ebml_uint(track_num)) +
         _ebml_el(b'\x73\xC5', _ebml_uint(track_num)) +
         _ebml_el(b'\x83', _ebml_uint(0x11)) +
         _ebml_el(b'\xB9', _ebml_uint(1)) +
-        _ebml_el(b'\x88', _ebml_uint(0)) +
+        _ebml_el(b'\x88', _ebml_uint(1 if is_default else 0)) +
+        _ebml_el(b'\x55\xAA', _ebml_uint(1 if is_forced else 0)) +
         _ebml_el(b'\x22\xB5\x9C', lang_bytes) +
         _ebml_el(b'\x86', codec_mkv.encode())
     )
@@ -1500,34 +1512,45 @@ def make_stub_mkv(title: str, quality: str | None = None,
                 track_num=next_num,
                 codec_mkv=mkv_codec,
                 lang=(at.get("language") or "und")[:3],
-                channels=int(at.get("channels") or 2),
+                # Declared channel count is floored at 10: HDMI/eARC passthrough
+                # tops out at 8ch, so >8 guarantees no client (Shield included)
+                # can ever Direct Play the stub, regardless of the real CDN
+                # track's actual channel count. The wrapper doesn't read this
+                # value (maps by stream index), only Plex's direct-play check does.
+                channels=max(int(at.get("channels") or 2), 10),
                 sample_rate=float(at.get("sample_rate") or 48000),
                 is_default=(i == default_audio_idx),
             )
             next_num += 1
     else:
-        # EAC3 5.1 placeholder.
-        #   - A_EAC3 6ch: Plex chooses Direct Stream audio (copy output) for
-        #     clients that support EAC3 passthrough (Shield TV + AV receiver via
-        #     eARC). No EAE needed. Audio packets copied from CDN.
-        #   - For clients that transcode (MiTV -> AC3), EAE decodes EAC3 via
-        #     eac3_eae IPC. The wrapper keeps -eae_prefix for transcode sessions.
+        # EAC3 10ch placeholder: >8ch guarantees no client can Direct Play the
+        # stub (HDMI/eARC passthrough max is 8ch), forcing the transcoder (and
+        # our wrapper) to always be invoked. The wrapper forces video copy to
+        # avoid the wasteful full re-encode this would otherwise trigger.
         tracks_data += _ebml_audio_track_entry(
             track_num=2, codec_mkv="A_EAC3", lang="und",
-            channels=6, sample_rate=48000.0, is_default=True,
+            channels=10, sample_rate=48000.0, is_default=True,
         )
         next_num = 3
 
-    for st in (subtitle_tracks or []):
-        mkv_codec = _FFCODEC_TO_MKV_SUB.get(
-            (st.get("codec") or "").lower(), "S_TEXT/UTF8"
-        )
-        tracks_data += _ebml_subtitle_track_entry(
-            track_num=next_num,
-            codec_mkv=mkv_codec,
-            lang=(st.get("language") or "und")[:3],
-        )
-        next_num += 1
+    # Real subtitle tracks (subtitle_tracks) are intentionally NOT declared in
+    # the stub anymore: Plex prefers a soft/text track (SRT) over image-based
+    # PGS whenever both are available in the same language, which lets it pick
+    # SRT and skip the burn-in requirement entirely, undoing the trick below.
+    # Real subtitle metadata still lives in the DB (save_spore_tracks).
+    #
+    # Forced default PGS (image-based) subtitle track: no client soft-renders
+    # PGS, so Plex must burn it into the video via a real transcode session,
+    # guaranteeing the transcoder (and our wrapper) is invoked instead of
+    # Direct Play. default+forced so Plex can't just ignore it in favor of a
+    # (nonexistent, since we no longer declare one) text track. The wrapper
+    # strips the burn-in filter and forces a plain video copy, so this costs
+    # nothing extra once the wrapper takes over.
+    tracks_data += _ebml_subtitle_track_entry(
+        track_num=next_num, codec_mkv="S_HDMV/PGS", lang="und",
+        is_default=True, is_forced=True,
+    )
+    next_num += 1
 
     tracks_el = _ebml_el(b'\x16\x54\xAE\x6B', tracks_data)
 
@@ -2017,13 +2040,20 @@ def _write_strm(path: Path, url: str) -> bool:
         return False
     # Fuzzy duplicate check: skip if any existing sibling folder normalizes to the same title.
     # Catches "The Minecraft Movie (2025)" vs "Minecraft Movie The (2025)", case differences, etc.
-    parent = path.parent.parent  # movies/ or series/
-    norm = _norm_title(path.parent.name)
+    # For movies path.parent is the title folder directly under movies/. For
+    # episodes path.parent is a "Season NN" folder, so the title folder (and
+    # its siblings under series/) is one level further up.
+    if re.match(r"^Season \d+$", path.parent.name):
+        title_folder = path.parent.parent
+    else:
+        title_folder = path.parent
+    parent = title_folder.parent  # movies/ or series/
+    norm = _norm_title(title_folder.name)
     if parent.is_dir():
         for existing in parent.iterdir():
-            if existing.is_dir() and existing != path.parent and _norm_title(existing.name) == norm:
-                if any(existing.glob("*.strm")):
-                    log.info("Skipping duplicate strm %s  -  already have %s", path.parent.name, existing.name)
+            if existing.is_dir() and existing != title_folder and _norm_title(existing.name) == norm:
+                if any(existing.glob("*.strm")) or any(existing.rglob("*.strm")):
+                    log.info("Skipping duplicate strm %s  -  already have %s", title_folder.name, existing.name)
                     return False
     try:
         atomic_write_text(path, url)
@@ -2187,7 +2217,6 @@ def scan_torbox_library() -> dict:
     lands in a properly named, deduplicated folder (same canonical-title path
     normal requests use), and falls back to the raw parsed name otherwise.
     """
-    import torbox as torbox_mod
     import tmdb
     items = torbox_mod.list_torrents(force_refresh=True)
     scanned = imported = skipped = failed = 0
@@ -2373,9 +2402,6 @@ def migrate_to_canonical_names() -> dict:
 
     Returns: {scanned, renamed, merged, skipped, errors, no_imdb}
     """
-    import re as _re
-    import shutil
-
     if not _maintenance_lock.acquire(blocking=False):
         log.warning("migrate_to_canonical_names: maintenance already running  -  skipping")
         return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0, "no_imdb": 0}
@@ -2412,8 +2438,13 @@ def _migrate_to_canonical_names_locked() -> dict:
     def _do_rename(old: Path, new: Path) -> bool:
         try:
             old.rename(new)
-            # Update DB strm_path: any virtual_item pointing into old folder
-            db.update_virtual_strm_path_prefix(str(old), str(new))
+            # Update DB strm_path: any virtual_item pointing into old folder.
+            # rename_virtual_item_paths() anchors the match to a directory
+            # boundary (trailing "/"), unlike update_virtual_strm_path_prefix()
+            # - without that, renaming "Alien (1979)" would also corrupt
+            # strm_path rows for a sibling folder like "Alien (1979) Directors
+            # Cut" whose name happens to start with the same string.
+            db.rename_virtual_item_paths(str(old), str(new))
             # Rename .strm/.nfo files inside that still use the old folder stem
             old_stem = old.name
             new_stem = new.name
@@ -2424,14 +2455,36 @@ def _migrate_to_canonical_names_locked() -> dict:
                     if not new_file.exists():
                         old_file.rename(new_file)
                         if suffix == ".strm":
-                            db.update_virtual_strm_path_prefix(str(old_file), str(new_file))
+                            db.update_virtual_item_strm_path(str(old_file), str(new_file))
             log.info("migrate: renamed '%s' → '%s'", old.name, new.name)
             return True
         except Exception as exc:
             log.error("migrate: rename failed %s → %s: %s", old.name, new.name, exc)
             return False
 
-    def _do_delete(folder: Path) -> None:
+    def _do_delete(folder: Path, keep: Path) -> None:
+        """Merge any .strm this duplicate has that `keep` doesn't, then remove
+        it - unlike a plain rmtree, this can't silently lose a differently
+        named/quality .strm (or its virtual_item row) that only existed in
+        the folder being discarded."""
+        fully_merged = True
+        for strm in folder.glob("*.strm"):
+            dest = keep / strm.name
+            if dest.exists():
+                db.delete_virtual_item_by_strm_path(str(strm))
+                continue
+            try:
+                content = strm.read_text(encoding="utf-8")
+                dest.write_text(content, encoding="utf-8")
+            except Exception as exc:
+                log.warning("migrate: could not copy %s to %s: %s", strm, dest, exc)
+                fully_merged = False
+                continue
+            db.update_virtual_item_strm_path(str(strm), str(dest))
+        if not fully_merged:
+            log.warning("migrate: not all files could be merged out of '%s' - leaving folder in place",
+                        folder.name)
+            return
         try:
             shutil.rmtree(folder)
             log.info("migrate: deleted duplicate '%s'", folder.name)
@@ -2507,7 +2560,7 @@ def _migrate_to_canonical_names_locked() -> dict:
                 for dup in ordered[1:]:
                     if dup.resolve() == keep.resolve():
                         continue
-                    _do_delete(dup)
+                    _do_delete(dup, keep)
                     merged += 1
 
         except Exception as exc:
@@ -2746,7 +2799,7 @@ def _cleanup_duplicate_strms_locked() -> dict:
             if not new_path.exists():
                 try:
                     keep.rename(new_path)
-                    db.update_virtual_strm_path_prefix(str(keep), str(new_path))
+                    db.update_virtual_item_strm_path(str(keep), str(new_path))
                     nfo_old = keep.with_suffix(".nfo")
                     nfo_new = new_path.with_suffix(".nfo")
                     if nfo_old.exists() and not nfo_new.exists():

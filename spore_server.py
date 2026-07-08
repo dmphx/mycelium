@@ -26,7 +26,8 @@ import requests as req_lib
 log = logging.getLogger(__name__)
 
 # Bind localhost by default so the byte-range API is reachable only by the
-# Plex interceptor running in the same container/host. Override with
+# Plex interceptor running in the same container/host. This protocol has no
+# auth, so it must never be exposed beyond loopback by default. Override with
 # SPORE_BIND_ADDR (or MYCELIUM_SPORE_HOST) when the Plex transcoder runs on
 # a different host that needs reachability.
 _DEFAULT_HOST = "127.0.0.1"
@@ -100,6 +101,16 @@ def _fetch_range(cdn_url: str, offset: int, count: int) -> bytes | None:
             timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
             stream=True,
         )
+        if resp.status_code == 200 and offset != 0:
+            # CDN ignored the Range header and is sending the file from byte
+            # 0 - the first `count` bytes of that body are NOT bytes
+            # [offset, offset+count), so returning them would silently serve
+            # wrong data. A 200 is only actually correct here when offset==0.
+            log.warning(
+                "Spore: CDN returned HTTP 200 (ignored Range) for %s bytes=%d-%d",
+                cdn_url[:60], offset, end,
+            )
+            return None
         if resp.status_code not in (200, 206):
             log.warning(
                 "Spore: CDN returned HTTP %d for %s bytes=%d-%d",
@@ -250,6 +261,7 @@ def start(host: str = _DEFAULT_HOST,
             port = int(env_port)
         except ValueError:
             pass
+    host = os.environ.get("MYCELIUM_SPORE_HOST", host)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

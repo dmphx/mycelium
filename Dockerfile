@@ -7,6 +7,14 @@ COPY frontend/ ./
 COPY plugins/ /plugins/
 RUN npm run build
 
+# -- Stage 2: build spore-nfs (Go) ------------------------------------------------------
+FROM golang:1.25-alpine AS spore-nfs
+WORKDIR /src
+COPY spore-nfs/go.mod spore-nfs/go.sum* ./
+RUN go mod download
+COPY spore-nfs/main.go ./
+RUN CGO_ENABLED=0 go build -o /spore-nfs .
+
 # -- Stage 3: Python runtime ----------------------------------------------------------
 FROM python:3.12-slim
 
@@ -63,11 +71,18 @@ COPY docs/ ./docs/
 COPY --from=frontend /static/app/ ./static/app/
 # Also copy pre-built SPA if present (skips npm build when static/app/ is tracked)
 COPY static/ ./static/
+COPY --from=spore-nfs /spore-nfs /usr/local/bin/spore-nfs
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && chown -R mycelium:mycgrp /app
 
-EXPOSE 8088
+# spore-nfs (runs alongside gunicorn inside this container). LISTEN_ADDR binds
+# the container-internal interface; host exposure is pinned to loopback in
+# docker-compose (127.0.0.1:2049:2049), not here.
+ENV MYCELIUM_BASE=http://127.0.0.1:8088 \
+    LISTEN_ADDR=:2049
+
+EXPOSE 8088 2049
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
   CMD python -c "import urllib.request,os,sys; \
@@ -76,4 +91,4 @@ r=urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=5); \
 sys.exit(0 if r.status==200 else 1)" || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["sh", "-c", "exec gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 1 --threads 8 --access-logfile - app:app"]
+CMD ["sh", "-c", "spore-nfs & exec gunicorn --bind ${LISTEN_HOST}:${LISTEN_PORT} --workers 1 --threads 8 --access-logfile - app:app"]
