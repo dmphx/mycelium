@@ -14,6 +14,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ var (
 	myceliumBase = envOr("MYCELIUM_BASE", "http://mycelium:8088")
 	listenAddr   = envOr("LISTEN_ADDR", ":2049")
 	stubRoot     = envOr("SPORE_STUB_ROOT", "/data/plex-media")
+	fshRoot      = envOr("SPORE_FSH_ROOT", stubRoot+"/.fsh")
 	treeTTL      = 10 * time.Second
 	httpClient   = &http.Client{Timeout: 30 * time.Second}
 )
@@ -698,6 +700,116 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 	return w.data[rel:end], nil
 }
 
+// ---- fast-start moov header served straight from the .fsh cache -----------
+//
+// mp4_faststart.py builds a moov-first header ([ftyp][rewritten moov]) for
+// cached MP4 titles and stores it as <token>.fsh. That file lives on the same
+// filesystem as this server (spore-nfs runs inside the mycelium container), so
+// reads that fall inside the header can be served straight from it -- no HTTP,
+// no CDN, and crucially no catbox.materialize(). Plex's over-NFS analyze pass
+// only ever reads the moov; routing it through /spore-stream made every moov
+// read pay materialize()'s ~30s cold torrent-add, which exceeds the NFS read
+// timeout and stalled Direct Play analysis. mdat reads (real playback) still
+// go through bufferedRead -> /spore-stream and materialize on demand.
+//
+// .fsh layout: [preamble][ftyp+rewritten_moov]. Preamble is 32 bytes
+// (ftyp_size, moov_size, cdn_size, moov_offset as big-endian uint64) in the
+// current format, 24 in a legacy one. Either way the header is the trailing
+// (ftyp_size+moov_size) bytes, so headerStart = fileSize - headerSize is
+// format-agnostic. moov_size == 0 is a sentinel (MKV / already-fast) with no
+// cached moov; such tokens report "no header" and fall through to bufferedRead.
+type fshMeta struct {
+	headerStart int64
+	headerSize  int64
+	ok          bool
+	fetched     time.Time
+}
+
+var (
+	fshMetaMu    sync.RWMutex
+	fshMetaCache = map[string]fshMeta{}
+)
+
+const fshMissTTL = 2 * time.Minute
+
+func fshPath(token string) string { return filepath.Join(fshRoot, token+".fsh") }
+
+// fshMetaFor locates the cached moov header for a token. Hits are cached
+// forever (a .fsh is immutable once atomically written); misses are re-checked
+// after fshMissTTL because a title's .fsh may be built later (on first real
+// playback), after which its moov reads should go fast too.
+func fshMetaFor(token string) fshMeta {
+	fshMetaMu.RLock()
+	m, ok := fshMetaCache[token]
+	fshMetaMu.RUnlock()
+	if ok && (m.ok || time.Since(m.fetched) < fshMissTTL) {
+		return m
+	}
+	m = readFshMeta(token)
+	m.fetched = time.Now()
+	fshMetaMu.Lock()
+	fshMetaCache[token] = m
+	fshMetaMu.Unlock()
+	return m
+}
+
+func readFshMeta(token string) fshMeta {
+	fp := fshPath(token)
+	st, err := os.Stat(fp)
+	if err != nil {
+		return fshMeta{}
+	}
+	f, err := os.Open(fp)
+	if err != nil {
+		return fshMeta{}
+	}
+	defer f.Close()
+	var pre [16]byte
+	if _, err := io.ReadFull(f, pre[:]); err != nil {
+		return fshMeta{}
+	}
+	ftypSize := int64(binary.BigEndian.Uint64(pre[0:8]))
+	moovSize := int64(binary.BigEndian.Uint64(pre[8:16]))
+	if ftypSize < 0 || moovSize <= 0 {
+		return fshMeta{} // sentinel (MKV / already-fast): no cached moov to serve
+	}
+	headerSize := ftypSize + moovSize
+	headerStart := st.Size() - headerSize
+	// Preamble is 24 (legacy) or 32 (current); anything else means the file is
+	// truncated/malformed -- fall through to the CDN path rather than serve junk.
+	if headerStart != 24 && headerStart != 32 {
+		return fshMeta{}
+	}
+	return fshMeta{headerStart: headerStart, headerSize: headerSize, ok: true}
+}
+
+// fshHeaderRead serves [offset, offset+want) of the virtual moov-first file from
+// the cached header bytes in the .fsh. The caller guarantees offset < headerSize;
+// the slice is clamped to the header boundary, so a read spanning header+mdat
+// yields only the header part (a short read) and the next read continues into
+// mdat via bufferedRead.
+func fshHeaderRead(token string, m fshMeta, offset, want int64) ([]byte, error) {
+	end := offset + want
+	if end > m.headerSize {
+		end = m.headerSize
+	}
+	n := end - offset
+	if n <= 0 {
+		return nil, nil
+	}
+	f, err := os.Open(fshPath(token))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	got, err := f.ReadAt(buf, m.headerStart+offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:got], nil
+}
+
 type sporeFile struct {
 	name   string
 	token  string
@@ -723,7 +835,14 @@ func (f *sporeFile) Read(p []byte) (int, error) {
 	var buf []byte
 	var err error
 	if f.cached {
-		buf, err = bufferedRead(f.token, f.pos, want, f.size)
+		// A read inside the moov header is served straight from the local .fsh
+		// cache (no materialize) so Plex's over-NFS analyze pass runs fast; mdat
+		// reads (real playback) fall through to the materialize + CDN path.
+		if m := fshMetaFor(f.token); m.ok && f.pos < m.headerSize {
+			buf, err = fshHeaderRead(f.token, m, f.pos, want)
+		} else {
+			buf, err = bufferedRead(f.token, f.pos, want, f.size)
+		}
 	} else {
 		buf, err = stubRead(f.stub, f.pos, want)
 	}
