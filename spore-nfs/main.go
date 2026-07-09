@@ -409,9 +409,18 @@ func (fs *sporeFS) Open(filename string) (billy.File, error) {
 		return nil, os.ErrNotExist
 	}
 	if !info.cached {
-		// Uncached: serve the on-disk stub (forces a Plex transcode, lazy-adds
-		// to TorBox only on a real /spore-stream play). No CDN, no torrent add
-		// during scans.
+		// Sticky-real: a title that was already converted (has a built .fsh)
+		// keeps serving as the real file even after its torrent idle-releases
+		// from the account. Plex recorded it as a real Direct Play item, so if
+		// spore-nfs suddenly served the 240-byte stub here Plex would read a
+		// truncated file and playback would break. Instead serve the real size
+		// (moov straight from the local .fsh, mdat re-materialized on demand via
+		// bufferedRead -> /spore-stream), so the item stays playable across the
+		// cache/expire cycle with no Plex re-analysis needed. Never-converted
+		// titles (no .fsh) still serve the stub and transcode via the wrapper.
+		if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
+			return &sporeFile{name: p, token: info.token, size: m.cdnSize, cached: true}, nil
+		}
 		sp := stubPath(p)
 		st, err := os.Stat(sp)
 		if err != nil {
@@ -470,6 +479,14 @@ func (fs *sporeFS) sizeAndMtime(p string, info entryInfo) (int64, time.Time) {
 			}
 		}
 		return size, mtimeCached
+	}
+	// Sticky-real (see Open): a converted title keeps reporting its real size
+	// and cached mtime once idle-released, so Plex keeps Direct-Playing it
+	// rather than seeing a stub-sized file and breaking. Reporting the same
+	// mtime band it had while cached means Plex never registers a flip, so no
+	// re-analysis is triggered either.
+	if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
+		return m.cdnSize, mtimeCached
 	}
 	if st, err := os.Stat(stubPath(p)); err == nil {
 		return st.Size(), mtimeStub
@@ -721,6 +738,7 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 type fshMeta struct {
 	headerStart int64
 	headerSize  int64
+	cdnSize     int64 // real size of the full title, from the .fsh preamble
 	ok          bool
 	fetched     time.Time
 }
@@ -764,13 +782,14 @@ func readFshMeta(token string) fshMeta {
 		return fshMeta{}
 	}
 	defer f.Close()
-	var pre [16]byte
+	var pre [24]byte
 	if _, err := io.ReadFull(f, pre[:]); err != nil {
 		return fshMeta{}
 	}
 	ftypSize := int64(binary.BigEndian.Uint64(pre[0:8]))
 	moovSize := int64(binary.BigEndian.Uint64(pre[8:16]))
-	if ftypSize < 0 || moovSize <= 0 {
+	cdnSize := int64(binary.BigEndian.Uint64(pre[16:24]))
+	if ftypSize < 0 || moovSize <= 0 || cdnSize <= 0 {
 		return fshMeta{} // sentinel (MKV / already-fast): no cached moov to serve
 	}
 	headerSize := ftypSize + moovSize
@@ -780,7 +799,7 @@ func readFshMeta(token string) fshMeta {
 	if headerStart != 24 && headerStart != 32 {
 		return fshMeta{}
 	}
-	return fshMeta{headerStart: headerStart, headerSize: headerSize, ok: true}
+	return fshMeta{headerStart: headerStart, headerSize: headerSize, cdnSize: cdnSize, ok: true}
 }
 
 // fshHeaderRead serves [offset, offset+want) of the virtual moov-first file from
