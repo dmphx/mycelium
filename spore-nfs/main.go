@@ -666,9 +666,21 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 	}
 
 	rel := offset - w.start
+	dlen := int64(len(w.data))
+	// A short window (the CDN returned fewer bytes than the item's reported
+	// size -- e.g. the materialized release differs from what checkcached sized)
+	// can put rel past the data. Clamp both ends so the slice is always valid: a
+	// read past the available bytes yields nothing instead of panicking and
+	// crashing the whole NFS server for every client.
+	if rel < 0 {
+		rel = 0
+	}
+	if rel > dlen {
+		rel = dlen
+	}
 	end := rel + want
-	if end > int64(len(w.data)) {
-		end = int64(len(w.data))
+	if end > dlen {
+		end = dlen
 	}
 
 	// Past the midpoint of this grid cell: start fetching the next one now,
