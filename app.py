@@ -286,6 +286,54 @@ def ui_api_me_password():
     return jsonify(ok=True)
 
 
+# ---- spore-nfs cached/size status cache ---------------------------------
+# Per-token (cached, real_size), refreshed in the background with a single
+# batched checkcached sweep so /spore-nfs/tree and /spore-nfs/size answer
+# instantly, with no per-file TorBox call during a Plex library scan. spore-nfs
+# serves cached tokens as the real file (Direct Play) and uncached tokens as the
+# on-disk stub (forces transcode, lazy-adds only on a real play). Defined before
+# _start_scheduler() since the scheduler primes it at boot.
+_spore_status: "dict[str, tuple[bool, int]]" = {}
+_spore_status_lock = threading.Lock()
+
+
+def _refresh_spore_status() -> None:
+    import time as _t
+    t0 = _t.monotonic()
+    try:
+        items = db.get_all_virtual_items()
+    except Exception as exc:
+        log.warning("spore-nfs status: db error: %s", exc)
+        return
+    hashes = [it["info_hash"] for it in items if it.get("info_hash")]
+    try:
+        by_hash = torbox.check_cached_files(hashes) if hashes else {}
+    except Exception as exc:
+        log.warning("spore-nfs status: checkcached error: %s", exc)
+        return
+    newmap: "dict[str, tuple[bool, int]]" = {}
+    for it in items:
+        h = (it.get("info_hash") or "").lower()
+        entry = by_hash.get(h)
+        size = 0
+        if entry:
+            files = entry.get("files") or []
+            main = strm_generator._pick_main_movie_file(files) if files else None
+            size = int((main.get("size") if main else entry.get("size")) or 0)
+        newmap[it["token"]] = (size > 0, size)
+    with _spore_status_lock:
+        _spore_status.clear()
+        _spore_status.update(newmap)
+    cached_n = sum(1 for c, _ in newmap.values() if c)
+    log.info("spore-nfs status refreshed: %d items, %d cached (%.1fs)",
+             len(newmap), cached_n, _t.monotonic() - t0)
+
+
+def _spore_status_for(token: str):
+    with _spore_status_lock:
+        return _spore_status.get(token)
+
+
 def _start_scheduler() -> BackgroundScheduler:
     # job_defaults: every interval job gets +/-60s jitter to avoid stampede when
     # multiple long-running jobs hit the same minute mark.
@@ -386,6 +434,19 @@ def _start_scheduler() -> BackgroundScheduler:
             next_run_time=None,
         )
         log.info("Scheduled probe_pending_stubs every 30m")
+
+        # Refresh the cached/uncached status map so spore-nfs can serve cached
+        # titles as real files (Direct Play) and uncached ones as stubs. Primed
+        # once at startup in a thread so a long checkcached sweep never blocks boot.
+        _spore_refresh_min = int(_os.environ.get("SPORE_CACHE_REFRESH_MIN", "60") or "60")
+        scheduler.add_job(
+            _refresh_spore_status,
+            trigger="interval", minutes=_spore_refresh_min,
+            id="spore_status", next_run_time=None,
+        )
+        threading.Thread(target=_refresh_spore_status, name="spore-status-init",
+                         daemon=True).start()
+        log.info("Scheduled spore-nfs cache-status refresh every %dm", _spore_refresh_min)
 
     if not LITE_MODE:
         if AUTO_UPGRADE_ENABLED and AUTO_UPGRADE_INTERVAL_HOURS > 0:
@@ -1588,12 +1649,18 @@ def spore_nfs_tree():
         if rel_idx is None:
             continue
         rel = Path(*parts[rel_idx:])
+        st = _spore_status_for(item["token"])
+        cached, size = (st[0], st[1]) if st else (False, 0)
         entries.append({
             "token": item["token"],
             # Real container is unknown until first probe; .mkv is a safe
             # default since our proxy transparently redirects/remuxes
             # regardless of the client-visible extension.
             "path": str(rel.with_suffix(".mkv")),
+            # cached => spore-nfs serves the real file (Direct Play); otherwise
+            # it serves the on-disk stub. size is the real byte size when cached.
+            "size": size,
+            "cached": cached,
         })
     return jsonify({"entries": entries})
 
@@ -1604,6 +1671,11 @@ def spore_nfs_size(token: str):
     checkcached call, which reports cached files without adding anything to
     the account. Used for library scans; actual playback still goes through
     /spore-stream/<token>, which materializes for real."""
+    # Fast path: answer from the background-refreshed status cache.
+    st = _spore_status_for(token)
+    if st is not None:
+        return jsonify({"size": st[1], "cached": st[0]})
+    # Cold fallback (token not swept yet): a live, non-materializing checkcached.
     item = db.get_virtual_item(token)
     if not item:
         abort(404)
@@ -1612,13 +1684,13 @@ def spore_nfs_size(token: str):
     if not entry:
         # Not cached (or a torrent Mycelium has never checked yet): no size
         # to report without materializing, which a bulk scan must not do.
-        return jsonify({"size": 0})
+        return jsonify({"size": 0, "cached": False})
     files = entry.get("files") or []
     main = strm_generator._pick_main_movie_file(files) if files else None
     # Single-file torrents (the common case for movies) have no "files"
     # list at all -- size/name live directly on the entry.
-    size = main.get("size") if main else entry.get("size")
-    return jsonify({"size": int(size or 0)})
+    size = int((main.get("size") if main else entry.get("size")) or 0)
+    return jsonify({"size": size, "cached": size > 0})
 
 
 @app.get("/spore-stream/<token>")

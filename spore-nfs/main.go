@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +36,16 @@ import (
 var (
 	myceliumBase = envOr("MYCELIUM_BASE", "http://mycelium:8088")
 	listenAddr   = envOr("LISTEN_ADDR", ":2049")
+	stubRoot     = envOr("SPORE_STUB_ROOT", "/data/plex-media")
 	treeTTL      = 10 * time.Second
 	httpClient   = &http.Client{Timeout: 30 * time.Second}
+)
+
+// Distinct mtime bands per representation so Plex notices a stub<->real flip
+// (a title becoming cached, or a torrent expiring) and re-analyzes it.
+var (
+	mtimeCached = time.Unix(2_000_000_000, 0)
+	mtimeStub   = time.Unix(1_000_000_000, 0)
 )
 
 func envOr(k, def string) string {
@@ -49,18 +58,29 @@ func envOr(k, def string) string {
 // ---- virtual tree -----------------------------------------------------
 
 type treeEntry struct {
-	Token string `json:"token"`
-	Path  string `json:"path"` // e.g. "movies/Civil War (2024)/Civil War (2024).mkv"
+	Token  string `json:"token"`
+	Path   string `json:"path"`   // e.g. "movies/Civil War (2024)/Civil War (2024).mkv"
+	Size   int64  `json:"size"`   // real cached size in bytes; 0 when uncached/unknown
+	Cached bool   `json:"cached"` // true => serve the real file; false => serve the stub
+}
+
+// entryInfo is the per-path record the tree keeps in memory.
+type entryInfo struct {
+	token  string
+	size   int64
+	cached bool
 }
 
 type tree struct {
 	mu        sync.RWMutex
-	byPath    map[string]string // path -> token
-	dirs      map[string]bool   // every ancestor directory of every file
+	byPath    map[string]entryInfo // path -> {token,size,cached}
+	dirs      map[string]bool      // every ancestor directory of every file
 	fetchedAt time.Time
 }
 
-func newTree() *tree { return &tree{byPath: map[string]string{}, dirs: map[string]bool{"": true}} }
+func newTree() *tree {
+	return &tree{byPath: map[string]entryInfo{}, dirs: map[string]bool{"": true}}
+}
 
 func (t *tree) refreshIfStale() {
 	t.mu.RLock()
@@ -91,11 +111,11 @@ func (t *tree) refresh() {
 		return
 	}
 
-	byPath := map[string]string{}
+	byPath := map[string]entryInfo{}
 	dirs := map[string]bool{"": true}
 	for _, e := range out.Entries {
 		clean := strings.Trim(path.Clean("/"+e.Path), "/")
-		byPath[clean] = e.Token
+		byPath[clean] = entryInfo{token: e.Token, size: e.Size, cached: e.Cached}
 		for dir := path.Dir(clean); dir != "." && dir != "/"; dir = path.Dir(dir) {
 			dirs[dir] = true
 			if dir == "." {
@@ -113,11 +133,16 @@ func (t *tree) refresh() {
 }
 
 func (t *tree) tokenFor(p string) (string, bool) {
+	info, ok := t.infoFor(p)
+	return info.token, ok
+}
+
+func (t *tree) infoFor(p string) (entryInfo, bool) {
 	t.refreshIfStale()
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	tok, ok := t.byPath[p]
-	return tok, ok
+	info, ok := t.byPath[p]
+	return info, ok
 }
 
 func (t *tree) isDir(p string) bool {
@@ -344,15 +369,30 @@ func (fs *sporeFS) Chroot(path string) (billy.Filesystem, error) { return fs, ni
 
 func (fs *sporeFS) Open(filename string) (billy.File, error) {
 	p := fs.clean(filename)
-	tok, ok := fs.tree.tokenFor(p)
+	info, ok := fs.tree.infoFor(p)
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	size, err := cachedRealSize(tok)
-	if err != nil {
-		return nil, err
+	if !info.cached {
+		// Uncached: serve the on-disk stub (forces a Plex transcode, lazy-adds
+		// to TorBox only on a real /spore-stream play). No CDN, no torrent add
+		// during scans.
+		sp := stubPath(p)
+		st, err := os.Stat(sp)
+		if err != nil {
+			return nil, err
+		}
+		return &sporeFile{name: p, token: info.token, size: st.Size(), cached: false, stub: sp}, nil
 	}
-	return &sporeFile{name: p, token: tok, size: size}, nil
+	size := info.size
+	if size <= 0 {
+		s, err := cachedRealSize(info.token)
+		if err != nil {
+			return nil, err
+		}
+		size = s
+	}
+	return &sporeFile{name: p, token: info.token, size: size, cached: true}, nil
 }
 
 func (fs *sporeFS) Stat(filename string) (os.FileInfo, error) {
@@ -360,26 +400,55 @@ func (fs *sporeFS) Stat(filename string) (os.FileInfo, error) {
 	if p == "" || fs.tree.isDir(p) {
 		return dirInfo{name: path.Base(p)}, nil
 	}
-	tok, ok := fs.tree.tokenFor(p)
+	info, ok := fs.tree.infoFor(p)
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	// go-nfs calls Stat() on every single READ RPC (NFSv3 is stateless --
-	// this server re-derives EOF/size per read, it doesn't hold an open
-	// file across reads). If this token was already opened for real
-	// playback, reuse that size instead of a second network round trip;
-	// otherwise (library scan, never played) fall back to the cheap,
-	// non-materializing lookup.
-	if size, ok := peekRealSize(tok); ok {
-		return fileInfo{name: path.Base(p), size: size}, nil
+	size, mtime := fs.sizeAndMtime(p, info)
+	return fileInfo{name: path.Base(p), size: size, mtime: mtime}, nil
+}
+func (fs *sporeFS) Lstat(filename string) (os.FileInfo, error) { return fs.Stat(filename) }
+
+// sizeAndMtime resolves the size and mtime to report for a path. Cached items
+// report their real size (served via spore-stream); uncached items report the
+// on-disk stub's size (served straight from SPORE_STUB_ROOT: no CDN, no add).
+func (fs *sporeFS) sizeAndMtime(p string, info entryInfo) (int64, time.Time) {
+	if info.cached {
+		size := info.size
+		// go-nfs calls Stat() on every READ RPC; if this token is already open
+		// for real playback, reuse that size instead of another lookup.
+		if s, ok := peekRealSize(info.token); ok {
+			size = s
+		}
+		if size <= 0 {
+			if s, err := cheapSize(info.token); err == nil {
+				size = s
+			}
+		}
+		return size, mtimeCached
 	}
-	size, err := cheapSize(tok)
+	if st, err := os.Stat(stubPath(p)); err == nil {
+		return st.Size(), mtimeStub
+	}
+	return 0, mtimeStub
+}
+
+func stubPath(p string) string { return filepath.Join(stubRoot, filepath.FromSlash(p)) }
+
+// stubRead serves a byte range from the tiny on-disk stub file.
+func stubRead(pathStr string, offset, length int64) ([]byte, error) {
+	fh, err := os.Open(pathStr)
 	if err != nil {
 		return nil, err
 	}
-	return fileInfo{name: path.Base(p), size: size}, nil
+	defer fh.Close()
+	buf := make([]byte, length)
+	n, err := fh.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:n], nil
 }
-func (fs *sporeFS) Lstat(filename string) (os.FileInfo, error) { return fs.Stat(filename) }
 
 func (fs *sporeFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	p := fs.clean(dirname)
@@ -390,17 +459,12 @@ func (fs *sporeFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 			out = append(out, dirInfo{name: name})
 			continue
 		}
-		tok, ok := fs.tree.tokenFor(child)
+		info, ok := fs.tree.infoFor(child)
 		if !ok {
 			continue
 		}
-		size, err := cheapSize(tok)
-		if err != nil {
-			// Item not checkable right now (TorBox/CDN hiccup): still list
-			// it so the library entry exists, just report 0 for now.
-			size = 0
-		}
-		out = append(out, fileInfo{name: name, size: size})
+		size, mtime := fs.sizeAndMtime(child, info)
+		out = append(out, fileInfo{name: name, size: size, mtime: mtime})
 	}
 	return out, nil
 }
@@ -408,14 +472,20 @@ func (fs *sporeFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 // ---- os.FileInfo implementations ---------------------------------------
 
 type fileInfo struct {
-	name string
-	size int64
+	name  string
+	size  int64
+	mtime time.Time
 }
 
-func (f fileInfo) Name() string       { return f.name }
-func (f fileInfo) Size() int64        { return f.size }
-func (f fileInfo) Mode() os.FileMode  { return 0444 }
-func (f fileInfo) ModTime() time.Time { return time.Unix(0, 0) }
+func (f fileInfo) Name() string      { return f.name }
+func (f fileInfo) Size() int64       { return f.size }
+func (f fileInfo) Mode() os.FileMode { return 0444 }
+func (f fileInfo) ModTime() time.Time {
+	if f.mtime.IsZero() {
+		return time.Unix(0, 0)
+	}
+	return f.mtime
+}
 func (f fileInfo) IsDir() bool        { return false }
 func (f fileInfo) Sys() interface{}   { return nil }
 
@@ -575,11 +645,13 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 }
 
 type sporeFile struct {
-	name  string
-	token string
-	size  int64
-	pos   int64
-	mu    sync.Mutex
+	name   string
+	token  string
+	size   int64
+	pos    int64
+	cached bool
+	stub   string // on-disk stub path, used when !cached
+	mu     sync.Mutex
 }
 
 func (f *sporeFile) Name() string { return f.name }
@@ -594,7 +666,13 @@ func (f *sporeFile) Read(p []byte) (int, error) {
 	if f.pos+want > f.size {
 		want = f.size - f.pos
 	}
-	buf, err := bufferedRead(f.token, f.pos, want, f.size)
+	var buf []byte
+	var err error
+	if f.cached {
+		buf, err = bufferedRead(f.token, f.pos, want, f.size)
+	} else {
+		buf, err = stubRead(f.stub, f.pos, want)
+	}
 	if err != nil {
 		return 0, err
 	}
