@@ -1747,14 +1747,14 @@ _spore_probing: set  = set()  # tokens currently running a background probe
 _SPORE_CHUNK = 16 << 20
 
 
-@app.get("/spore-nfs/tree")
-def spore_nfs_tree():
-    """Virtual directory tree for the spore-nfs server: one entry per playable
-    virtual item, reusing the same movies/series folder layout as the Jellyfin
-    .strm tree (strm_path), just with the extension swapped for the real
-    media container instead of .strm. spore-nfs polls this to build its
-    in-memory filesystem; it does not touch the filesystem itself."""
+_spore_tree_cache = {"body": None, "ts": 0.0}
+_spore_tree_lock = threading.Lock()
+_SPORE_TREE_TTL = 30.0  # seconds
+
+
+def _build_spore_tree_json() -> str:
     from pathlib import Path
+    import json as _json
     entries = []
     for item in db.get_all_virtual_items():
         strm_path_str = item.get("strm_path")
@@ -1788,7 +1788,28 @@ def spore_nfs_tree():
             "size": size,
             "cached": cached,
         })
-    return jsonify({"entries": entries})
+    return _json.dumps({"entries": entries})
+
+
+@app.get("/spore-nfs/tree")
+def spore_nfs_tree():
+    """Virtual directory tree for the spore-nfs server. spore-nfs polls this every
+    ~10s and the response is a large (100k-entry, ~11MB) JSON. It is cached and
+    rebuilt at most once per _SPORE_TREE_TTL under a lock: without the cache,
+    concurrent polls each rebuilt it and piled up on the single gunicorn worker,
+    starving playback (/spore-stream) under any added load."""
+    import time as _t
+    body = _spore_tree_cache["body"]
+    if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
+        return app.response_class(body, mimetype="application/json")
+    with _spore_tree_lock:
+        body = _spore_tree_cache["body"]
+        if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
+            return app.response_class(body, mimetype="application/json")
+        body = _build_spore_tree_json()
+        _spore_tree_cache["body"] = body
+        _spore_tree_cache["ts"] = _t.monotonic()
+    return app.response_class(body, mimetype="application/json")
 
 
 @app.get("/spore-nfs/size/<token>")
