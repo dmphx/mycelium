@@ -245,8 +245,17 @@ _mylist_cache: dict = {"items": None, "ts": 0.0}
 _mylist_lock = __import__("threading").Lock()
 
 
-def list_torrents(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
-    """Return TorBox mylist (all pages), cached for ~45s."""
+def list_torrents(timeout: int = 30, force_refresh: bool = False,
+                  max_pages: int = 20) -> list[dict]:
+    """Return TorBox mylist (paged), cached for ~45s.
+
+    max_pages caps how many 1000-item pages are fetched. The default 20 (20k
+    items) keeps the hot-path callers (find_by_hash during materialize, usage
+    summary) fast. Accounts larger than 20k must pass a higher value to see the
+    whole list -- the spore-nfs cache-status sweep does, so cached titles beyond
+    the recent 20k window are not wrongly served as stubs. The loop still stops
+    early at the real end of the list, so a high cap costs nothing on small
+    accounts; it only raises the anti-infinite-loop ceiling."""
     import time as _t
     if not force_refresh:
         cached = _mylist_cache["items"]
@@ -257,7 +266,7 @@ def list_torrents(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
     seen_ids: set[int] = set()
     offset = 0
     limit = 1000
-    for _ in range(20):  # max 20 pages = 20 000 items; guards against infinite loop
+    for _ in range(max_pages):  # stops early when a short page ends the list
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"limit": limit, "offset": offset})
         if resp.status_code == 403:

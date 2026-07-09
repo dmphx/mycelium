@@ -316,7 +316,11 @@ def _refresh_spore_status() -> None:
         log.warning("spore-nfs status: db error: %s", exc)
         return
     try:
-        torrents = torbox.list_torrents(force_refresh=True)
+        # Page the WHOLE account (not the default 20k cap) so cached titles beyond
+        # the recent 20k window are seen and served as real files, not stubs.
+        torrents = torbox.list_torrents(
+            force_refresh=True,
+            max_pages=int(_os.environ.get("SPORE_MYLIST_MAX_PAGES", "500") or "500"))
     except Exception as exc:
         log.warning("spore-nfs status: mylist error: %s", exc)
         return
@@ -346,6 +350,71 @@ def _refresh_spore_status() -> None:
 def _spore_status_for(token: str):
     with _spore_status_lock:
         return _spore_status.get(token)
+
+
+def _spore_mark_cached(token: str) -> None:
+    """Event-driven flip: a token that just materialized on a real play is now in
+    the TorBox account, so mark it cached immediately (with real size) instead of
+    waiting for the next sweep. spore-nfs then serves the real file, and Plex is
+    poked to re-analyze that one title so it Direct Plays. No-op once cached, so it
+    is cheap even if reached repeatedly."""
+    st = _spore_status_for(token)
+    if st and st[0]:
+        return
+    try:
+        item = db.get_virtual_item(token)
+        if not item or not item.get("info_hash"):
+            return
+        h = item["info_hash"].lower()
+        entry = torbox.check_cached_files([h]).get(h)
+        if not entry:
+            return
+        files = entry.get("files") or []
+        main = strm_generator._pick_main_movie_file(files) if files else None
+        size = int((main.get("size") if main else entry.get("size")) or 0)
+        if size <= 0:
+            return
+        with _spore_status_lock:
+            cur = _spore_status.get(token)
+            if cur and cur[0]:
+                return
+            _spore_status[token] = (True, size)
+        log.info("spore-nfs: token=%s flipped stub->cached on play (size=%d)", token, size)
+        _spore_plex_rescan(item)
+    except Exception as exc:
+        log.debug("spore-nfs mark-cached failed for %s: %s", token, exc)
+
+
+def _spore_plex_rescan(item: dict) -> None:
+    """Best-effort: poke Plex to re-scan just this title's folder so a stub->real
+    flip is re-analyzed and Direct Plays. Needs PLEX_URL + PLEX_TOKEN and the
+    section id (PLEX_MOVIE_SECTION / PLEX_SERIES_SECTION) in the env; if any is
+    missing this is skipped and Plex's own scheduled scan is the backstop."""
+    plex_url = _os.environ.get("PLEX_URL", "").rstrip("/")
+    plex_token = _os.environ.get("PLEX_TOKEN", "")
+    is_series = bool(item.get("season") and item.get("episode"))
+    section = _os.environ.get(
+        "PLEX_SERIES_SECTION" if is_series else "PLEX_MOVIE_SECTION", "")
+    if not (plex_url and plex_token and section):
+        return
+    strm_path_str = item.get("strm_path")
+    if not strm_path_str:
+        return
+    from pathlib import Path as _P
+    parts = _P(strm_path_str).parts
+    rel_idx = next((i for i in range(len(parts) - 1, -1, -1)
+                    if parts[i] in ("movies", "series")), None)
+    if rel_idx is None:
+        return
+    media_root = _os.environ.get("SPORE_NFS_PLEX_ROOT", "/spore-nfs-media")
+    folder = str(_P(media_root, *parts[rel_idx:-1]))
+    try:
+        import requests as _rq
+        _rq.get(f"{plex_url}/library/sections/{section}/refresh",
+                params={"path": folder, "X-Plex-Token": plex_token}, timeout=10)
+        log.debug("spore-nfs: poked Plex re-scan section=%s path=%s", section, folder)
+    except Exception as exc:
+        log.debug("spore-nfs: Plex re-scan poke failed: %s", exc)
 
 
 def _start_scheduler() -> BackgroundScheduler:
@@ -452,7 +521,7 @@ def _start_scheduler() -> BackgroundScheduler:
         # Refresh the cached/uncached status map so spore-nfs can serve cached
         # titles as real files (Direct Play) and uncached ones as stubs. Primed
         # once at startup in a thread so a long checkcached sweep never blocks boot.
-        _spore_refresh_min = int(_os.environ.get("SPORE_CACHE_REFRESH_MIN", "60") or "60")
+        _spore_refresh_min = int(_os.environ.get("SPORE_CACHE_REFRESH_MIN", "15") or "15")
         scheduler.add_job(
             _refresh_spore_status,
             trigger="interval", minutes=_spore_refresh_min,
@@ -1726,6 +1795,15 @@ def spore_stream_proxy(token: str):
         log.warning("spore-stream: materialize FAILED token=%s ua=%r range=%s (%.1fs)",
                     token, ua, rng, _t.monotonic() - started)
         abort(404)
+
+    # Materialized => this token is now in the TorBox account. Flip it to cached in
+    # the spore-nfs status map (off-thread so it never delays the stream) so
+    # spore-nfs serves the real file and Plex re-analyzes it: "watch once, becomes
+    # NFS". Guarded to a no-op once the token is already known-cached.
+    _st = _spore_status_for(token)
+    if not (_st and _st[0]):
+        threading.Thread(target=_spore_mark_cached, args=(token,),
+                         daemon=True, name="spore-flip").start()
 
     info = mp4_faststart.load(token)
 
