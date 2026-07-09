@@ -13,11 +13,13 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -75,11 +77,25 @@ type tree struct {
 	mu        sync.RWMutex
 	byPath    map[string]entryInfo // path -> {token,size,cached}
 	dirs      map[string]bool      // every ancestor directory of every file
+	childMap  map[string][]string  // dir -> immediate child names (files + subdirs)
 	fetchedAt time.Time
 }
 
 func newTree() *tree {
-	return &tree{byPath: map[string]entryInfo{}, dirs: map[string]bool{"": true}}
+	return &tree{
+		byPath:   map[string]entryInfo{},
+		dirs:     map[string]bool{"": true},
+		childMap: map[string][]string{},
+	}
+}
+
+// parentOf returns the parent directory of p, with the export root expressed as "".
+func parentOf(p string) string {
+	d := path.Dir(p)
+	if d == "." || d == "/" {
+		return ""
+	}
+	return d
 }
 
 func (t *tree) refreshIfStale() {
@@ -113,11 +129,32 @@ func (t *tree) refresh() {
 
 	byPath := map[string]entryInfo{}
 	dirs := map[string]bool{"": true}
+	childMap := map[string][]string{}
+	childSeen := map[string]map[string]bool{}
+	addChild := func(parent, name string) {
+		if name == "" {
+			return
+		}
+		s := childSeen[parent]
+		if s == nil {
+			s = map[string]bool{}
+			childSeen[parent] = s
+		}
+		if s[name] {
+			return
+		}
+		s[name] = true
+		childMap[parent] = append(childMap[parent], name)
+	}
 	for _, e := range out.Entries {
 		clean := strings.Trim(path.Clean("/"+e.Path), "/")
 		byPath[clean] = entryInfo{token: e.Token, size: e.Size, cached: e.Cached}
+		addChild(parentOf(clean), path.Base(clean))
 		for dir := path.Dir(clean); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			dirs[dir] = true
+			if !dirs[dir] {
+				dirs[dir] = true
+				addChild(parentOf(dir), path.Base(dir))
+			}
 			if dir == "." {
 				break
 			}
@@ -127,6 +164,7 @@ func (t *tree) refresh() {
 	t.mu.Lock()
 	t.byPath = byPath
 	t.dirs = dirs
+	t.childMap = childMap
 	t.fetchedAt = time.Now()
 	t.mu.Unlock()
 	log.Printf("tree refreshed: %d files, %d dirs", len(byPath), len(dirs))
@@ -152,30 +190,14 @@ func (t *tree) isDir(p string) bool {
 	return t.dirs[p]
 }
 
-// children returns the immediate child names (files and subdirs) of dir.
+// children returns the immediate child names (files and subdirs) of dir. O(1)
+// via the precomputed childMap -- a Plex library scan issues one READDIR per
+// directory, so the old O(files) scan per call made cold scans crawl and time out.
 func (t *tree) children(dir string) []string {
 	t.refreshIfStale()
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	seen := map[string]bool{}
-	var out []string
-	add := func(name string) {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	for p := range t.byPath {
-		if path.Dir(p) == dir || (dir == "" && !strings.Contains(p, "/")) {
-			add(path.Base(p))
-		}
-	}
-	for d := range t.dirs {
-		if d != "" && (path.Dir(d) == dir || (dir == "" && !strings.Contains(d, "/"))) {
-			add(path.Base(d))
-		}
-	}
-	return out
+	return t.childMap[dir]
 }
 
 // ---- HTTP-backed file size / content -----------------------------------
@@ -728,35 +750,128 @@ func (f *sporeFile) Lock() error                   { return nil }
 func (f *sporeFile) Unlock() error                 { return nil }
 func (f *sporeFile) Truncate(size int64) error     { return billy.ErrReadOnly }
 
+// ---- stable file handles ------------------------------------------------
+
+// The default CachingHandler mints a random UUID per path in a 4096-entry LRU.
+// That breaks this deployment two ways: the map is empty after a spore-nfs
+// restart (every handle Plex still holds goes STALE, so the library vanishes),
+// and 4096 handles is far too few for a 100k-file library (handles evict mid
+// scan). stableHandler instead derives each handle deterministically from the
+// path (sha256), so the same path always maps to the same handle -- handles
+// survive restarts and never evict. A path->handle map, pre-seeded from the
+// tree, lets FromHandle resolve any handle the client cached before a restart.
+type stableHandler struct {
+	nfs.Handler // embedded NullAuthHandler supplies Mount/Change/FSStat
+	fs          billy.Filesystem
+	mu          sync.RWMutex
+	toPath      map[string][]string // handle bytes (as string) -> path components
+	lastLen     int
+}
+
+func newStableHandler(base nfs.Handler, fs billy.Filesystem) *stableHandler {
+	return &stableHandler{Handler: base, fs: fs, toPath: map[string][]string{}}
+}
+
+func pathHandle(parts []string) []byte {
+	sum := sha256.Sum256([]byte(path.Join(parts...)))
+	return sum[:]
+}
+
+func (h *stableHandler) ToHandle(_ billy.Filesystem, p []string) []byte {
+	fh := pathHandle(p)
+	k := string(fh)
+	h.mu.RLock()
+	_, known := h.toPath[k]
+	h.mu.RUnlock()
+	if !known {
+		cp := append([]string(nil), p...)
+		h.mu.Lock()
+		h.toPath[k] = cp
+		h.mu.Unlock()
+	}
+	return fh
+}
+
+func (h *stableHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
+	h.mu.RLock()
+	parts, ok := h.toPath[string(fh)]
+	h.mu.RUnlock()
+	if !ok {
+		return nil, nil, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
+	}
+	return h.fs, parts, nil
+}
+
+func (h *stableHandler) InvalidateHandle(billy.Filesystem, []byte) error { return nil }
+
+func (h *stableHandler) HandleLimit() int { return math.MaxInt32 }
+
+// syncFromTree pre-registers a deterministic handle for every path in the tree so
+// a handle the client cached before a restart still resolves. Additive (never
+// removes), so handles learned on access (e.g. .minfo sidecars) are kept. Skips
+// work when the path count is unchanged.
+func (h *stableHandler) syncFromTree(t *tree) {
+	t.mu.RLock()
+	total := len(t.byPath) + len(t.dirs)
+	if total == h.lastLen {
+		t.mu.RUnlock()
+		return
+	}
+	paths := make([][]string, 0, total+1)
+	paths = append(paths, []string{}) // export root
+	for p := range t.byPath {
+		paths = append(paths, strings.Split(p, "/"))
+	}
+	for d := range t.dirs {
+		if d != "" {
+			paths = append(paths, strings.Split(d, "/"))
+		}
+	}
+	t.mu.RUnlock()
+
+	h.mu.Lock()
+	for _, parts := range paths {
+		k := string(pathHandle(parts))
+		if _, ok := h.toPath[k]; !ok {
+			h.toPath[k] = parts
+		}
+	}
+	h.lastLen = total
+	h.mu.Unlock()
+}
+
 // ---- main ---------------------------------------------------------------
 
 func main() {
 	t := newTree()
 	t.refresh()
 
+	fs := &sporeFS{tree: t}
+	base := nfshelper.NewNullAuthHandler(fs)
+	handler := newStableHandler(base, fs)
+	handler.syncFromTree(t)
+
 	// Retry independently of incoming NFS requests: on a fresh start this
 	// container can win the race against mycelium's own startup, and
 	// refreshIfStale() alone won't retry again until something actually
 	// asks the filesystem for a file, which never happens on a client
-	// that gave up mounting after an empty first listing.
+	// that gave up mounting after an empty first listing. Re-seed handles
+	// after every refresh so newly added paths are resolvable.
 	go func() {
 		ticker := time.NewTicker(treeTTL)
 		defer ticker.Stop()
 		for range ticker.C {
 			t.refresh()
+			handler.syncFromTree(t)
 		}
 	}()
-
-	fs := &sporeFS{tree: t}
-	handler := nfshelper.NewNullAuthHandler(fs)
-	cacheHelper := nfshelper.NewCachingHandler(handler, 4096)
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("spore-nfs listening on %s, backing store = %s", listenAddr, myceliumBase)
-	if err := nfs.Serve(listener, cacheHelper); err != nil {
+	if err := nfs.Serve(listener, handler); err != nil {
 		log.Fatal(err)
 	}
 }

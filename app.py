@@ -417,6 +417,46 @@ def _spore_plex_rescan(item: dict) -> None:
         log.debug("spore-nfs: Plex re-scan poke failed: %s", exc)
 
 
+# Bounded flip pipeline. /spore-stream fires on every read (and the preload hits
+# it in bulk), so spawning a thread per hit piled up thousands of blocking TorBox/
+# Plex calls and hung mycelium. Instead enqueue tokens (deduped) onto a bounded
+# queue drained by ONE worker: at most one flip runs at a time, bursts are capped,
+# and anything dropped is caught by the next cache-status sweep.
+import queue as _queue
+_spore_flip_q: "_queue.Queue" = _queue.Queue(maxsize=4096)
+_spore_flip_seen: set = set()
+_spore_flip_lock = threading.Lock()
+
+
+def _enqueue_flip(token: str) -> None:
+    st = _spore_status_for(token)
+    if st and st[0]:
+        return  # already cached -> nothing to do
+    with _spore_flip_lock:
+        if token in _spore_flip_seen:
+            return
+        if len(_spore_flip_seen) > 100000:
+            _spore_flip_seen.clear()
+        _spore_flip_seen.add(token)
+    try:
+        _spore_flip_q.put_nowait(token)
+    except _queue.Full:
+        # Queue saturated: drop (the sweep will pick it up) and allow a later retry.
+        with _spore_flip_lock:
+            _spore_flip_seen.discard(token)
+
+
+def _spore_flip_worker() -> None:
+    while True:
+        token = _spore_flip_q.get()
+        try:
+            _spore_mark_cached(token)
+        except Exception as exc:
+            log.debug("spore flip worker: %s", exc)
+        finally:
+            _spore_flip_q.task_done()
+
+
 def _start_scheduler() -> BackgroundScheduler:
     # job_defaults: every interval job gets +/-60s jitter to avoid stampede when
     # multiple long-running jobs hit the same minute mark.
@@ -528,6 +568,9 @@ def _start_scheduler() -> BackgroundScheduler:
             id="spore_status", next_run_time=None,
         )
         threading.Thread(target=_refresh_spore_status, name="spore-status-init",
+                         daemon=True).start()
+        # Single drain worker for the bounded flip queue.
+        threading.Thread(target=_spore_flip_worker, name="spore-flip-worker",
                          daemon=True).start()
         log.info("Scheduled spore-nfs cache-status refresh every %dm", _spore_refresh_min)
 
@@ -1796,14 +1839,11 @@ def spore_stream_proxy(token: str):
                     token, ua, rng, _t.monotonic() - started)
         abort(404)
 
-    # Materialized => this token is now in the TorBox account. Flip it to cached in
-    # the spore-nfs status map (off-thread so it never delays the stream) so
-    # spore-nfs serves the real file and Plex re-analyzes it: "watch once, becomes
-    # NFS". Guarded to a no-op once the token is already known-cached.
-    _st = _spore_status_for(token)
-    if not (_st and _st[0]):
-        threading.Thread(target=_spore_mark_cached, args=(token,),
-                         daemon=True, name="spore-flip").start()
+    # Materialized => this token is now in the TorBox account. Enqueue a flip so
+    # spore-nfs serves the real file and Plex re-analyzes it ("watch once, becomes
+    # NFS"). Bounded single-worker queue -- never spawns per-request threads, so a
+    # burst (e.g. the preload) can't pile up and hang mycelium.
+    _enqueue_flip(token)
 
     info = mp4_faststart.load(token)
 
