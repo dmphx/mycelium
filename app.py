@@ -297,6 +297,16 @@ _spore_status: "dict[str, tuple[bool, int]]" = {}
 _spore_status_lock = threading.Lock()
 
 
+# A title is "cached" (serve the real file) when its torrent is already in the
+# TorBox account and ready to stream. Deriving this from the mylist (~20 paged
+# calls, cached) instead of a per-hash checkcached (one call per 100 items, i.e.
+# ~1000+ calls over a 100k-item library) keeps the sweep to a few seconds, and is
+# the right semantic: a torrent already in the account has a CDN URL ready, so
+# serving its real bytes needs no scan-time add. Titles not (yet) in the account
+# stay stubs and lazy-add on a real play.
+_SPORE_READY_STATES = {"cached", "completed"}
+
+
 def _refresh_spore_status() -> None:
     import time as _t
     t0 = _t.monotonic()
@@ -305,21 +315,25 @@ def _refresh_spore_status() -> None:
     except Exception as exc:
         log.warning("spore-nfs status: db error: %s", exc)
         return
-    hashes = [it["info_hash"] for it in items if it.get("info_hash")]
     try:
-        by_hash = torbox.check_cached_files(hashes) if hashes else {}
+        torrents = torbox.list_torrents(force_refresh=True)
     except Exception as exc:
-        log.warning("spore-nfs status: checkcached error: %s", exc)
+        log.warning("spore-nfs status: mylist error: %s", exc)
         return
+    by_hash = {}
+    for t in torrents:
+        h = (t.get("hash") or "").lower()
+        if h:
+            by_hash[h] = t
     newmap: "dict[str, tuple[bool, int]]" = {}
     for it in items:
         h = (it.get("info_hash") or "").lower()
-        entry = by_hash.get(h)
+        t = by_hash.get(h)
         size = 0
-        if entry:
-            files = entry.get("files") or []
+        if t and (t.get("download_state") or "").lower() in _SPORE_READY_STATES:
+            files = t.get("files") or []
             main = strm_generator._pick_main_movie_file(files) if files else None
-            size = int((main.get("size") if main else entry.get("size")) or 0)
+            size = int((main.get("size") if main else t.get("size")) or 0)
         newmap[it["token"]] = (size > 0, size)
     with _spore_status_lock:
         _spore_status.clear()
