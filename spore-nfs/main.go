@@ -369,6 +369,17 @@ func (fs *sporeFS) Chroot(path string) (billy.Filesystem, error) { return fs, ni
 
 func (fs *sporeFS) Open(filename string) (billy.File, error) {
 	p := fs.clean(filename)
+	if strings.HasSuffix(p, ".minfo") {
+		// A .minfo sidecar is served straight from the on-disk stub tree so the
+		// Plex transcoder wrapper can read the token when a stub (uncached) title
+		// is played over NFS. Not in the media tree; opened by path.
+		sp := stubPath(p)
+		st, err := os.Stat(sp)
+		if err != nil {
+			return nil, err
+		}
+		return &sporeFile{name: p, size: st.Size(), cached: false, stub: sp}, nil
+	}
 	info, ok := fs.tree.infoFor(p)
 	if !ok {
 		return nil, os.ErrNotExist
@@ -399,6 +410,15 @@ func (fs *sporeFS) Stat(filename string) (os.FileInfo, error) {
 	p := fs.clean(filename)
 	if p == "" || fs.tree.isDir(p) {
 		return dirInfo{name: path.Base(p)}, nil
+	}
+	if strings.HasSuffix(p, ".minfo") {
+		// .minfo sidecar: report the on-disk stub sidecar so the wrapper's
+		// `[ -f X.minfo ]` test and read succeed over NFS.
+		st, err := os.Stat(stubPath(p))
+		if err != nil {
+			return nil, err
+		}
+		return fileInfo{name: path.Base(p), size: st.Size(), mtime: mtimeStub}, nil
 	}
 	info, ok := fs.tree.infoFor(p)
 	if !ok {
