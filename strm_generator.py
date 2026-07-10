@@ -1667,6 +1667,18 @@ def _write_spore_stubs(strm_path: Path, token: str,
         except Exception as exc:
             log.warning("Spore: could not write .minfo %s: %s", minfo_path, exc)
 
+    # Notify Plex so it scans AND matches the new episode/movie. The per-item add
+    # path marks via _write_strm, but the bulk backfill (backfill_spore_stubs)
+    # writes stubs with no preceding _write_strm -- without this the item lands in
+    # Plex unmatched (guid=local://): no episode still, no description. mark() keys
+    # off the .strm path under MEDIA_PATH and is debounced per-folder, so a whole
+    # show's episodes coalesce into a single targeted show-folder scan.
+    try:
+        import media_servers
+        media_servers.mark(strm_path)
+    except Exception as exc:
+        log.debug("Spore: Plex scan-notify failed for %s: %s", strm_path, exc)
+
 
 def _delete_spore_stubs(strm_path: Path) -> None:
     """Remove .mkv stub and .minfo for a given .strm path (if they exist)."""

@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import requests
@@ -60,6 +61,10 @@ try:
     _DEBOUNCE = float(_cfg("TARGETED_SCAN_DEBOUNCE_SEC", "20"))
 except (TypeError, ValueError):
     _DEBOUNCE = 20.0
+try:
+    _SCAN_PACE = float(_cfg("TARGETED_SCAN_PACE_SEC", "0.5"))
+except (TypeError, ValueError):
+    _SCAN_PACE = 0.5
 
 _lock = threading.Lock()
 _pending = set()       # {(kind, folder)}
@@ -116,20 +121,30 @@ def _flush():
         _timer = None
     if not batch:
         return
-    jf_updates, plex_queue_lines = [], []
+    # Jellyfin is a single batched POST -- fire it up front so the Plex scan
+    # pacing below never delays it.
+    _scan_jellyfin([{"Path": "%s/%s/%s" % (JF_LIBRARY_ROOT, kind, folder),
+                     "UpdateType": "Modified" if mode == "analyze" else "Created"}
+                    for kind, folder, mode in batch])
+    plex_queue_lines = []
+    scanned = 0
     for kind, folder, mode in batch:
-        jf_updates.append({"Path": "%s/%s/%s" % (JF_LIBRARY_ROOT, kind, folder),
-                           "UpdateType": "Modified" if mode == "analyze" else "Created"})
         section = PLEX_SECTION_TV if kind == "series" else PLEX_SECTION_MOVIE
         root    = PLEX_TV_ROOT if kind == "series" else PLEX_MOVIE_ROOT
         plex_path = "%s/%s" % (root, folder)
-        # Prefer a direct Plex API partial scan: it re-reads changed files, so a
-        # stub rewritten with a corrected codec lands in Plex's DB (a rewritten
-        # stub otherwise stays stale and keeps the codec mismatch alive). Fall
-        # back to the host-drained queue file when no Plex token is configured.
-        if not _plex_api_scan(section, plex_path):
+        # Pace successive Plex partial scans so a large batch (e.g. a bulk Spore
+        # backfill marking hundreds of show folders) trickles into Plex's scan
+        # queue instead of bursting. A burst of scanner spawns is what piles up
+        # in D-state and deadlocks SQLite; a small gap keeps Plex responsive.
+        if scanned and _SCAN_PACE > 0:
+            time.sleep(_SCAN_PACE)
+        # A direct Plex API partial scan re-reads changed files, so a stub
+        # rewritten with a corrected codec lands in Plex's DB. Falls back to the
+        # host-drained queue file when no Plex token is configured.
+        if _plex_api_scan(section, plex_path):
+            scanned += 1
+        else:
             plex_queue_lines.append("%s\t%s" % (section, plex_path))
-    _scan_jellyfin(jf_updates)
     if plex_queue_lines:
         _queue_plex(plex_queue_lines)
 
