@@ -415,8 +415,12 @@ def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
 
 
 def _extract_year(name: str) -> int | None:
-    m = _YEAR_RE.search(name or "")
-    return int(m.group(1)) if m else None
+    # Prefer the LAST year-like token. Release names are "Title ... <ReleaseYear>
+    # <quality>", so a year embedded in the title ("Blade Runner 2049", "2012",
+    # "1917") must not be mistaken for the release year (first-match did exactly
+    # that, baking wrong-year folders that never match in Plex).
+    ms = _YEAR_RE.findall(name or "")
+    return int(ms[-1]) if ms else None
 
 
 # ── Jellyfin: NFO en mapbeheer ────────────────────────────────────────────────
@@ -617,21 +621,29 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
                              fallback_year: int | None = None) -> str:
     """Return the canonical 'Title (Year)' folder name from TMDB for this imdb_id.
     Falls back to fallback_title/year if TMDB lookup fails."""
-    try:
-        import tmdb as _tmdb
-        results = _tmdb._get(f"/find/{imdb_id}",
-                             params={"external_source": "imdb_id"}) or {}
-        hits = results.get("movie_results") or []
-        if hits:
-            title = hits[0].get("title") or ""
-            year = (hits[0].get("release_date") or "")[:4]
-            if title:
-                safe = _safe(title)
+    import time as _time
+    import tmdb as _tmdb
+    # Retry on transient TMDB failures (network blips / empty responses) BEFORE
+    # falling back: a bad fallback year gets baked into the folder permanently and
+    # then never matches in Plex. Only give up after real attempts.
+    for _attempt in range(3):
+        try:
+            results = _tmdb._get(f"/find/{imdb_id}",
+                                 params={"external_source": "imdb_id"}) or {}
+            hits = results.get("movie_results") or []
+            if hits and hits[0].get("title"):
+                safe = _safe(hits[0]["title"])
+                year = (hits[0].get("release_date") or "")[:4]
                 return f"{safe} ({year})" if year else safe
-    except Exception as exc:
-        log.debug("_canonical_movie_folder TMDB lookup failed for %s: %s", imdb_id, exc)
+        except Exception as exc:
+            log.debug("_canonical_movie_folder TMDB lookup failed for %s (attempt %d): %s",
+                      imdb_id, _attempt + 1, exc)
+        _time.sleep(0.5 * (_attempt + 1))
     if fallback_title:
         safe = _safe(fallback_title)
+        # Strip a trailing "(YYYY)" already in the fallback title so we never emit a
+        # double-year folder like "Articulo 53 (1937) (1937)".
+        safe = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", safe)
         return f"{safe} ({fallback_year})" if fallback_year else safe
     return ""
 
