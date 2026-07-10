@@ -430,6 +430,40 @@ def load(token: str) -> dict | None:
         return None
 
 
+def load_meta(token: str) -> dict | None:
+    """Cheap header-only load: the four size fields without the moov bytes.
+
+    Reads at most 32 bytes from the .fsh, so unlike load() (which pulls the full
+    ftyp+moov header, up to ~32 MB, into memory) this is safe to call once per
+    entry while listing a large directory. Returns None if the .fsh is absent or
+    the cache dir was never initialised.
+    """
+    try:
+        path = _cache_path(token)
+        with path.open("rb") as fh:
+            raw = fh.read(32)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log.warning("FastStart: load_meta failed for %s: %s", token, exc)
+        return None
+    if len(raw) < 24:
+        return None
+    if len(raw) < 32:
+        # Legacy .fsh without moov_offset field (3-field header)
+        ftyp_size, moov_size, cdn_size = struct.unpack_from(">QQQ", raw, 0)
+        moov_offset = ftyp_size if moov_size == 0 else cdn_size - moov_size
+    else:
+        ftyp_size, moov_size, cdn_size, moov_offset = struct.unpack_from(">QQQQ", raw, 0)
+    return {
+        "ftyp_size":    ftyp_size,
+        "moov_size":    moov_size,
+        "moov_offset":  moov_offset,
+        "cdn_size":     cdn_size,
+        "already_fast": moov_size == 0,
+    }
+
+
 def extract_codec_private(token: str) -> bytes | None:
     """Extract HEVC (hvcC) or AVC (avcC) decoder config bytes from the cached moov.
     Returns the box payload (without 8-byte header), or None if not found."""
