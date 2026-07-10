@@ -677,10 +677,16 @@ func (s *readAheadSet) prefetch(token string, start, fileSize int64) {
 	if err != nil {
 		return
 	}
+	// Never cache a short prefetch (cold mdat streamed fewer bytes than asked
+	// before the CDN was ready); a truncated window would later serve false
+	// EOFs to a sequential reader that crosses into it.
+	if int64(len(data)) < fetchLen && start+int64(len(data)) < fileSize {
+		return
+	}
 	s.store(readAheadWindow{data: data, start: start, used: s.clock})
 }
 
-func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
+func bufferedRead(token string, offset, want, fileSize, mdatStart int64) ([]byte, error) {
 	readAheadMu.Lock()
 	s, ok := readAheads[token]
 	if !ok {
@@ -689,7 +695,22 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 	}
 	readAheadMu.Unlock()
 
-	start := gridStart(offset)
+	gridS := gridStart(offset)
+	start := gridS
+	// bufferedRead only ever serves mdat: reads inside the moov header are
+	// answered straight from the .fsh in Read(). A read-ahead window must
+	// therefore never begin inside the moov. gridStart rounds an mdat offset in
+	// the first 16MB down to 0, which made readRange ask spore-stream for a
+	// range crossing the moov/mdat boundary. Cold, spore-stream sends the moov
+	// instantly (from the .fsh) then stalls on the not-yet-materialized mdat;
+	// the truncated response came back as a short buffer, got cached as a full
+	// window, and every read past it then returned a false EOF -- Direct Play
+	// died a couple MB in and "offered the next episode". Pinning the first
+	// window to the mdat boundary keeps every fetch a clean pure-mdat range
+	// that spore-stream serves whole.
+	if mdatStart > 0 && start < mdatStart {
+		start = mdatStart
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -727,7 +748,13 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 			return nil, err
 		}
 		nw := readAheadWindow{data: data, start: start, used: s.clock}
-		s.store(nw)
+		// Only cache a window that came back whole. A short read (cold mdat:
+		// spore-stream ended the stream before the CDN was ready) must not be
+		// stored as authoritative, or every later read in this grid cell would
+		// keep hitting the truncated copy and returning a false EOF.
+		if int64(len(data)) >= fetchLen || start+int64(len(data)) >= fileSize {
+			s.store(nw)
+		}
 		w = &nw
 	} else {
 		w.used = s.clock
@@ -735,16 +762,28 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 
 	rel := offset - w.start
 	dlen := int64(len(w.data))
-	// A short window (the CDN returned fewer bytes than the item's reported
-	// size -- e.g. the materialized release differs from what checkcached sized)
-	// can put rel past the data. Clamp both ends so the slice is always valid: a
-	// read past the available bytes yields nothing instead of panicking and
-	// crashing the whole NFS server for every client.
 	if rel < 0 {
 		rel = 0
 	}
-	if rel > dlen {
-		rel = dlen
+	if rel >= dlen {
+		// The window does not reach offset -- a short cold fetch. Returning an
+		// empty slice here is a false EOF to the NFS client, which truncates
+		// playback mid-file (the original "plays 1.5 min then offers the next
+		// episode" bug). Fetch exactly what was asked for instead: by now the
+		// mdat is usually materialized, so this returns real bytes and playback
+		// continues. If it is genuinely past the end, signal EOF; otherwise
+		// surface a retryable error rather than a silent truncation.
+		if offset >= fileSize {
+			return nil, io.EOF
+		}
+		direct, err := readRange(token, offset, want)
+		if err != nil {
+			return nil, err
+		}
+		if len(direct) == 0 {
+			return nil, fmt.Errorf("spore: short read at %d/%d, mdat not ready", offset, fileSize)
+		}
+		return direct, nil
 	}
 	end := rel + want
 	if end > dlen {
@@ -753,9 +792,11 @@ func bufferedRead(token string, offset, want, fileSize int64) ([]byte, error) {
 
 	// Past the midpoint of this grid cell: start fetching the next one now,
 	// in the background, so it's ready before a sequential reader reaches
-	// the edge instead of blocking on a fresh fetch at that point.
-	if rel > int64(len(w.data))/2 {
-		next := start + readAheadSize
+	// the edge instead of blocking on a fresh fetch at that point. `next` is
+	// based on the unclamped grid so the first (mdat-boundary) window still
+	// hands off to the aligned 16MB grid.
+	if rel > dlen/2 {
+		next := gridS + readAheadSize
 		if next < fileSize {
 			if _, have := s.findWindow(next); !have && !s.pending[next] {
 				s.pending[next] = true
@@ -906,10 +947,20 @@ func (f *sporeFile) Read(p []byte) (int, error) {
 		// A read inside the moov header is served straight from the local .fsh
 		// cache (no materialize) so Plex's over-NFS analyze pass runs fast; mdat
 		// reads (real playback) fall through to the materialize + CDN path.
-		if m := fshMetaFor(f.token); m.ok && f.pos < m.headerSize {
+		m := fshMetaFor(f.token)
+		if m.ok && f.pos < m.headerSize {
 			buf, err = fshHeaderRead(f.token, m, f.pos, want)
 		} else {
-			buf, err = bufferedRead(f.token, f.pos, want, f.size)
+			// mdatStart marks where the moov header ends and mdat begins in the
+			// virtual layout; bufferedRead uses it to keep read-ahead windows
+			// from straddling that boundary (a straddling window short-reads
+			// cold mdat and truncates playback -- see there). 0 for header-less
+			// (MKV/sentinel) tokens, which map 1:1 to the CDN.
+			var mdatStart int64
+			if m.ok {
+				mdatStart = m.headerSize
+			}
+			buf, err = bufferedRead(f.token, f.pos, want, f.size, mdatStart)
 		}
 	} else {
 		buf, err = stubRead(f.stub, f.pos, want)
