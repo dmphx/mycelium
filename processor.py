@@ -808,12 +808,21 @@ def _process_locked(req: MediaRequest, _retry_attempt: int) -> bool:
         reason = _WANTED.pop(req.imdb_id)
         _LAST_FAIL_REASON.pop(req.imdb_id, None)
         db.update_request(row_id, "wanted", error=reason)
-        try:
-            import tmdb
-            tmdb_id = tmdb.find_by_imdb(req.imdb_id, kind="movie")
-        except Exception:
-            tmdb_id = None
-        db.upsert_wanted_movie(req.imdb_id, tmdb_id, req.title, reason)
+        if req.is_movie:
+            try:
+                import tmdb
+                tmdb_id = tmdb.find_by_imdb(req.imdb_id, kind="movie")
+            except Exception:
+                tmdb_id = None
+            db.upsert_wanted_movie(req.imdb_id, tmdb_id, req.title, reason)
+        else:
+            # A series with no cached release yet must NOT be parked in
+            # wanted_movies: recheck_wanted() reprocesses that table as
+            # media_type="movie", which writes a flat movies/<Title>/<Title>.strm
+            # (a <movie> stub for a TV show, unmatchable in the Movies library and
+            # showing up as an "unmatched movie"). Keep it monitored so it is
+            # rechecked per-episode as a series instead.
+            monitor.add_series(req.imdb_id, req.title, req.seasons)
         log.info("Marked %s as wanted  -  will recheck for an acceptable release", req.title)
         db.log_activity("wanted", req.title, f"{reason} ({req.imdb_id})", False)
     else:
