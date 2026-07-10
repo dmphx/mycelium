@@ -450,8 +450,14 @@ func (fs *sporeFS) Open(filename string) (billy.File, error) {
 		}
 		return &sporeFile{name: p, token: info.token, size: st.Size(), cached: false, stub: sp}, nil
 	}
+	// The .fsh's cdn_size is the ACTUAL servable size (from the CDN HEAD when the
+	// moov-first header was built). The tree's size can be a stale/nominal value
+	// from a different release; if it over-reports, Plex reads past the real end,
+	// gets 416s, and Direct Play stalls. Prefer the .fsh size whenever present.
 	size := info.size
-	if size <= 0 {
+	if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
+		size = m.cdnSize
+	} else if size <= 0 {
 		s, err := cachedRealSize(info.token)
 		if err != nil {
 			return nil, err
@@ -489,6 +495,11 @@ func (fs *sporeFS) Lstat(filename string) (os.FileInfo, error) { return fs.Stat(
 // on-disk stub's size (served straight from SPORE_STUB_ROOT: no CDN, no add).
 func (fs *sporeFS) sizeAndMtime(p string, info entryInfo) (int64, time.Time) {
 	if info.cached {
+		// Prefer the .fsh's real cdn_size over the tree's (possibly stale) size --
+		// see Open(). Keeps Stat/ReadDir consistent with what is actually servable.
+		if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
+			return m.cdnSize, mtimeCached
+		}
 		size := info.size
 		// go-nfs calls Stat() on every READ RPC; if this token is already open
 		// for real playback, reuse that size instead of another lookup.
