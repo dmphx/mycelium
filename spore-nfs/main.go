@@ -59,6 +59,15 @@ func envOr(k, def string) string {
 	return def
 }
 
+func envOrInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
+}
+
 // ---- virtual tree -----------------------------------------------------
 
 type treeEntry struct {
@@ -313,6 +322,14 @@ var noRedirectClient = &http.Client{
 const maxRetries429 = 4
 const retryBaseDelay = 300 * time.Millisecond
 
+// errRateLimited signals that a Range GET exhausted its 429 retries. It is kept
+// distinct from a generic failure so readRange can tell "the CDN is throttling
+// this (still-valid) URL" apart from "this URL is stale": the former must NOT
+// drop the cached URL and re-resolve via spore-stream (which 302s straight back
+// to the same URL and doubles the request rate that is feeding the 429); the
+// latter must.
+var errRateLimited = errors.New("cdn range GET: 429 rate limited")
+
 // rangeGetWithRetry issues a Range GET, retrying with backoff on a 429
 // instead of failing immediately: a rate limit means the CDN needs a moment
 // to clear, not that the request is doomed. Concurrent reads (multiple
@@ -353,6 +370,12 @@ func fetchRange(client *http.Client, url string, offset, length int64) ([]byte, 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Retries exhausted and still throttled. Report it as such (not a
+		// generic status error) so the caller keeps a still-valid URL instead
+		// of re-resolving into the same throttled endpoint.
+		return nil, errRateLimited
+	}
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
 		return nil, fmt.Errorf("range GET %s: status %d", url, resp.StatusCode)
 	}
@@ -376,6 +399,15 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 		data, err := fetchRange(httpClient, cached.url, offset, length)
 		if err == nil {
 			return data, nil
+		}
+		if errors.Is(err, errRateLimited) {
+			// The URL is valid, just rate limited. Dropping it and re-resolving
+			// via spore-stream only 302s back to this same URL and issues a
+			// second request into the same throttle -- exactly the amplification
+			// that turns one throttled title into a 429 storm. Keep the URL and
+			// surface the throttle; the NFS client re-issues the read shortly,
+			// by which point the limit has usually eased.
+			return nil, err
 		}
 		log.Printf("cached CDN url for %s failed (%v), re-resolving via spore-stream", token, err)
 		cdnURLMu.Lock()
@@ -408,6 +440,49 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 		return nil, fmt.Errorf("range GET %s: status %d", token, resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, length))
+}
+
+// coalesceRange collapses concurrent fetches of the same window into a single
+// upstream readRange. Callers arriving while a fetch for the same (token,start)
+// is in flight wait for it and share its bytes rather than issuing their own
+// request. The blocking cache-miss read, the background prefetch, a second
+// Watch-Together viewer, and a client's own extra connections all hitting the
+// same 16MB window thus become one CDN Range GET instead of several -- which is
+// what keeps TorBox's per-URL 429 rate limit from tripping. Keyed on the window
+// start (not length): every consumer of a given window fetches the same
+// grid-aligned span, and a follower that happens to want fewer bytes just slices
+// less out of the shared buffer.
+type inflightRange struct {
+	done chan struct{}
+	data []byte
+	err  error
+}
+
+var (
+	inflightMu sync.Mutex
+	inflight   = map[string]*inflightRange{}
+)
+
+func coalesceRange(token string, start, length int64) ([]byte, error) {
+	key := token + ":" + strconv.FormatInt(start, 10)
+
+	inflightMu.Lock()
+	if f, ok := inflight[key]; ok {
+		inflightMu.Unlock()
+		<-f.done
+		return f.data, f.err
+	}
+	f := &inflightRange{done: make(chan struct{})}
+	inflight[key] = f
+	inflightMu.Unlock()
+
+	f.data, f.err = readRange(token, start, length)
+
+	inflightMu.Lock()
+	delete(inflight, key)
+	inflightMu.Unlock()
+	close(f.done)
+	return f.data, f.err
 }
 
 // ---- billy.Filesystem implementation -----------------------------------
@@ -629,6 +704,16 @@ const (
 	probeMinFetch      = 1 << 20   // floor for probe-sized fetches (avoid 1:1 tiny requests)
 )
 
+// prefetchMaxInflight bounds how many read-ahead windows a single title may be
+// fetching at once. All viewers of a title share one readAheadSet (and one
+// s.pending map), so two Watch-Together viewers at different offsets would
+// otherwise each launch their own prefetch on top of their foreground read;
+// those extra concurrent Range GETs against one TorBox CDN URL are what push it
+// over its 429 rate limit. 1 = at most one outstanding prefetch per title
+// (foreground read + one prefetch => peak 2 concurrent per URL); 0 disables
+// read-ahead entirely. Tunable via SPORE_PREFETCH_MAX_INFLIGHT.
+var prefetchMaxInflight = envOrInt("SPORE_PREFETCH_MAX_INFLIGHT", 1)
+
 // A single window worked for one sequential reader, but real sessions have
 // more than one: Plex's background analysis/thumbnail pass can read the
 // same file concurrently at a different offset than the main playback
@@ -693,7 +778,7 @@ func (s *readAheadSet) prefetch(token string, start, fileSize int64) {
 	if start+fetchLen > fileSize {
 		fetchLen = fileSize - start
 	}
-	data, err := readRange(token, start, fetchLen)
+	data, err := coalesceRange(token, start, fetchLen)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -767,7 +852,7 @@ func bufferedRead(token string, offset, want, fileSize, mdatStart int64) ([]byte
 		if start+fetchLen > fileSize {
 			fetchLen = fileSize - start
 		}
-		data, err := readRange(token, start, fetchLen)
+		data, err := coalesceRange(token, start, fetchLen)
 		if err != nil {
 			return nil, err
 		}
@@ -821,7 +906,12 @@ func bufferedRead(token string, offset, want, fileSize, mdatStart int64) ([]byte
 	// hands off to the aligned 16MB grid.
 	if rel > dlen/2 {
 		next := gridS + readAheadSize
-		if next < fileSize {
+		// Cap outstanding prefetches per title (shared across all its viewers)
+		// so read-ahead can't fan concurrent CDN requests out past what the
+		// per-URL 429 limit tolerates. Read-ahead is best effort: if we're
+		// already at the cap, skip it -- the foreground read still fetches on
+		// demand when it reaches that window.
+		if next < fileSize && len(s.pending) < prefetchMaxInflight {
 			if _, have := s.findWindow(next); !have && !s.pending[next] {
 				s.pending[next] = true
 				go s.prefetch(token, next, fileSize)
