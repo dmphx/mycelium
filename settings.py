@@ -27,6 +27,7 @@ _BOOL_KEYS = {
     "STRICT_NO_CAM",
     "PREFER_WEBDL",
     "PREFER_HEVC",
+    "VERIFY_RELEASE_BEFORE_GRAB",
     "ZILEAN_ENABLED",
     "CATCHUP_ENABLED",
     "CATBOX_LAZY_ADD",
@@ -50,6 +51,7 @@ _LIST_KEYS = {
 }
 _FLOAT_KEYS = {
     "AUTO_ADD_MIN_RATING",
+    "MAX_MOVIE_SIZE_GB",
 }
 # Keys with a fixed set of valid values  -  rendered as a <select> in the UI
 # instead of free text, so a typo can't silently produce an invalid setting.
@@ -124,6 +126,9 @@ HOT_RELOAD = {
     "PREFER_HEVC",
     "MIN_SEEDERS",
     "MAX_SIZE_GB",
+    "MAX_MOVIE_SIZE_GB",
+    "SERIES_PACK_NAME_REGEX",
+    "VERIFY_RELEASE_BEFORE_GRAB",
     "AUDIO_LANGUAGE_PREFERENCE",
     "EXCLUDE_LANGUAGES",
     "OPENSUBTITLES_LANGUAGES",
@@ -199,6 +204,7 @@ SETTING_GROUPS = [
             "QUALITY_PREFERENCE", "ALLOW_4K", "EXCLUDE_REMUX", "EXCLUDE_BLURAY", "EXCLUDE_CAM",
             "PREFER_WEBDL", "PREFER_HEVC", "MIN_SEEDERS", "MAX_SIZE_GB", "STRICT_NO_CAM",
             "EXCLUDE_UNDERSIZED_RELEASES",
+            "VERIFY_RELEASE_BEFORE_GRAB", "MAX_MOVIE_SIZE_GB", "SERIES_PACK_NAME_REGEX",
             "WEB_PLAYER_MAX_SIZE_GB",
         ],
     },

@@ -37,8 +37,10 @@ class RateLimited(Exception):
     the request permanently failed (and without blacklisting the torrent)."""
 
 
-def _rank(streams, prefer_season_pack: bool = False, override: dict | None = None):
-    return torrentio.rank_streams(streams, prefer_season_pack=prefer_season_pack, override=override)
+def _rank(streams, prefer_season_pack: bool = False, override: dict | None = None,
+          media_kind: str | None = None):
+    return torrentio.rank_streams(streams, prefer_season_pack=prefer_season_pack,
+                                  override=override, media_kind=media_kind)
 
 
 def _movie_runtime_minutes(imdb_id: str) -> float | None:
@@ -84,7 +86,7 @@ def _fetch_movie_candidates(req: MediaRequest) -> list:
             streams.append(s)
     if streams:
         log.info("Combined %d unique streams for movie %s (zilean+torrentio+mediafusion+prowlarr)", len(streams), req.title)
-    return _rank(streams, override=override)
+    return _rank(streams, override=override, media_kind="movie")
 
 
 def _fetch_season_candidates(req: MediaRequest, season: int, episode: int, prefer_season_pack: bool = False) -> list:
@@ -191,9 +193,17 @@ def _try_add_magnet(stream: TorrentioStream, label: str) -> bool:
         return False
 
 
-def _add_best_from(candidates: list, label: str) -> tuple[bool, Optional[TorrentioStream]]:
+def _add_best_from(candidates: list, label: str,
+                   verify: dict | None = None) -> tuple[bool, Optional[TorrentioStream]]:
     """Check cache, try best cached candidate first, fall back to second-best on failure.
     Returns (success, winning_stream).
+
+    `verify`, when set, is a release_sanity context (e.g.
+    {"kind": "movie"} / {"kind": "episode", "season": s, "episode": e, "imdb_id": id}
+    / {"kind": "season_pack", "season": s}). Cached candidates whose actual TorBox
+    files fail that check are dropped BEFORE being added, so a mislabeled pack that
+    shares the imdb_id is never stored or marked success. If every cached candidate
+    is rejected we fall through to the uncached list (and ultimately 'wanted').
     """
     candidates = blacklist.filter_candidates(candidates)
     if not candidates:
@@ -215,6 +225,10 @@ def _add_best_from(candidates: list, label: str) -> tuple[bool, Optional[Torrent
 
     cached = [s for s in candidates if s.info_hash in cached_hashes]
     uncached = [s for s in candidates if s.info_hash not in cached_hashes]
+
+    if verify and cached:
+        import release_sanity
+        cached = release_sanity.filter_cached(cached, label=label, **verify)
 
     if cached:
         log.info("%d/%d candidate(s) cached for %s  -  trying best cached", len(cached), len(candidates), label)
@@ -259,6 +273,9 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
         log.warning("Lazy cache-check failed for %s: %s", req.title, exc)
         return None
     cached = [s for s in torrent_only if s.info_hash in cached_hashes]
+    if cached:
+        import release_sanity
+        cached = release_sanity.filter_cached(cached, kind="movie", label=req.title)
     if not cached:
         # No cached torrents  -  try the best NZB before giving up to wanted.
         nzbs = [s for s in candidates if s.is_usenet and s.nzb_url]
@@ -344,7 +361,7 @@ def _process_movie(req: MediaRequest) -> tuple[bool, Optional[TorrentioStream]]:
         return False, None
 
     try:
-        ok, winner = _add_best_from(candidates, req.title)
+        ok, winner = _add_best_from(candidates, req.title, verify={"kind": "movie"})
     except RateLimited:
         # TorBox quota gone  -  try RealDebrid (no createtorrent limit) before
         # giving up, so we can still serve the title right now.
@@ -468,6 +485,10 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
     # --- Try season pack first ---
     packs = [s for s in pack_candidates if s.is_season_pack and s.info_hash in cached_hashes]
     if packs:
+        import release_sanity
+        packs = release_sanity.filter_cached(
+            packs, kind="season_pack", season=season, label=f"{req.title} S{season:02d} pack")
+    if packs:
         pack = packs[0]
         ep_count = _get_season_episode_count(req.imdb_id, season)
         if ep_count == 0:
@@ -536,6 +557,12 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
                 break
             ep_candidates = [s for s in ep_cands_raw if s.info_hash in ep_cached]
 
+        if ep_candidates:
+            import release_sanity
+            ep_candidates = release_sanity.filter_cached(
+                ep_candidates, kind="episode", season=season, episode=episode,
+                imdb_id=req.imdb_id, label=f"{req.title} S{season:02d}E{episode:02d}")
+
         if not ep_candidates:
             if episode == 1:
                 log.info("Lazy: no cached per-episode for %s S%02dE%02d  -  stopping", req.title, season, episode)
@@ -593,7 +620,8 @@ def _process_season(req: MediaRequest, season: int) -> tuple[bool, Optional[Torr
         log.info("Trying season pack(s) for %s S%02d", req.title, season)
         packs = [s for s in pack_candidates if s.is_season_pack]
         try:
-            ok, winner = _add_best_from(packs, f"{req.title} S{season:02d} pack")
+            ok, winner = _add_best_from(packs, f"{req.title} S{season:02d} pack",
+                                        verify={"kind": "season_pack", "season": season})
         except RateLimited:
             log.info("TorBox rate limited  -  trying RD pack fallback for %s S%02d", req.title, season)
             rd_winner = _try_realdebrid_fallback(
@@ -631,7 +659,11 @@ def _process_season(req: MediaRequest, season: int) -> tuple[bool, Optional[Torr
             log.info("No more episodes returned at S%02dE%02d", season, episode)
             break
         try:
-            ok, winner = _add_best_from(candidates, f"{req.title} S{season:02d}E{episode:02d}")
+            ok, winner = _add_best_from(
+                candidates, f"{req.title} S{season:02d}E{episode:02d}",
+                verify={"kind": "episode", "season": season, "episode": episode,
+                        "imdb_id": req.imdb_id},
+            )
         except RateLimited:
             # TorBox quota gone mid-season  -  try RD for this episode, then stop
             # adding more (leave the rest for the retry queue) to respect quota.

@@ -231,10 +231,17 @@ def rank_streams(
     streams: list[TorrentioStream],
     prefer_season_pack: bool = False,
     override: dict | None = None,
+    media_kind: str | None = None,
 ) -> list[TorrentioStream]:
     """Return streams sorted by preference. Per-show override (dict from DB) can replace
     quality_preference, allow_4k, prefer_hevc on a case-by-case basis. Global filters
-    are pulled live from the settings overlay so the UI can toggle them at runtime."""
+    are pulled live from the settings overlay so the UI can toggle them at runtime.
+
+    media_kind='movie' additionally hard-drops candidates whose name/size obviously
+    cannot be a single film (season/series packs, oversized collections)  -  see
+    release_sanity. Unlike the heuristic filters below this one does NOT fall back
+    to allowing rejected candidates: an empty result sends the movie to 'wanted'
+    rather than latching onto a mislabeled pack that shares the imdb_id."""
     if not streams:
         return []
 
@@ -340,6 +347,25 @@ def rank_streams(
             candidates = filtered
         else:
             log.warning("All candidates match EXCLUDE_LANGUAGES; allowing all")
+
+    if media_kind == "movie":
+        # Mislabeled-pack guard: a single-movie request must never keep a
+        # season/series pack or an oversized collection, even when it shares the
+        # imdb_id. No fallback  -  dropping to [] parks the movie in 'wanted'.
+        import release_sanity
+        kept = []
+        for s in candidates:
+            reason = release_sanity.movie_name_size_reject(f"{s.name} {s.title}", s.size_gb)
+            if reason:
+                log.info("Release sanity: dropping movie candidate %s (%s)", s.info_hash, reason)
+            else:
+                kept.append(s)
+        if len(kept) != len(candidates):
+            log.info("Release sanity: kept %d/%d movie candidate(s) after pack/size filter",
+                     len(kept), len(candidates))
+        candidates = kept
+        if not candidates:
+            return []
 
     def _lang_score(s: TorrentioStream) -> int:
         if not audio_pref:

@@ -648,6 +648,27 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
     if not file_id:
         live = torbox.find_by_id(torbox_id)
         if live:
+            # Backstop for the mislabeled-pack bug: if this torrent's real files
+            # obviously aren't the requested item (a movie request resolving to a
+            # season/complete-series pack, an oversized collection, or no video at
+            # all), refuse rather than guessing a file and serving garbage. The
+            # durable fix is at grab time  -  this only catches items whose bad
+            # hash predates that guard.
+            import release_sanity
+            _kind = ("movie" if item["media_type"] == "movie"
+                     else "episode" if (item.get("season") and item.get("episode"))
+                     else "season_pack")
+            _bad = release_sanity.verify_live_torrent(
+                live, _kind, season=item.get("season"), episode=item.get("episode"),
+                imdb_id=item.get("imdb_id"))
+            if _bad:
+                log.error("Catbox: release sanity rejected torrent %s for %s (%s)  -  "
+                          "keeping .strm, not serving a mislabeled pack",
+                          torbox_id, item["title"], _bad)
+                _fail_put(token, _FAIL_COOLDOWN_SEC)
+                if ckey:
+                    db.update_playability_fail(ckey, REASON_NO_FILE)
+                return None
             import strm_generator
             if item["media_type"] == "movie":
                 main = strm_generator._pick_main_movie_file(live.get("files") or [])

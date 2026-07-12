@@ -251,7 +251,12 @@ def _retry_episode(ep: dict) -> bool:
     # TorBox add is deferred until first playback  -  no quota consumed here.
     if _settings.get("CATBOX_MODE", False):
         cached_hashes = torbox.check_cached([s.info_hash for s in candidates])
-        best = next((s for s in candidates if s.info_hash in cached_hashes), None)
+        cached = [s for s in candidates if s.info_hash in cached_hashes]
+        import release_sanity
+        cached = release_sanity.filter_cached(
+            cached, kind="episode", season=season, episode=episode,
+            imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+        best = cached[0] if cached else None
         if not best:
             log.info("Monitor: no cached release for %s S%02dE%02d  -  still wanted",
                      title, season, episode)
@@ -276,6 +281,13 @@ def _retry_episode(ep: dict) -> bool:
     torrent_hashes = [s.info_hash for s in candidates if not s.is_usenet]
     cached_hashes = torbox.check_cached(torrent_hashes) if torrent_hashes else set()
     cached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes]
+    # Drop any cached torrent whose real TorBox files aren't this episode (e.g. a
+    # full-season/complete-series pack with no identifiable SxxEyy file), so we
+    # don't add a hash that can never materialise this episode.
+    import release_sanity
+    cached_torrents = release_sanity.filter_cached(
+        cached_torrents, kind="episode", season=season, episode=episode,
+        imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
     nzbs = [s for s in candidates if s.is_usenet]
     uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
     ordered = cached_torrents + nzbs + uncached_torrents

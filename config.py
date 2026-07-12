@@ -121,6 +121,54 @@ MIN_SEEDERS = _env_int("MIN_SEEDERS", 3)
 MAX_SIZE_GB = _env_int("MAX_SIZE_GB", 0)
 # Audio language preference (comma-separated codes: nl, en, multi). Empty = no preference.
 AUDIO_LANGUAGE_PREFERENCE = [l.strip().lower() for l in _env("AUDIO_LANGUAGE_PREFERENCE", "").split(",") if l.strip()]
+
+# ── Release sanity check (mislabeled-pack guard) ──────────────────────────────
+# When a requested title has no *properly* cached release, TorBox can still
+# report a cache HIT on a hash that shares the imdb_id but is obviously not the
+# requested single movie/episode  -  the classic case is a single-movie request
+# latching onto a 525 GB "Complete Series" pack that happens to carry the same
+# imdb_id (TMDB original_title collisions, e.g. "2099: The Soldier Protocol"
+# scraping as "The.Wheel.2019.*"). Grabbing it marks the request success while
+# playback 404s. These knobs let the pipeline reject such candidates at grab
+# time so a wrong hash is never stored or marked success.
+#
+# A single movie whose total (or main-file) size exceeds this is almost always a
+# pack/collection, not one film. 0 disables the size check.
+#
+# Default 100 (not ~25): this library holds many single 4K/2160p movies that
+# legitimately run 25-90 GB (a 4K WEB-DL or upscaled remux of a long film), so a
+# 25 GB cap flags hundreds of real movies. Multi-hundred-GB series packs and
+# movie collections (the "525 GB Star Trek Complete Series" incident) sit well
+# above 100 GB, and pack-NAMED collections are caught by SERIES_PACK_NAME_REGEX
+# at any size, so 100 GB is the size backstop for packs with an innocent name.
+MAX_MOVIE_SIZE_GB = _env_float("MAX_MOVIE_SIZE_GB", 100.0)
+# Release names matching this regex are season/series/multi-title packs, never a
+# single movie. Deliberately narrow (requires a digit/range/plural or an
+# unambiguous multi-title word next to the pack word) so single films like
+# "A Complete Unknown", "Season of the Witch" or "Seven Samurai (Criterion
+# Collection)" are NOT caught. Empty disables it.
+SERIES_PACK_NAME_REGEX = _env(
+    "SERIES_PACK_NAME_REGEX",
+    r"(?:"
+    r"complete[\s._-]*(?:series|collection|seasons?|set|pack|saga|anthology)"
+    r"|complete[\s._-]*(?:tv[\s._-]*)?show"
+    r"|\bseasons\b"
+    r"|\bseason[\s._-]*\d{1,2}[\s._-]*[-–][\s._-]*\d{1,2}\b"
+    r"|\bseason[\s._-]*\d{1,2}\b"
+    r"|\bs\d{1,2}[\s._-]*[-–][\s._-]*s?\d{1,2}\b"
+    r"|\b\d{1,2}[\s._-]*[-–][\s._-]*\d{1,2}[\s._-]*seasons?\b"
+    r"|\b(?:tri|du|quadri|penta|hexa)logy\b"
+    r"|\b\d{1,3}[\s._-]*(?:movie|film)s?[\s._-]*(?:collection|pack|set|anthology)\b"
+    r"|\b\d{2,3}[\s._-]*(?:movies|films)\b"
+    r"|\bmega[\s._-]*pack\b"
+    r"|\bbox[\s._-]?set\b"
+    r"|\ball[\s._-]*\d{1,2}[\s._-]*(?:movies|films)\b"
+    r")",
+)
+# When true, verify a chosen (usually cached) release actually resolves to a
+# sane single video file that matches the request before writing its .strm and
+# marking success. When nothing sane is cached the title stays 'wanted' instead.
+VERIFY_RELEASE_BEFORE_GRAB = _env("VERIFY_RELEASE_BEFORE_GRAB", "true").lower() in ("1", "true", "yes")
 # Languages to hard-block (comma-separated codes, e.g. ru). Torrents detected as
 # exclusively in a blocked language are filtered out before sorting.
 EXCLUDE_LANGUAGES = [l.strip().lower() for l in _env("EXCLUDE_LANGUAGES", "").split(",") if l.strip()]
