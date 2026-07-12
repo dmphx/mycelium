@@ -659,10 +659,16 @@ def upsert_wanted_episode(imdb_id: str, tmdb_id: int | None, title: str,
 
 def get_wanted_episodes(max_attempts: int = 10) -> list[dict]:
     with _connect() as conn:
+        # Order by fewest attempts then newest air date so the monitor grab loop
+        # reaches never-tried and recently-aired episodes first. A title/season
+        # ordering buried every ongoing show's newest episode at the back of a
+        # ~290k-row queue that a single pass never finishes, so new episodes were
+        # never grabbed. Un-gettable back-catalog (high attempt_count) sinks to
+        # the back instead of starving the front every cycle.
         rows = conn.execute(
             """SELECT * FROM wanted_episodes
                WHERE status='wanted' AND attempt_count < ?
-               ORDER BY title, season, episode""",
+               ORDER BY attempt_count ASC, air_date DESC""",
             (max_attempts,),
         ).fetchall()
         return [dict(r) for r in rows]
