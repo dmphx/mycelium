@@ -1740,6 +1740,45 @@ import cachetools as _cachetools
 _spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=86400)
 _spore_probing: set  = set()  # tokens currently running a background probe
 
+# One playback session reopens the source several times a minute (seek, transcode
+# restart, client reconnect), so an unconditional liveness check would spend a CDN
+# round trip re-confirming a link it confirmed moments ago.
+_ALIVE_CHECK_TTL_SEC = 120
+_spore_alive_cache: "_cachetools.TTLCache[str, bool]" = _cachetools.TTLCache(
+    maxsize=10000, ttl=_ALIVE_CHECK_TTL_SEC
+)
+
+# Only these mean the link itself is no longer valid, which is the single case
+# where re-resolving yields a working URL. Everything else, a 429 above all, keeps
+# the cached URL: TorBox hands back the same URL, so re-resolving a live-but-
+# throttled link doubles the request rate that is feeding the throttle. Same split
+# as spore-nfs's errRateLimited.
+_CDN_DEAD_STATUSES = frozenset({400, 401, 403, 404, 410})
+
+
+def _cdn_url_alive(cdn_url: str) -> bool:
+    """Confirm a cached CDN link still resolves, memoised for _ALIVE_CHECK_TTL_SEC.
+
+    Only an explicit link-invalid status counts as dead. A 429, a transient 5xx or
+    a HEAD that never answered are not evidence the link expired, so they keep the
+    URL and stay uncached, leaving the next request to re-check.
+    """
+    if cdn_url in _spore_alive_cache:
+        return True
+    import requests as _req
+    try:
+        head = _req.head(cdn_url, timeout=5, allow_redirects=True)
+    except Exception as exc:
+        log.warning("spore-stream: liveness HEAD did not answer, assuming alive: %s", exc)
+        return True
+    if head.status_code in _CDN_DEAD_STATUSES:
+        return False
+    if head.status_code >= 400:
+        log.info("spore-stream: CDN status=%d, url is live but busy", head.status_code)
+        return True
+    _spore_alive_cache[cdn_url] = True
+    return True
+
 # Per-CDN-fetch chunk size. TorBox's CDN rate-limits per *request*, so fetching
 # in large gulps (vs many small ones) keeps a single transcode — which reads the
 # file in bursts — under the per-file limit. 16 MiB cuts request count ~8x vs the
@@ -2061,6 +2100,18 @@ def spore_stream_proxy(token: str):
             log.info("spore-stream: token=%s triggering background probe", token)
         if info["ftyp_size"] == 0:
             # Non-MP4 sentinel (MKV/other): 302 to CDN, no moov seeking required.
+            # The URL cache holds a link for up to 23h but TorBox retires them
+            # sooner, and a 302 hands the client a link we never get to revalidate:
+            # the MP4 path proxies through mp4_faststart and recovers, this one
+            # leaves ffmpeg following a redirect into an error page. Confirm the
+            # link resolves before pointing a client at it.
+            if not _cdn_url_alive(cdn_url):
+                log.warning("spore-stream: cached CDN url dead for token=%s, re-resolving", token)
+                catbox.invalidate_url_cache(token)
+                fresh = catbox.materialize(token)
+                if not fresh:
+                    abort(502)
+                cdn_url = fresh
             _spore_cold_sizes.pop(token, None)
             log.info("spore-stream: token=%s non-MP4 sentinel, 302 to CDN", token)
             return redirect(cdn_url, code=302)
