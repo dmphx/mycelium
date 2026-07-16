@@ -157,6 +157,26 @@ def _content_key(item: dict) -> str | None:
     return imdb_id
 
 
+_TOUCH_DEBOUNCE_SEC = 60  # the last_played/play_count precision we actually need
+_touch_cache: "cachetools.TTLCache[str, bool]" = cachetools.TTLCache(
+    maxsize=10000, ttl=_TOUCH_DEBOUNCE_SEC
+)
+_touch_cache_lock = threading.Lock()
+
+
+def _touch_debounced(token: str) -> None:
+    """db.touch_virtual_item() is a synchronous UPDATE + commit, and materialize's
+    cache-hit path runs on every byte-range request, so one viewer fires dozens a
+    minute. SQLite takes one writer at a time, so under concurrent playback those
+    writes serialize against every other session's. play_count/last_played do not
+    need per-chunk precision."""
+    with _touch_cache_lock:
+        if token in _touch_cache:
+            return
+        _touch_cache[token] = True
+    db.touch_virtual_item(token)
+
+
 def _cache_get(token: str) -> str | None:
     with _url_cache_lock:
         entry = _url_cache.get(token)
@@ -223,7 +243,7 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
     """
     cached = _cache_get(token)
     if cached:
-        db.touch_virtual_item(token)
+        _touch_debounced(token)
         return cached
 
     # Respect failure cooldown  -  don't spam TorBox after a recent failed attempt.
@@ -237,7 +257,7 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
         # Re-check inside the lock: another thread may have succeeded or set cooldown.
         cached = _cache_get(token)
         if cached:
-            db.touch_virtual_item(token)
+            _touch_debounced(token)
             return cached
         if _fail_get(token):
             return None
