@@ -32,6 +32,12 @@ os.environ.setdefault("MEDIA_PATH", "/tmp/mycelium-test-media")
 os.environ.setdefault("SPORE_MEDIA_PATH", "/tmp/mycelium-test-spore")
 os.environ.setdefault("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
 os.environ.setdefault("SPORE_ENABLED", "true")
+# app.py heeft een startup-gate die sys.exit(1) doet als er geen auth-methode is
+# geconfigureerd. test_cdn_liveness.py importeert app, dus die ack moet hier staan
+# en niet in die testmodule zelf: cfg.INSECURE_ALLOW_ANON wordt gebonden zodra de
+# eerste testmodule config importeert, en dat is (alfabetisch) ruim voor
+# test_cdn_liveness aan de beurt is. Zelfde valkuil als hierboven beschreven.
+os.environ.setdefault("INSECURE_ALLOW_ANON", "true")
 
 # Repo-root op sys.path zodat strm_generator en co. importeerbaar zijn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
