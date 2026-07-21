@@ -247,3 +247,100 @@ def test_movie_still_caught_when_no_filelist():
         "files": [],
     }
     assert release_sanity.verify_entry(entry, "movie") is not None
+
+
+# ── partial packs that name their own episode span ────────────────────────────
+# The live miss this class was added for: American Dad! S22E10/E11 (both aired
+# the same night) each latched onto one Russian multi-dub torrent holding only
+# episodes 1-7. files=0, and the Cyrillic name defeats _file_episode, so nothing
+# rejected it; Plex then dropped both because the NFS read could resolve no file.
+
+_RU_PARTIAL = ("Американский папаша!  American Dad!  Сезон 22  Серии 1-7 из 22 "
+               "[2026, WEB-DL 1080p] MVO (TVShows) + MVO (LE-Production) + Original + Sub (Eng)")
+
+
+def test_partial_pack_outside_declared_span_rejected():
+    entry = {"name": _RU_PARTIAL, "size": 5 * GB, "files": []}
+    reason = release_sanity.verify_entry(entry, "episode", season=22, episode=10,
+                                         imdb_id="tt0397306")
+    assert reason and "declares episodes 1-7" in reason
+
+
+def test_partial_pack_inside_declared_span_accepted():
+    entry = {"name": _RU_PARTIAL, "size": 5 * GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=22, episode=3,
+                                       imdb_id="tt0397306") is None
+
+
+def test_latin_episode_span_forms():
+    for name, wanted, blocked in (
+        ("Show Season 4 Episodes 1-7 1080p WEB-DL", 3, 10),
+        ("Show S04 Eps 1 to 7 1080p", 3, 10),
+        # A declared span outranks the first SxxExx token: this one holds E03
+        # even though _file_episode reads the name as "S04E01".
+        ("Show S04E01-E07 1080p WEB-DL", 3, 10),
+    ):
+        entry = {"name": name, "size": 5 * GB, "files": []}
+        assert release_sanity.verify_entry(entry, "episode", season=4,
+                                           episode=wanted) is None, name
+        assert release_sanity.verify_entry(entry, "episode", season=4,
+                                           episode=blocked), name
+
+
+def test_full_pack_naming_one_episode_still_accepted():
+    # "Complete Series" + a lone "Episode 1" is a full pack advertising where it
+    # starts, not a one-episode release  -  too ambiguous to reject on.
+    entry = {"name": "Show Complete Series Episode 1 onwards 1080p", "size": 40 * GB,
+             "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=2, episode=9) is None
+
+
+def test_span_spelled_with_absolute_numbers_accepted(monkeypatch):
+    # Some packs number across the whole series. S22E10 of American Dad! is
+    # absolute 401, so a "395-405" pack does hold it even though 10 is outside.
+    # numbering is stubbed so this does not depend on the live numbering cache.
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: 401))
+    entry = {"name": "American Dad! Episodes 395-405 1080p WEB-DL", "size": 8 * GB,
+             "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=22, episode=10,
+                                       imdb_id="tt0397306") is None
+
+
+# The three false positives a sweep of 20k real TorBox names turned up. Each
+# name below is real; all three would have caused NEW wrong rejections/accepts.
+
+def test_absolute_number_field_is_not_a_span():
+    # "S07E13 - 246 - Marry Me": the 246 is an absolute-episode field, not a
+    # range end. Reading it as 13-246 would wave through every wrong episode.
+    entry = {"name": "Gunsmoke - S07E13 - 246 - Marry Me.avi", "size": GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=7, episode=13) is None
+    reason = release_sanity.verify_entry(entry, "episode", season=7, episode=20)
+    assert reason and "not S07E20" in reason
+
+
+def test_lone_episode_number_does_not_outrank_tag():
+    # "S03E04 ... Episode 28": 28 is the absolute number. The SxxExx tag wins,
+    # so the correct file is still accepted for S03E04.
+    entry = {"name": "One-Punch.Man.S03E04.Episode.28.1080p.AMZN.WEB-DL.mkv",
+             "size": GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=3, episode=4) is None
+
+
+def test_discontinuous_run_keeps_its_upper_bound():
+    # "Серии 1-31, 33-77 из 78" really does hold episode 50; reading only the
+    # first run (1-31) would reject it.
+    entry = {"name": "Шоу Тома и Джерри  The Tom and Jerry Show  Сезон 3  "
+                     "Серии 1-31, 33-77 из 78 [WEB-DL 1080p]", "size": 20 * GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=3, episode=50) is None
+    assert release_sanity.verify_entry(entry, "episode", season=3, episode=90)
+
+
+def test_span_reject_survives_unavailable_numbering(monkeypatch):
+    # No absolute number available (offline / uncached): the season-relative
+    # episode alone still decides, so the partial pack is still rejected.
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: None))
+    entry = {"name": _RU_PARTIAL, "size": 5 * GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=22, episode=10,
+                                       imdb_id="tt0397306")

@@ -56,6 +56,37 @@ _DEFAULT_PACK_REGEX = (
     r")"
 )
 
+# Some release names spell out exactly which episodes they carry:
+# "Серии 1-7 из 22" (RU, "episodes 1-7 of 22"), "Episodes 1-7", "E01-E07".
+# That PARTIAL pack is the one pack shape which genuinely does NOT hold every
+# episode of its season, so it needs a rule of its own  -  the generic pack-name
+# pattern above deliberately accepts packs (see _verify_episode) and waves it
+# through. The dash class is built with chr() so no literal en/em dash sits in
+# this source file; release names in the wild use all three.
+_EP_DASHES = "-" + chr(0x2013) + chr(0x2014)  # hyphen, en dash, em dash
+_DASH = "[" + _EP_DASHES + "]"
+# One episode number or a run of them: "5", "1-7", "1 to 7", "1-31, 33-77".
+# Discontinuous runs are read whole so a gap-listing pack keeps its real upper
+# bound ("Серии 1-31, 33-77 из 78" must not read as merely 1-31).
+_EP_RUN = (r"\d{1,3}(?:\s*(?:" + _DASH + r"|to)\s*\d{1,3})?"
+           r"(?:\s*,\s*\d{1,3}(?:\s*(?:" + _DASH + r"|to)\s*\d{1,3})?)*")
+_EP_SPAN_RES = (
+    # Cyrillic "Серия/Серии/Серий 1-7"; a trailing "из 22" (of 22) is the season
+    # total, so the run stops before it.
+    re.compile(r"сери[ияй][\s._]*(" + _EP_RUN + r")", re.IGNORECASE),
+    # "Episodes 1-7", "Eps 1 to 7", "Ep 5"
+    re.compile(r"\bep(?:isode)?s?[\s._]*(" + _EP_RUN + r")", re.IGNORECASE),
+    # "S04E01-E07": an E on both ends, so spacing around the dash is safe. The
+    # lookbehind allows the season digits before it while still keeping the
+    # pattern from firing mid-word ("Se7en", "The01").
+    re.compile(r"(?<![a-z])e(\d{1,3})[\s._]*" + _DASH + r"[\s._]*e(\d{1,3})\b",
+               re.IGNORECASE),
+    # "S05E09-10": bare second number, so the dash must be TIGHT. Loose spacing
+    # here reads "Gunsmoke - S07E13 - 246 - Marry Me.avi" as episodes 13-246,
+    # which would wave through every wrong-episode request for that file.
+    re.compile(r"(?<![a-z])e(\d{1,3})" + _DASH + r"(\d{1,3})\b", re.IGNORECASE),
+)
+
 # Compiled-regex cache keyed on the pattern string so a per-candidate call does
 # not recompile the (non-trivial) pack regex thousands of times in a sweep.
 _pack_re_cache: dict[str, "re.Pattern | None"] = {}
@@ -109,6 +140,64 @@ def name_looks_like_pack(name: str) -> bool:
         return False
     _, pack_re = _cfg()
     return bool(pack_re and pack_re.search(name))
+
+
+def _declared_episode_span(name: str) -> tuple[int, int] | None:
+    """(first, last) episode numbers a release name explicitly claims, or None.
+
+    A bare single number yields (n, n). A span that runs backwards or starts
+    below 1 is treated as a misparse and ignored.
+    """
+    if not name:
+        return None
+    for rx in _EP_SPAN_RES:
+        m = rx.search(name)
+        if not m:
+            continue
+        groups = [g for g in m.groups() if g]
+        if not groups:
+            continue
+        # Word-form patterns capture the whole run as one string ("1-31, 33-77");
+        # the ExxEyy forms capture the two endpoints. Min/max spans both, and a
+        # gap inside a discontinuous run resolves toward accepting.
+        nums = [int(n) for n in re.findall(r"\d{1,3}", " ".join(groups))]
+        if not nums or min(nums) < 1:
+            continue
+        return min(nums), max(nums)
+    return None
+
+
+def _absolute_episode(imdb_id: str | None, season: int, episode: int) -> int | None:
+    """Series-absolute number for S<season>E<episode>, or None if unavailable."""
+    try:
+        import numbering
+        return numbering.to_absolute(imdb_id, int(season), int(episode))
+    except Exception:
+        return None
+
+
+def _span_reject(span: tuple[int, int], top_name: str, season: int, episode: int,
+                 imdb_id: str | None) -> str | None:
+    """Reject a pack whose NAME declares an episode span missing the requested
+    episode ("Сезон 22 Серии 1-7 из 22" grabbed for S22E10).
+
+    Compared against absolute numbering too, since some packs number episodes
+    across the whole series rather than per season. A single declared number in
+    an otherwise pack-named release is too ambiguous to act on ("Complete Series
+    Episode 1" is a full pack), so only a real span rejects in that case.
+    """
+    lo, hi = span
+    if lo == hi and name_looks_like_pack(top_name):
+        return None
+    wanted = [int(episode)]
+    absolute = _absolute_episode(imdb_id, season, episode)
+    if absolute:
+        wanted.append(int(absolute))
+    if any(lo <= n <= hi for n in wanted):
+        return None
+    declared = f"episode {lo}" if lo == hi else f"episodes {lo}-{hi}"
+    return (f"name declares {declared}, not E{int(episode):02d} "
+            f"({_short(top_name)})")
 
 
 def movie_name_size_reject(name: str, size_gb: float) -> str | None:
@@ -219,22 +308,33 @@ def _verify_episode(entry: dict, season: int | None, episode: int | None,
         # find_by_id (full file list). Rejecting on pack-name alone would wrongly
         # kill every episode served from a cached season pack.
         if season is not None and episode is not None:
+            # One exception to "a pack is fine": a pack that names its own
+            # episode span is PARTIAL, so an episode outside that span really is
+            # absent and find_by_id will never resolve it.
+            span = _declared_episode_span(top_name)
             tag = strm_generator._file_episode(top_name)
-            if tag and tag != (int(season), int(episode)):
-                return (f"single file tags S{tag[0]:02d}E{tag[1]:02d}, "
-                        f"not S{int(season):02d}E{int(episode):02d}")
+            # A real RANGE is the most specific thing the name states, so it
+            # outranks the tag: "S04E01-E07" does hold E03 even though
+            # _file_episode reads that name as S04E01. A LONE number does not  -
+            # it is usually an absolute number printed next to the real tag, as
+            # in "One-Punch.Man.S03E04.Episode.28", where trusting it over the
+            # tag would reject the correct file.
+            if span and span[0] < span[1]:
+                return _span_reject(span, top_name, int(season), int(episode), imdb_id)
+            if tag:
+                if tag != (int(season), int(episode)):
+                    return (f"single file tags S{tag[0]:02d}E{tag[1]:02d}, "
+                            f"not S{int(season):02d}E{int(episode):02d}")
+                return None
+            if span:
+                return _span_reject(span, top_name, int(season), int(episode), imdb_id)
         return None
 
     # Multi-file pack: require the specific episode file to be identifiable.
     if season is None or episode is None:
         return None
     norm = _entry_files(entry)
-    absolute = None
-    try:
-        import numbering
-        absolute = numbering.to_absolute(imdb_id, int(season), int(episode))
-    except Exception:
-        absolute = None
+    absolute = _absolute_episode(imdb_id, season, episode)
     main = strm_generator._pick_episode_file(norm, int(season), int(episode), absolute=absolute)
     if not main:
         return (f"season/series pack with no identifiable "

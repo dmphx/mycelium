@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import date
 
+import blacklist
 import db
 import seerr
 import tmdb
@@ -242,6 +243,10 @@ def _retry_episode(ep: dict) -> bool:
             streams.append(s)
 
     candidates = torrentio.rank_streams(streams)
+    # Drop hashes already known to fail. processor.py filters at every grab site;
+    # this path did not, so a hash blacklisted after a bad grab was re-picked on
+    # the very next retry and the episode re-broke the same way indefinitely.
+    candidates = blacklist.filter_candidates(candidates)
     if not candidates:
         log.info("Monitor: no acceptable candidates for %s S%02dE%02d (still wanted)",
                  title, season, episode)
