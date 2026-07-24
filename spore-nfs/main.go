@@ -42,6 +42,11 @@ var (
 	stubRoot     = envOr("SPORE_STUB_ROOT", "/data/plex-media")
 	fshRoot      = envOr("SPORE_FSH_ROOT", stubRoot+"/.fsh")
 	treeTTL      = envDurSecOr("SPORE_TREE_TTL_SEC", 300*time.Second)
+	// Until the first non-empty tree loads, refresh retries every startupRetryTTL
+	// (not treeTTL): on a cold start spore-nfs can beat mycelium's gunicorn up, so
+	// the initial refresh fails and an empty tree must be retried fast -- otherwise
+	// Plex could see an empty library for a full treeTTL.
+	startupRetryTTL = 10 * time.Second
 	httpClient   = &http.Client{Timeout: 30 * time.Second}
 )
 
@@ -1234,9 +1239,18 @@ func main() {
 	// that gave up mounting after an empty first listing. Re-seed handles
 	// after every refresh so newly added paths are resolvable.
 	go func() {
-		ticker := time.NewTicker(treeTTL)
-		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			// Steady-state cadence is treeTTL, but keep retrying every startupRetryTTL
+			// until the tree is non-empty so a cold-start race with gunicorn recovers
+			// fast instead of waiting a full treeTTL.
+			t.mu.RLock()
+			ready := len(t.byPath) > 0
+			t.mu.RUnlock()
+			if ready {
+				time.Sleep(treeTTL)
+			} else {
+				time.Sleep(startupRetryTTL)
+			}
 			t.refresh()
 			handler.syncFromTree(t)
 		}
