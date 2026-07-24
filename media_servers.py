@@ -35,6 +35,11 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+import re
+# Matches a Jellyfin/Plex 'Season NN' folder so targeted scans can be scoped to
+# the season rather than the whole (possibly 1000-episode) show.
+_SEASON_RE = re.compile(r"^Season \d+$", re.IGNORECASE)
+
 
 def _cfg(key, default=""):
     if settings is not None:
@@ -72,13 +77,25 @@ _timer = None
 
 
 def _top_folder(strm_path):
-    """Return ('series'|'movies', '<top folder>') for a .strm under MEDIA_PATH, else None."""
+    """Return ('series'|'movies', '<scan folder>') for a .strm under MEDIA_PATH, else None.
+
+    For series, scope the targeted scan to the SEASON folder (e.g. \"One Piece/Season 14\")
+    instead of the whole show. A single new/changed episode otherwise makes Jellyfin and
+    Plex refresh the ENTIRE series; on 1000-episode anime (One Piece, Bleach, Naruto
+    Shippuden) that full-series refresh recreates+removes a phantom \"Season Unknown\",
+    removes+re-adds episodes, pegs Jellyfin CPU, and runs >15s so the /Library/Media/Updated
+    POST times out (the 'Unexpected end of request content' errors). Season scope keeps the
+    refresh to one season. Falls back to the show folder for movies and flat (no 'Season NN')
+    layouts; the periodic full-refresh backstop still catches anything a narrower scan misses.
+    """
     try:
         parts = Path(strm_path).relative_to(Path(MEDIA_PATH)).parts
     except Exception:
         return None
     if len(parts) < 2 or parts[0] not in ("series", "movies"):
         return None
+    if parts[0] == "series" and len(parts) >= 4 and _SEASON_RE.match(parts[2]):
+        return ("series", "%s/%s" % (parts[1], parts[2]))
     return (parts[0], parts[1])
 
 
@@ -172,9 +189,12 @@ def _scan_jellyfin(updates):
 def _plex_api_scan(section, plex_path):
     """Trigger a Plex partial scan of one folder over the HTTP API.
 
-    Returns True when the scan was attempted (PLEX_URL + PLEX_TOKEN configured),
-    so the caller skips the host-queue fallback; returns False when no Plex creds
-    are set. A partial scan re-reads changed files, so a stub rewritten with a
+    Returns True only when Plex actually accepted the scan, so the caller skips the
+    host-queue fallback; returns False when no Plex creds are set OR when the request
+    failed/was rejected, letting the caller queue the folder for plex_targeted_scan.sh
+    (Scanner CLI, no token needed). Reporting an HTTP failure as success used to
+    silently disable that fallback whenever the token went stale.
+    A partial scan re-reads changed files, so a stub rewritten with a
     corrected codec updates Plex's cached media info."""
     url   = _cfg("PLEX_URL", "")
     token = _cfg("PLEX_TOKEN", "")
@@ -185,13 +205,15 @@ def _plex_api_scan(section, plex_path):
                             params={"path": plex_path, "X-Plex-Token": token},
                             timeout=15)
         if resp.status_code >= 400:
-            log.warning("Plex API scan HTTP %s for %s", resp.status_code, plex_path)
-        else:
-            log.info("Plex API partial scan: section %s path %s", section, plex_path)
+            log.warning("Plex API scan HTTP %s for %s; falling back to host scan queue",
+                        resp.status_code, plex_path)
+            return False
+        log.info("Plex API partial scan: section %s path %s", section, plex_path)
+        return True
     except Exception as exc:
-        log.warning("Plex API scan failed for %s (%s); periodic refresh backstop will catch it",
+        log.warning("Plex API scan failed for %s (%s); falling back to host scan queue",
                     plex_path, exc)
-    return True
+        return False
 
 
 def _queue_plex(lines):

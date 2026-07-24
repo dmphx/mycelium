@@ -41,7 +41,7 @@ var (
 	listenAddr   = envOr("LISTEN_ADDR", ":2049")
 	stubRoot     = envOr("SPORE_STUB_ROOT", "/data/plex-media")
 	fshRoot      = envOr("SPORE_FSH_ROOT", stubRoot+"/.fsh")
-	treeTTL      = 10 * time.Second
+	treeTTL      = envDurSecOr("SPORE_TREE_TTL_SEC", 300*time.Second)
 	httpClient   = &http.Client{Timeout: 30 * time.Second}
 )
 
@@ -63,6 +63,18 @@ func envOrInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
+		}
+	}
+	return def
+}
+
+// envDurSecOr reads an integer number of seconds from env var k and returns it
+// as a Duration, or def when unset/invalid. Lets the tree-refresh cadence be
+// tuned without a rebuild (SPORE_TREE_TTL_SEC).
+func envDurSecOr(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
 		}
 	}
 	return def
