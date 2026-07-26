@@ -1,15 +1,42 @@
+import importlib.util
 import os
 import sys
 
 os.environ.setdefault("TORBOX_API_KEY", "test")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-sys.modules.pop("settings", None)
-
 import pytest
 
-import db
-import settings
+
+def _load_real(name, extra_deps=None):
+    """Load a fresh real module from source, isolated from the MagicMocks that
+    conftest.py installs in sys.modules for the strm_generator test group.
+
+    conftest replaces db + settings (among others) with MagicMocks. These tests
+    need the REAL pair (settings.get() must round-trip through SQLite), but must
+    not leave the real modules in sys.modules where a later-collected strm test
+    would bind to them. So the real deps are exposed in sys.modules only while
+    `name`'s body executes, then the mocks are restored.
+    """
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(__file__), "..", name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    inject = {name: mod, **(extra_deps or {})}
+    saved = {k: sys.modules.get(k) for k in inject}
+    sys.modules.update(inject)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = prev
+    return mod
+
+
+db = _load_real("db")
+settings = _load_real("settings", extra_deps={"db": db})
 
 
 @pytest.fixture(autouse=True)
