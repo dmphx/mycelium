@@ -71,6 +71,15 @@ def _token_lock(token: str) -> threading.Lock:
 _RATE_LIMIT_WAIT_DEFAULT = 5.0   # used when the server sends no usable hint
 _RATE_LIMIT_WAIT_CAP     = 10.0  # never sleep longer than this on one 429
 _MAX_RATE_WAITS          = 5     # ~ up to 5 paced retries before giving up
+# serve_bytes() calls _get() inline on a live gunicorn request thread while
+# streaming a Plex response, and gunicorn runs only a handful of threads for
+# the whole app (see Dockerfile --threads). At the full budget a sustained
+# 429 could pin one of those threads for up to _MAX_RATE_WAITS x
+# _RATE_LIMIT_WAIT_CAP (~50s), starving other requests. build_and_cache()'s
+# calls run backgrounded and can afford to wait it out, so the 429 wait
+# budget is caller-tunable and the live paths pass this much smaller one:
+# one paced wait, then give up and let the client re-request the range.
+_LIVE_REQUEST_MAX_RATE_WAITS = 1
 
 
 def init(cache_dir: str | Path) -> None:
@@ -176,7 +185,8 @@ def _find_box_in(data: bytes, typ: bytes) -> int:
 
 # ── Fetch + cache ─────────────────────────────────────────────────────────────
 
-def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
+def _get(url: str, start: int, end: int, tries: int = 4,
+         rate_waits_max: int | None = None) -> bytes:
     """Fetch CDN bytes [start, end] inclusive, *validated*.
 
     The naive version returned whatever the CDN sent — including a 500 error
@@ -198,11 +208,12 @@ def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
     count = end - start + 1
     if count <= 0:
         return b""
+    rw_max = _MAX_RATE_WAITS if rate_waits_max is None else rate_waits_max
     buf = bytearray()
     attempts = 0
     rate_waits = 0
     rounds = 0
-    max_rounds = tries + _MAX_RATE_WAITS + 16
+    max_rounds = tries + rw_max + 16
     while len(buf) < count:
         rounds += 1
         if rounds > max_rounds:
@@ -226,8 +237,8 @@ def _get(url: str, start: int, end: int, tries: int = 4) -> bytes:
                     or resp.headers.get("Retry-After")
                 resp.close()
                 rate_waits += 1
-                if rate_waits > _MAX_RATE_WAITS:
-                    raise SporeFetchError("CDN rate-limited (429) — gave up after waiting")
+                if rate_waits > rw_max:
+                    raise SporeFetchError("CDN rate-limited (429), gave up after waiting")
                 wait = _RATE_LIMIT_WAIT_DEFAULT
                 if hint:
                     try:
@@ -520,14 +531,18 @@ def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int) -> bytes:
         out += header[pos : chunk_end + 1]
         pos = chunk_end + 1
 
-    # Region 2: mdat1 (before moov in CDN) — cdn = virtual - moov_size
+    # Region 2: mdat1 (before moov in CDN), cdn = virtual - moov_size.
+    # serve_bytes runs inline on a live request thread, so cap the 429 wait
+    # budget (see _LIVE_REQUEST_MAX_RATE_WAITS) instead of holding the thread.
     if pos <= v_end and pos < mdat2_start:
         chunk_end = min(v_end, mdat2_start - 1)
-        out += _get(cdn_url, pos - moov_size, chunk_end - moov_size)
+        out += _get(cdn_url, pos - moov_size, chunk_end - moov_size,
+                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS)
         pos = chunk_end + 1
 
-    # Region 3: mdat2 (after moov in CDN) — cdn = virtual
+    # Region 3: mdat2 (after moov in CDN), cdn = virtual
     if pos <= v_end:
-        out += _get(cdn_url, pos, v_end)
+        out += _get(cdn_url, pos, v_end,
+                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS)
 
     return bytes(out)
