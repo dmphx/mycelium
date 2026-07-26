@@ -39,7 +39,15 @@ class SporeFetchError(Exception):
     Raised instead of silently returning wrong/partial bytes, so callers can
     re-materialize a fresh CDN URL and retry rather than streaming garbage
     (misaligned bytes) into FFmpeg's decoder.
+
+    `status` carries the CDN's HTTP status when one was received, so callers
+    can tell a retired URL (400/403/404: invalidate and re-resolve) from a
+    throttled one (429: the same URL is fine, re-resolving amplifies load).
     """
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT    = 60
@@ -238,7 +246,9 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                 resp.close()
                 rate_waits += 1
                 if rate_waits > rw_max:
-                    raise SporeFetchError("CDN rate-limited (429), gave up after waiting")
+                    raise SporeFetchError(
+                        "CDN rate-limited (429), gave up after waiting", status=429
+                    )
                 wait = _RATE_LIMIT_WAIT_DEFAULT
                 if hint:
                     try:
@@ -260,7 +270,7 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                 )
             if sc not in (200, 206):
                 resp.close()
-                raise SporeFetchError(f"CDN HTTP {sc}")
+                raise SporeFetchError(f"CDN HTTP {sc}", status=sc)
             got_before = len(buf)
             for chunk in resp.iter_content(1 << 17):
                 if chunk:

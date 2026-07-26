@@ -2022,6 +2022,16 @@ def spore_stream_proxy(token: str):
                     # A stale/expired CDN URL or a TorBox hiccup: re-materialize a
                     # fresh URL once and retry this chunk before giving up, so a
                     # transient failure doesn't truncate the stream mid-playback.
+                    # A 429 is the exception: the URL is alive but throttled, and
+                    # re-resolving returns the same URL while doubling the request
+                    # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
+                    if getattr(exc, "status", None) == 429:
+                        log.warning("spore-stream cold proxy: throttled pos=%d token=%s: %s",
+                                    pos, token, exc)
+                        break
+                    # materialize() consults the same URL cache the stale URL came
+                    # from; drop the entry first or it hands the dead URL back.
+                    catbox.invalidate_url_cache(token)
                     fresh = catbox.materialize(token)
                     if fresh and fresh != url_ref:
                         url_ref = fresh
@@ -2147,6 +2157,16 @@ def spore_stream_proxy(token: str):
                 # Re-materialize a fresh CDN URL once (handles mid-stream URL
                 # expiry / transient TorBox errors) and retry before giving up,
                 # rather than truncating the response or serving garbage.
+                # A 429 is the exception: the URL is alive but throttled, and
+                # re-resolving returns the same URL while doubling the request
+                # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
+                if getattr(exc, "status", None) == 429:
+                    log.warning("spore-stream proxy: throttled v=%d token=%s: %s",
+                                pos, token, exc)
+                    break
+                # materialize() consults the same URL cache the stale URL came
+                # from; drop the entry first or it hands the dead URL back.
+                catbox.invalidate_url_cache(token)
                 fresh = catbox.materialize(token)
                 if fresh and fresh != url_ref:
                     url_ref = fresh
