@@ -81,13 +81,18 @@ _RATE_LIMIT_WAIT_CAP     = 10.0  # never sleep longer than this on one 429
 _MAX_RATE_WAITS          = 5     # ~ up to 5 paced retries before giving up
 # serve_bytes() calls _get() inline on a live gunicorn request thread while
 # streaming a Plex response, and gunicorn runs only a handful of threads for
-# the whole app (see Dockerfile --threads). At the full budget a sustained
-# 429 could pin one of those threads for up to _MAX_RATE_WAITS x
-# _RATE_LIMIT_WAIT_CAP (~50s), starving other requests. build_and_cache()'s
-# calls run backgrounded and can afford to wait it out, so the 429 wait
-# budget is caller-tunable and the live paths pass this much smaller one:
-# one paced wait, then give up and let the client re-request the range.
-_LIVE_REQUEST_MAX_RATE_WAITS = 1
+# the whole app (see Dockerfile --threads). A sustained 429 that pins those
+# threads waiting would starve other requests (incl. /health -> the container
+# watchdog restart). We therefore let a live fetch WAIT OUT a throttle
+# patiently -- turning a transient rate-limit into a brief buffer instead of a
+# truncated read -- but BOUND how many threads may be parked on a 429-wait at
+# once with a semaphore, so free threads are always left for /health and other
+# streams. A live fetch that finds no free permit gives up immediately (the
+# client re-requests the range). build_and_cache()'s calls run backgrounded and
+# wait unbounded (bounded_waits stays False). See _get(bounded_waits=...).
+_LIVE_REQUEST_MAX_RATE_WAITS = 8          # patient, now that waits are bounded
+_MAX_LIVE_429_WAITERS        = 8          # concurrent live 429-waiters allowed
+_live_429_wait_sem = threading.BoundedSemaphore(_MAX_LIVE_429_WAITERS)
 
 
 def init(cache_dir: str | Path) -> None:
@@ -194,7 +199,7 @@ def _find_box_in(data: bytes, typ: bytes) -> int:
 # ── Fetch + cache ─────────────────────────────────────────────────────────────
 
 def _get(url: str, start: int, end: int, tries: int = 4,
-         rate_waits_max: int | None = None) -> bytes:
+         rate_waits_max: int | None = None, bounded_waits: bool = False) -> bytes:
     """Fetch CDN bytes [start, end] inclusive, *validated*.
 
     The naive version returned whatever the CDN sent — including a 500 error
@@ -255,7 +260,22 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                         wait = float(hint) + 0.5
                     except (TypeError, ValueError):
                         pass
-                time.sleep(min(max(wait, 0.5), _RATE_LIMIT_WAIT_CAP))
+                wait = min(max(wait, 0.5), _RATE_LIMIT_WAIT_CAP)
+                if bounded_waits:
+                    # Live request thread: only park on the wait if a permit is
+                    # free, else give up now so we never pin the last few
+                    # gunicorn threads and starve /health. The client re-requests
+                    # the range; a stalled read is worse app-wide than one retry.
+                    if not _live_429_wait_sem.acquire(blocking=False):
+                        raise SporeFetchError(
+                            "CDN rate-limited (429), no wait permit", status=429
+                        )
+                    try:
+                        time.sleep(wait)
+                    finally:
+                        _live_429_wait_sem.release()
+                else:
+                    time.sleep(wait)
                 continue  # retry the same offset; do not burn a normal attempt
             if sc == 416:
                 resp.close()
@@ -547,12 +567,12 @@ def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int) -> bytes:
     if pos <= v_end and pos < mdat2_start:
         chunk_end = min(v_end, mdat2_start - 1)
         out += _get(cdn_url, pos - moov_size, chunk_end - moov_size,
-                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS)
+                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS, bounded_waits=True)
         pos = chunk_end + 1
 
     # Region 3: mdat2 (after moov in CDN), cdn = virtual
     if pos <= v_end:
         out += _get(cdn_url, pos, v_end,
-                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS)
+                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS, bounded_waits=True)
 
     return bytes(out)
