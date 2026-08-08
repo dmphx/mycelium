@@ -157,9 +157,20 @@ def run_series_check() -> None:
     # Retry wanted episodes  -  keep watching indefinitely (like Radarr/Sonarr).
     # In catbox mode no TorBox quota is consumed so we never pause for budget.
     import processor
+    import time
+    import indexer_backoff
     catbox_mode = _settings.get("CATBOX_MODE", False)
     wanted = db.get_wanted_episodes(max_attempts=10_000)
     for ep in wanted:
+        # Respect Torrentio's 429 backoff: when the scraper pool is throttled,
+        # sleep it off before searching the next episode instead of hammering a
+        # provider that has already told us we're too fast. Only the monitor
+        # waits here; interactive/webhook searches never block on this.
+        _cooldown = indexer_backoff.remaining()
+        if _cooldown > 0:
+            log.info("Monitor: scraper pool in 429 backoff  -  sleeping %.0fs before next search",
+                     _cooldown)
+            time.sleep(_cooldown)
         air_date = ep.get("air_date")
         if air_date and air_date > today:
             db.mark_episode_status(ep["imdb_id"], ep["season"], ep["episode"], "not_aired")

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import requests
 
+import indexer_backoff
+
 from config import (
     ALLOW_4K,
     AUDIO_LANGUAGE_PREFERENCE,
@@ -209,6 +211,13 @@ def fetch_streams(
         resp.raise_for_status()
         payload = resp.json() or {}
     except requests.RequestException as exc:
+        resp = getattr(exc, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            # Public Torrentio is throttling us. Arm the shared cooldown so the
+            # series monitor backs off instead of hammering the next episode
+            # (which would just 429 again and burn Torrentio's rate budget).
+            indexer_backoff.note_rate_limit(
+                "torrentio", (resp.headers or {}).get("Retry-After"))
         log.warning("Torrentio unavailable for %s: %s", imdb_id, exc)
         return []
     except ValueError as exc:
