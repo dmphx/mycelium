@@ -7,6 +7,8 @@ run_pack_consolidation(): for series with N per-episode torrents of the
 same season, looks for a cached season pack and atomically replaces them.
 """
 import logging
+import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -243,12 +245,19 @@ def recheck_wanted() -> int:
     release becomes available. Quota-aware: stops once the TorBox createtorrent
     budget is low (RealDebrid fallback inside processor still applies)."""
     import processor
-    wanted = db.get_wanted_movies()
+    batch = max(1, int(os.environ.get("WANTED_MOVIE_BATCH", "50") or "50"))
+    delay = max(0.0, float(os.environ.get("WANTED_MOVIE_DELAY_SEC", "2") or "2"))
+    wanted = db.get_wanted_movies(limit=batch)
     if not wanted:
         return 0
     log.info("Wanted: rechecking %d movie(s) for an acceptable release", len(wanted))
     added = 0
     for w in wanted:
+        import indexer_backoff
+        cooldown = indexer_backoff.remaining()
+        if cooldown > 0:
+            log.info("Wanted: scraper pool in 429 backoff, sleeping %.0fs", cooldown)
+            time.sleep(cooldown)
         usage = torbox.createtorrent_usage()
         if usage["count"] >= torbox._CREATETORRENT_LIMIT_HOUR - 2:
             log.info("Wanted: createtorrent budget low (%d/%d)  -  pausing recheck",
@@ -277,6 +286,8 @@ def recheck_wanted() -> int:
             # _process_movie so it doesn't leak, and bump the attempt counter.
             processor._WANTED.pop(w["imdb_id"], None)
             db.touch_wanted_movie(w["imdb_id"])
+        if delay > 0:
+            time.sleep(delay)
     if added:
         jellyfin.refresh_library()
         log.info("Wanted: %d movie(s) became available and were added", added)

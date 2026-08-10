@@ -47,7 +47,7 @@ var (
 	// the initial refresh fails and an empty tree must be retried fast -- otherwise
 	// Plex could see an empty library for a full treeTTL.
 	startupRetryTTL = 10 * time.Second
-	httpClient   = &http.Client{Timeout: 30 * time.Second}
+	httpClient      = &http.Client{Timeout: 30 * time.Second}
 )
 
 // Distinct mtime bands per representation so Plex notices a stub<->real flip
@@ -329,6 +329,34 @@ var (
 	}{}
 )
 
+var cdnURLMaxTokens = envOrInt("SPORE_CDN_URL_MAX_TOKENS", 256)
+
+func storeCDNURL(token, requestURL string) {
+	now := time.Now()
+	cdnURLMu.Lock()
+	defer cdnURLMu.Unlock()
+	for key, cached := range cdnURLCache {
+		if now.After(cached.expires) {
+			delete(cdnURLCache, key)
+		}
+	}
+	if cdnURLMaxTokens > 0 && len(cdnURLCache) >= cdnURLMaxTokens {
+		var oldestToken string
+		var oldestExpiry time.Time
+		for key, cached := range cdnURLCache {
+			if oldestToken == "" || cached.expires.Before(oldestExpiry) {
+				oldestToken = key
+				oldestExpiry = cached.expires
+			}
+		}
+		delete(cdnURLCache, oldestToken)
+	}
+	cdnURLCache[token] = struct {
+		url     string
+		expires time.Time
+	}{url: requestURL, expires: now.Add(50 * time.Minute)}
+}
+
 var noRedirectClient = &http.Client{
 	Timeout: 30 * time.Second,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -338,6 +366,7 @@ var noRedirectClient = &http.Client{
 
 const maxRetries429 = 4
 const retryBaseDelay = 300 * time.Millisecond
+const retryMaxDelay = 30 * time.Second
 
 // errRateLimited signals that a Range GET exhausted its 429 retries. It is kept
 // distinct from a generic failure so readRange can tell "the CDN is throttling
@@ -354,9 +383,39 @@ var errRateLimited = errors.New("cdn range GET: 429 rate limited")
 // same CDN link. Same retry policy as spore-smb's range_get_with_retry
 // (Rust) and mp4_faststart.py's _get() (Python) -- this Go path hits the
 // identical TorBox CDN and was the one consumer that hadn't been patched.
-func rangeGetWithRetry(client *http.Client, url string, offset, length int64) (*http.Response, error) {
+func retryDelay(resp *http.Response, attempt int) time.Duration {
+	for _, name := range []string{"X-Ratelimit-After", "Retry-After"} {
+		value := strings.TrimSpace(resp.Header.Get(name))
+		if value == "" {
+			continue
+		}
+		if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
+			delay := time.Duration(seconds * float64(time.Second))
+			if delay > retryMaxDelay {
+				return retryMaxDelay
+			}
+			return delay
+		}
+		if when, err := http.ParseTime(value); err == nil {
+			delay := time.Until(when)
+			if delay > 0 {
+				if delay > retryMaxDelay {
+					return retryMaxDelay
+				}
+				return delay
+			}
+		}
+	}
+	delay := retryBaseDelay * time.Duration(int64(1)<<uint(attempt))
+	if delay > retryMaxDelay {
+		return retryMaxDelay
+	}
+	return delay
+}
+
+func rangeGetWithRetry(client *http.Client, requestURL string, offset, length int64, label string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequest(http.MethodGet, url, nil)
+		req, err := http.NewRequest(http.MethodGet, requestURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -366,10 +425,10 @@ func rangeGetWithRetry(client *http.Client, url string, offset, length int64) (*
 			return nil, err
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries429 {
+			backoff := retryDelay(resp, attempt)
 			resp.Body.Close()
-			backoff := retryBaseDelay * time.Duration(int64(1)<<uint(attempt))
 			log.Printf("range GET %s: 429 rate limited, retrying in %s (attempt %d/%d)",
-				url, backoff, attempt+1, maxRetries429)
+				label, backoff, attempt+1, maxRetries429)
 			time.Sleep(backoff)
 			continue
 		}
@@ -381,8 +440,8 @@ func rangeGetWithRetry(client *http.Client, url string, offset, length int64) (*
 // (either the mycelium spore-stream endpoint or a directly-cached CDN url)
 // and returns up to length bytes, or an error for anything other than
 // 200/206.
-func fetchRange(client *http.Client, url string, offset, length int64) ([]byte, error) {
-	resp, err := rangeGetWithRetry(client, url, offset, length)
+func fetchRange(client *http.Client, requestURL string, offset, length int64, label string) ([]byte, error) {
+	resp, err := rangeGetWithRetry(client, requestURL, offset, length, label)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +453,7 @@ func fetchRange(client *http.Client, url string, offset, length int64) ([]byte, 
 		return nil, errRateLimited
 	}
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
-		return nil, fmt.Errorf("range GET %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("range GET %s: status %d", label, resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, length))
 }
@@ -413,7 +472,7 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 	cached, ok := cdnURLCache[token]
 	cdnURLMu.RUnlock()
 	if ok && time.Now().Before(cached.expires) {
-		data, err := fetchRange(httpClient, cached.url, offset, length)
+		data, err := fetchRange(httpClient, cached.url, offset, length, token)
 		if err == nil {
 			return data, nil
 		}
@@ -433,7 +492,7 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 	}
 
 	target := myceliumBase + "/spore-stream/" + token
-	resp, err := rangeGetWithRetry(noRedirectClient, target, offset, length)
+	resp, err := rangeGetWithRetry(noRedirectClient, target, offset, length, token)
 	if err != nil {
 		return nil, err
 	}
@@ -444,13 +503,8 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 		if loc == "" {
 			return nil, fmt.Errorf("range GET %s: redirect with no Location", token)
 		}
-		cdnURLMu.Lock()
-		cdnURLCache[token] = struct {
-			url     string
-			expires time.Time
-		}{url: loc, expires: time.Now().Add(50 * time.Minute)}
-		cdnURLMu.Unlock()
-		return fetchRange(httpClient, loc, offset, length)
+		storeCDNURL(token, loc)
+		return fetchRange(httpClient, loc, offset, length, token)
 	}
 
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
@@ -493,7 +547,10 @@ func coalesceRange(token string, start, length int64) ([]byte, error) {
 	inflight[key] = f
 	inflightMu.Unlock()
 
+	set := getReadAheadSet(token)
+	set.fetchGate <- struct{}{}
 	f.data, f.err = readRange(token, start, length)
+	<-set.fetchGate
 
 	inflightMu.Lock()
 	delete(inflight, key)
@@ -516,18 +573,18 @@ func filepathToSlash(p string) string { return strings.ReplaceAll(p, "\\", "/") 
 
 func (fs *sporeFS) Root() string { return "/" }
 
-func (fs *sporeFS) Create(filename string) (billy.File, error)      { return nil, billy.ErrReadOnly }
+func (fs *sporeFS) Create(filename string) (billy.File, error) { return nil, billy.ErrReadOnly }
 func (fs *sporeFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	return fs.Open(filename)
 }
-func (fs *sporeFS) Rename(oldpath, newpath string) error { return billy.ErrReadOnly }
-func (fs *sporeFS) Remove(filename string) error         { return billy.ErrReadOnly }
-func (fs *sporeFS) Join(elem ...string) string           { return path.Join(elem...) }
-func (fs *sporeFS) TempFile(dir, prefix string) (billy.File, error) { return nil, billy.ErrReadOnly }
+func (fs *sporeFS) Rename(oldpath, newpath string) error             { return billy.ErrReadOnly }
+func (fs *sporeFS) Remove(filename string) error                     { return billy.ErrReadOnly }
+func (fs *sporeFS) Join(elem ...string) string                       { return path.Join(elem...) }
+func (fs *sporeFS) TempFile(dir, prefix string) (billy.File, error)  { return nil, billy.ErrReadOnly }
 func (fs *sporeFS) MkdirAll(filename string, perm os.FileMode) error { return nil }
-func (fs *sporeFS) Symlink(target, link string) error    { return billy.ErrReadOnly }
-func (fs *sporeFS) Readlink(link string) (string, error) { return "", errors.New("not a symlink") }
-func (fs *sporeFS) Chroot(path string) (billy.Filesystem, error) { return fs, nil }
+func (fs *sporeFS) Symlink(target, link string) error                { return billy.ErrReadOnly }
+func (fs *sporeFS) Readlink(link string) (string, error)             { return "", errors.New("not a symlink") }
+func (fs *sporeFS) Chroot(path string) (billy.Filesystem, error)     { return fs, nil }
 
 func (fs *sporeFS) Open(filename string) (billy.File, error) {
 	p := fs.clean(filename)
@@ -696,8 +753,8 @@ func (f fileInfo) ModTime() time.Time {
 	}
 	return f.mtime
 }
-func (f fileInfo) IsDir() bool        { return false }
-func (f fileInfo) Sys() interface{}   { return nil }
+func (f fileInfo) IsDir() bool      { return false }
+func (f fileInfo) Sys() interface{} { return nil }
 
 type dirInfo struct{ name string }
 
@@ -730,6 +787,8 @@ const (
 // (foreground read + one prefetch => peak 2 concurrent per URL); 0 disables
 // read-ahead entirely. Tunable via SPORE_PREFETCH_MAX_INFLIGHT.
 var prefetchMaxInflight = envOrInt("SPORE_PREFETCH_MAX_INFLIGHT", 1)
+var readAheadMaxTokens = envOrInt("SPORE_READAHEAD_MAX_TOKENS", 32)
+var readAheadTTL = envDurSecOr("SPORE_READAHEAD_TTL_SEC", 10*time.Minute)
 
 // A single window worked for one sequential reader, but real sessions have
 // more than one: Plex's background analysis/thumbnail pass can read the
@@ -746,16 +805,57 @@ type readAheadWindow struct {
 }
 
 type readAheadSet struct {
-	mu      sync.Mutex
-	windows [readAheadWindows]readAheadWindow
-	clock   int64
-	pending map[int64]bool // window start offsets currently being prefetched
+	mu        sync.Mutex
+	windows   [readAheadWindows]readAheadWindow
+	clock     int64
+	pending   map[int64]bool // window start offsets currently being prefetched
+	fetchGate chan struct{}
+	lastUsed  time.Time
 }
 
 var (
 	readAheadMu sync.Mutex
 	readAheads  = map[string]*readAheadSet{}
 )
+
+func getReadAheadSet(token string) *readAheadSet {
+	now := time.Now()
+	readAheadMu.Lock()
+	defer readAheadMu.Unlock()
+
+	for key, set := range readAheads {
+		if now.Sub(set.lastUsed) > readAheadTTL && len(set.fetchGate) == 0 {
+			delete(readAheads, key)
+		}
+	}
+	if set, ok := readAheads[token]; ok {
+		set.lastUsed = now
+		return set
+	}
+	if readAheadMaxTokens > 0 && len(readAheads) >= readAheadMaxTokens {
+		var oldestToken string
+		var oldestTime time.Time
+		for key, set := range readAheads {
+			if len(set.fetchGate) > 0 {
+				continue
+			}
+			if oldestToken == "" || set.lastUsed.Before(oldestTime) {
+				oldestToken = key
+				oldestTime = set.lastUsed
+			}
+		}
+		if oldestToken != "" {
+			delete(readAheads, oldestToken)
+		}
+	}
+	set := &readAheadSet{
+		pending:   map[int64]bool{},
+		fetchGate: make(chan struct{}, 1),
+		lastUsed:  now,
+	}
+	readAheads[token] = set
+	return set
+}
 
 // gridStart rounds offset down to a fixed readAheadSize boundary. Windows
 // used to start wherever a cache miss happened to land, which meant two
@@ -813,13 +913,7 @@ func (s *readAheadSet) prefetch(token string, start, fileSize int64) {
 }
 
 func bufferedRead(token string, offset, want, fileSize, mdatStart int64) ([]byte, error) {
-	readAheadMu.Lock()
-	s, ok := readAheads[token]
-	if !ok {
-		s = &readAheadSet{pending: map[int64]bool{}}
-		readAheads[token] = s
-	}
-	readAheadMu.Unlock()
+	s := getReadAheadSet(token)
 
 	gridS := gridStart(offset)
 	start := gridS
@@ -1125,11 +1219,11 @@ func (f *sporeFile) Seek(offset int64, whence int) (int64, error) {
 	return f.pos, nil
 }
 
-func (f *sporeFile) Write(p []byte) (int, error)   { return 0, billy.ErrReadOnly }
-func (f *sporeFile) Close() error                  { return nil }
-func (f *sporeFile) Lock() error                   { return nil }
-func (f *sporeFile) Unlock() error                 { return nil }
-func (f *sporeFile) Truncate(size int64) error     { return billy.ErrReadOnly }
+func (f *sporeFile) Write(p []byte) (int, error) { return 0, billy.ErrReadOnly }
+func (f *sporeFile) Close() error                { return nil }
+func (f *sporeFile) Lock() error                 { return nil }
+func (f *sporeFile) Unlock() error               { return nil }
+func (f *sporeFile) Truncate(size int64) error   { return billy.ErrReadOnly }
 
 // ---- stable file handles ------------------------------------------------
 

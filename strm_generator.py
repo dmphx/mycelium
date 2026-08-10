@@ -1836,12 +1836,13 @@ def probe_pending_stubs() -> dict:
 
     import catbox as _catbox
 
-    items = db.get_unprobed_spore_items()
+    probe_batch = max(1, int(os.environ.get("SPORE_PROBE_BATCH", "250") or "250"))
+    items = db.get_unprobed_spore_items(limit=probe_batch)
     if not items:
         log.debug("Probe pending: nothing to do")
         return {"probed": 0, "skipped": 0, "queued_preload": 0, "errors": 0}
 
-    log.info("Probe pending: %d stubs without track info", len(items))
+    log.info("Probe pending: processing a bounded batch of %d stubs without track info", len(items))
 
     # Group by info_hash to avoid duplicate TorBox API lookups
     by_hash: dict[str, list[dict]] = {}

@@ -147,7 +147,11 @@ def run_series_check() -> None:
     log.info("Monitor: starting series check")
     today = _TODAY()
 
-    for series in db.get_monitored_series(status="active"):
+    series_batch = max(1, int(os.environ.get("MONITORED_SERIES_BATCH", "250") or "250"))
+    episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
+    retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
+
+    for series in db.get_monitored_series(status="active", limit=series_batch):
         title = series["title"]
         try:
             _check_one_series(series)
@@ -160,7 +164,7 @@ def run_series_check() -> None:
     import time
     import indexer_backoff
     catbox_mode = _settings.get("CATBOX_MODE", False)
-    wanted = db.get_wanted_episodes(max_attempts=10_000)
+    wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
     for ep in wanted:
         # Respect Torrentio's 429 backoff: when the scraper pool is throttled,
         # sleep it off before searching the next episode instead of hammering a
@@ -198,6 +202,8 @@ def run_series_check() -> None:
             # not abort retries for every other wanted episode this cycle.
             log.error("Monitor: retry failed for %s S%02dE%02d: %s",
                       ep["title"], ep["season"], ep["episode"], exc)
+        if retry_delay > 0:
+            time.sleep(retry_delay)
 
     log.info("Monitor: series check complete")
 

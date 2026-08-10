@@ -7,24 +7,23 @@ Self-hosted media-request-and-stream pipeline. Watchlist clicks → `.strm` file
 - NOOIT em-dashes (`--`) gebruiken, nergens in code of tekst
 - Repo is PUBLIEK op GitHub -- geen wachtwoorden, tokens of IP-adressen committen
 - Altijd werken op branch `main` tenzij anders afgesproken
-- Docker beheer altijd op de NAS zelf via SSH (zie Commando's)
+- Docker beheer gebeurt op de actieve runtime-host via de private deployment-documentatie
 - GEEN Co-Authored-By in commit messages
 
 ## Omgeving
 
 | Component | Waarde |
 |---|---|
-| NAS | Synology, 10.0.0.10 |
-| Mycelium URL | http://10.0.0.10:8088 |
-| Projectmap NAS | /volume1/docker/mycelium/ |
-| Mount CachyOS | /mnt/nas-docker/mycelium/ |
+| Runtime-host | Deployment-specifiek; niet vastleggen in deze publieke repo |
+| Mycelium URL | Via `MYCELIUM_URL` of de private deployment-configuratie |
+| Projectmap host | Deployment-specifiek |
 | Container | `mycelium`, poort 8088 |
 | Jellyfin | container `jellyfin`, poort 8096 |
-| Plex | container `plex`, poort 32400, docker-compose in `/volume1/docker/plex/` |
+| Plex | Optionele containerintegratie; paden zijn deployment-specifiek |
 | Debrid | TorBox primair; optionele RealDebrid-fallback via `MULTI_DEBRID_ENABLED` (standaard uit) |
 | Gebruikers | 4-6 echte gebruikers |
 | Repo | corveck79/mycelium (publiek GitHub) |
-| Branch | main |
+| Branch | `main` voor upstreamwerk; private deployments kunnen een hardening-branch volgen |
 
 ## Stack
 
@@ -126,7 +125,7 @@ Virtueel layout: `[ftyp][moov_rewritten][mdat via CDN met offset -moov_size]`
 
 ### Plex docker-compose
 
-`/volume1/docker/plex/docker-compose.yml` - entrypoint kopieert wrapper script:
+De private Plex compose-configuratie kopieert het wrapper-script via deployment-specifieke mounts:
 ```yaml
 entrypoint:
   - /bin/sh
@@ -139,8 +138,8 @@ entrypoint:
     chmod +x '/usr/lib/plexmediaserver/Plex Transcoder'
     exec /init
 volumes:
-  - /volume1/docker/mycelium/spore:/spore
-  - /volume1/docker/mycelium/data/plex-media:/plex-media:ro
+  - /path/to/mycelium/spore:/spore
+  - /path/to/mycelium/data/plex-media:/plex-media:ro
 ```
 
 ### Spore commando's
@@ -150,7 +149,7 @@ volumes:
 docker exec mycelium python3 -c "import strm_generator; print(strm_generator.regenerate_spore_stubs())"
 
 # Plex herstarten (nieuwe wrapper)
-ssh corveck@10.0.0.10 "cd /volume1/docker/plex && docker compose up -d"
+docker compose -f /path/to/plex-compose.yml up -d
 ```
 
 ## Bestanden
@@ -200,23 +199,23 @@ Als alle filters niets opleveren: terugval op minder strenge filtering.
 ## Commando's
 
 ```bash
-# Logs live (op NAS)
-ssh corveck@10.0.0.10 "docker logs -f mycelium"
+# Logs live op de runtime-host
+docker logs -f mycelium
 
 # Herstarten na codewijziging
-ssh corveck@10.0.0.10 "cd /volume1/docker/mycelium && docker compose restart"
+docker compose -f /path/to/mycelium-compose.yml restart mycelium
 
 # Rebuild na Dockerfile wijziging
-ssh corveck@10.0.0.10 "cd /volume1/docker/mycelium && docker compose up -d --build"
+docker compose -f /path/to/mycelium-compose.yml up -d --build mycelium
 
 # Re-resolve specifiek item
-curl -X POST http://10.0.0.10:8088/ui/api/virtual-items/<token>/re-resolve
+curl -X POST "$MYCELIUM_URL/ui/api/virtual-items/<token>/re-resolve"
 
 # Integrity check
-curl http://10.0.0.10:8088/ui/api/integrity
+curl "$MYCELIUM_URL/ui/api/integrity"
 
 # Playability state overzicht
-curl http://10.0.0.10:8088/ui/api/playability-state
+curl "$MYCELIUM_URL/ui/api/playability-state"
 
 # Spore stubs regenereren (direct in container)
 docker exec mycelium python3 -c "import strm_generator; print(strm_generator.regenerate_spore_stubs())"
@@ -239,7 +238,7 @@ npm run dev    # Vite dev server
 npm run build  # → ../static/app/
 ```
 
-NB: `npm install` faalt op de NAS SMB mount (symlinks niet ondersteund). Kopieer naar /tmp, installeer daar, bouw, en kopieer output terug:
+NB: `npm install` kan falen op SMB-mounts zonder symlink-ondersteuning. Kopieer dan naar `/tmp`, installeer daar, bouw, en kopieer de output terug:
 
 ```bash
 cp -r frontend /tmp/mycelium-frontend && cd /tmp/mycelium-frontend

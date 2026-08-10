@@ -614,11 +614,15 @@ def upsert_monitored_series(imdb_id: str, tmdb_id: int | None, title: str,
         conn.commit()
 
 
-def get_monitored_series(status: str = "active") -> list[dict]:
+def get_monitored_series(status: str = "active", limit: int | None = None) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM monitored_series WHERE status=? ORDER BY title", (status,)
-        ).fetchall()
+        sql = ("SELECT * FROM monitored_series WHERE status=? "
+               "ORDER BY COALESCE(last_checked, '') ASC, title")
+        params: list = [status]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -657,7 +661,7 @@ def upsert_wanted_episode(imdb_id: str, tmdb_id: int | None, title: str,
         conn.commit()
 
 
-def get_wanted_episodes(max_attempts: int = 10) -> list[dict]:
+def get_wanted_episodes(max_attempts: int = 10, limit: int | None = None) -> list[dict]:
     with _connect() as conn:
         # Order by fewest attempts then newest air date so the monitor grab loop
         # reaches never-tried and recently-aired episodes first. A title/season
@@ -665,12 +669,14 @@ def get_wanted_episodes(max_attempts: int = 10) -> list[dict]:
         # ~290k-row queue that a single pass never finishes, so new episodes were
         # never grabbed. Un-gettable back-catalog (high attempt_count) sinks to
         # the back instead of starving the front every cycle.
-        rows = conn.execute(
-            """SELECT * FROM wanted_episodes
-               WHERE status='wanted' AND attempt_count < ?
-               ORDER BY attempt_count ASC, air_date DESC""",
-            (max_attempts,),
-        ).fetchall()
+        sql = ("SELECT * FROM wanted_episodes "
+               "WHERE status='wanted' AND attempt_count < ? "
+               "ORDER BY attempt_count ASC, air_date DESC")
+        params: list = [max_attempts]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -989,12 +995,17 @@ def get_virtual_items_by_hash(info_hash: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_unprobed_spore_items() -> list[dict]:
+def get_unprobed_spore_items(limit: int | None = None) -> list[dict]:
     """Return virtual_items that have a strm_path but no spore_tracks yet."""
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM virtual_items WHERE strm_path IS NOT NULL AND spore_tracks IS NULL"
-        ).fetchall()
+        sql = ("SELECT * FROM virtual_items WHERE strm_path IS NOT NULL "
+               "AND spore_tracks IS NULL "
+               "ORDER BY COALESCE(last_played, '') DESC, created_at DESC")
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -1002,6 +1013,15 @@ def get_all_virtual_items() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM virtual_items ORDER BY last_played DESC, created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_virtual_item_spore_index() -> list[dict]:
+    """Return only fields needed by the spore status sweep."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT token, info_hash FROM virtual_items"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1659,11 +1679,15 @@ def upsert_wanted_movie(imdb_id: str, tmdb_id: int | None, title: str,
         )
 
 
-def get_wanted_movies() -> list[dict]:
+def get_wanted_movies(limit: int | None = None) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM wanted_movies ORDER BY added_at"
-        ).fetchall()
+        sql = ("SELECT * FROM wanted_movies "
+               "ORDER BY COALESCE(last_checked, '') ASC, added_at ASC")
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 

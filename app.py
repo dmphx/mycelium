@@ -93,6 +93,7 @@ db.init()
 
 import settings as _settings_mod
 import os as _os
+from pathlib import Path
 LITE_MODE: bool = (
     _settings_mod.get("LITE_MODE", False)
     or _os.getenv("LITE_MODE", "").lower() in ("1", "true", "yes")
@@ -311,34 +312,37 @@ def _refresh_spore_status() -> None:
     import time as _t
     t0 = _t.monotonic()
     try:
-        items = db.get_all_virtual_items()
+        items = db.get_virtual_item_spore_index()
     except Exception as exc:
         log.warning("spore-nfs status: db error: %s", exc)
         return
-    try:
-        # Page the WHOLE account (not the default 20k cap) so cached titles beyond
-        # the recent 20k window are seen and served as real files, not stubs.
-        torrents = torbox.list_torrents(
-            force_refresh=True,
-            max_pages=int(_os.environ.get("SPORE_MYLIST_MAX_PAGES", "500") or "500"))
-    except Exception as exc:
-        log.warning("spore-nfs status: mylist error: %s", exc)
-        return
-    by_hash = {}
-    for t in torrents:
-        h = (t.get("hash") or "").lower()
-        if h:
-            by_hash[h] = t
+    by_hash: "dict[str, list[str]]" = {}
     newmap: "dict[str, tuple[bool, int]]" = {}
     for it in items:
         h = (it.get("info_hash") or "").lower()
-        t = by_hash.get(h)
-        size = 0
-        if t and (t.get("download_state") or "").lower() in _SPORE_READY_STATES:
-            files = t.get("files") or []
+        token = it["token"]
+        newmap[token] = (False, 0)
+        if h:
+            by_hash.setdefault(h, []).append(token)
+    try:
+        # Page the whole account so cached titles beyond the recent hot-path
+        # window are seen, while discarding each response page after projection.
+        torrents = torbox.iter_torrents(
+            max_pages=int(_os.environ.get("SPORE_MYLIST_MAX_PAGES", "500") or "500"))
+        for torrent in torrents:
+            h = (torrent.get("hash") or "").lower()
+            tokens = by_hash.get(h)
+            if not tokens or (torrent.get("download_state") or "").lower() not in _SPORE_READY_STATES:
+                continue
+            files = torrent.get("files") or []
             main = strm_generator._pick_main_movie_file(files) if files else None
-            size = int((main.get("size") if main else t.get("size")) or 0)
-        newmap[it["token"]] = (size > 0, size)
+            size = int((main.get("size") if main else torrent.get("size")) or 0)
+            if size > 0:
+                for token in tokens:
+                    newmap[token] = (True, size)
+    except Exception as exc:
+        log.warning("spore-nfs status: mylist error: %s", exc)
+        return
     with _spore_status_lock:
         _spore_status.clear()
         _spore_status.update(newmap)
@@ -539,22 +543,15 @@ def _start_scheduler() -> BackgroundScheduler:
         log.info("Scheduled retry queue every %dm", RETRY_QUEUE_INTERVAL_MINUTES)
 
     # Probe CDN files for Plex stubs that have no track info yet (duration, audio, subs).
-    # Runs every 30 min in a background thread to avoid blocking the scheduler.
+    # APScheduler already runs jobs in its executor. Keep the function attached
+    # to the job so max_instances can prevent overlapping probe passes.
     # build_fsh=False: only ffprobe, no 32MB download per file.
     if cfg.SPORE_ENABLED:
-        def _run_probe_pending():
-            import threading as _t
-            _t.Thread(
-                target=strm_generator.probe_pending_stubs,
-                daemon=True,
-                name="probe-pending-stubs",
-            ).start()
-
         scheduler.add_job(
-            _run_probe_pending,
+            strm_generator.probe_pending_stubs,
             trigger="interval", minutes=30,
             id="probe_pending_stubs",
-            next_run_time=None,
+            next_run_time=None, max_instances=1, coalesce=True,
         )
         log.info("Scheduled probe_pending_stubs every 30m")
 
@@ -823,12 +820,26 @@ def _check_torbox_auth() -> None:
 
 @app.get("/health")
 def health_simple():
-    """Liveness probe used by Docker HEALTHCHECK  -  process up + DB reachable."""
+    """Liveness plus cgroup pressure signal used by Docker HEALTHCHECK."""
     try:
         db.get_recent(1)
-        return jsonify(status="ok")
-    except Exception:
-        return jsonify(status="degraded"), 503
+    except Exception as exc:
+        return jsonify(status="degraded", failures=[f"db: {exc}"]), 503
+
+    memory = None
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        maximum_text = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        maximum = int(maximum_text) if maximum_text != "max" else 0
+        ratio = current / maximum if maximum else 0.0
+        memory = {"current": current, "max": maximum, "ratio": round(ratio, 4)}
+        fail_ratio = float(_os.environ.get("MEMORY_HEALTH_FAIL_RATIO", "0.95") or "0.95")
+        if maximum and ratio >= fail_ratio:
+            return jsonify(status="degraded", failures=["cgroup memory pressure"],
+                           memory=memory), 503
+    except (OSError, ValueError):
+        pass
+    return jsonify(status="ok", memory=memory)
 
 
 @app.get("/metrics")

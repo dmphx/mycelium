@@ -245,6 +245,32 @@ _mylist_cache: dict = {"items": None, "ts": 0.0}
 _mylist_lock = __import__("threading").Lock()
 
 
+def iter_torrents(timeout: int = 30, max_pages: int = 20):
+    """Yield TorBox torrents a page at a time without retaining the full account."""
+    url = f"{_base_url().rstrip('/')}/torrents/mylist"
+    seen_ids: set[int] = set()
+    offset = 0
+    limit = 1000
+    for _ in range(max_pages):
+        resp = requests.get(url, headers=_headers(), timeout=timeout,
+                            params={"limit": limit, "offset": offset})
+        if resp.status_code == 403:
+            log.warning("TorBox mylist returned 403 - API key invalid or plan restriction")
+            return
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        page = payload.get("data", []) or []
+        new = [t for t in page if t.get("id") not in seen_ids]
+        if not new:
+            break
+        for item in new:
+            yield item
+        seen_ids.update(t["id"] for t in new)
+        if len(page) < limit:
+            break
+        offset += limit
+
+
 def list_torrents(timeout: int = 30, force_refresh: bool = False,
                   max_pages: int = 20) -> list[dict]:
     """Return TorBox mylist (paged), cached for ~45s.
@@ -261,32 +287,7 @@ def list_torrents(timeout: int = 30, force_refresh: bool = False,
         cached = _mylist_cache["items"]
         if cached is not None and (_t.monotonic() - _mylist_cache["ts"]) < _MYLIST_TTL_SECONDS:
             return cached
-    url = f"{_base_url().rstrip('/')}/torrents/mylist"
-    all_items: list[dict] = []
-    seen_ids: set[int] = set()
-    offset = 0
-    limit = 1000
-    for _ in range(max_pages):  # stops early when a short page ends the list
-        resp = requests.get(url, headers=_headers(), timeout=timeout,
-                            params={"limit": limit, "offset": offset})
-        if resp.status_code == 403:
-            log.warning("TorBox mylist returned 403 - API key invalid or plan restriction")
-            # Cache the empty result for 5 minutes to avoid hammering TorBox
-            with _mylist_lock:
-                _mylist_cache["items"] = all_items
-                _mylist_cache["ts"] = _t.monotonic() + (5 * 60 - _MYLIST_TTL_SECONDS)
-            return all_items
-        resp.raise_for_status()
-        payload = resp.json() or {}
-        page = payload.get("data", []) or []
-        new = [t for t in page if t.get("id") not in seen_ids]
-        if not new:
-            break
-        all_items.extend(new)
-        seen_ids.update(t["id"] for t in new)
-        if len(page) < limit:
-            break
-        offset += limit
+    all_items = list(iter_torrents(timeout=timeout, max_pages=max_pages))
     with _mylist_lock:
         _mylist_cache["items"] = all_items
         _mylist_cache["ts"] = _t.monotonic()

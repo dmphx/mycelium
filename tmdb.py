@@ -1,4 +1,5 @@
 import logging
+import re
 
 import requests as req_lib
 
@@ -8,6 +9,13 @@ from config import TMDB_API_KEY as _TMDB_API_KEY_DEFAULT
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.themoviedb.org/3"
+_API_KEY_RE = re.compile(r"(api_key=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact(text: str) -> str:
+    text = _API_KEY_RE.sub(r"\1<redacted>", text)
+    key = _api_key()
+    return text.replace(key, "<redacted>") if isinstance(key, str) and key else text
 
 
 def _api_key() -> str:
@@ -41,7 +49,7 @@ def _get(path: str, params: dict | None = None, timeout: int = 10) -> dict | Non
         resp.raise_for_status()
         return resp.json() or {}
     except req_lib.RequestException as exc:
-        log.warning("TMDB request failed for %s: %s", path, exc)
+        log.warning("TMDB request failed for %s: %s", path, _redact(str(exc)))
         return None
 
 

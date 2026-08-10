@@ -44,6 +44,17 @@ _NEWZNAB_NS = "{http://www.newznab.com/DTD/2010/feeds/attributes/}"
 # search; refreshed every _INDEXER_CACHE_TTL_SEC.
 _INDEXER_CACHE_TTL_SEC = 600
 _indexer_cache: dict = {"at": 0.0, "items": []}
+_indexer_cooldowns: dict[int, float] = {}
+
+
+def _retry_after_seconds(resp: requests.Response) -> float:
+    for name in ("X-Ratelimit-After", "Retry-After"):
+        value = (resp.headers.get(name) or "").strip()
+        try:
+            return min(3600.0, max(1.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+    return 300.0
 
 
 def _enabled_indexers() -> list[dict]:
@@ -218,6 +229,12 @@ def _query_one_indexer(idx: dict, search_type: str, imdb_id: str,
             url, params=params, timeout=timeout,
             headers={"X-Api-Key": PROWLARR_API_KEY},
         )
+        if resp.status_code == 429:
+            delay = _retry_after_seconds(resp)
+            _indexer_cooldowns[idx["id"]] = time.monotonic() + delay
+            log.warning("Prowlarr [%s] rate limited, cooling down for %.0fs",
+                        idx["name"], delay)
+            return []
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.warning("Prowlarr [%s] query failed: %s", idx["name"], exc)
@@ -247,7 +264,9 @@ def fetch_streams(
     indexer in parallel. Both torrent and usenet sources contribute."""
     if not PROWLARR_ENABLED or not PROWLARR_BASE_URL or not PROWLARR_API_KEY:
         return []
-    indexers = _enabled_indexers()
+    now = time.monotonic()
+    indexers = [idx for idx in _enabled_indexers()
+                if _indexer_cooldowns.get(idx["id"], 0.0) <= now]
     if not indexers:
         return []
     search_type = "movie" if media_type == "movie" else "tvsearch"
