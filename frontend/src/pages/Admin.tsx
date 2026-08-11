@@ -1,7 +1,31 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from '../api';
+import { api, csrfToken } from '../api';
+import type { GenreRule } from '../api';
 import { usePlugins } from '../hooks/usePlugins';
+
+/** Shared fetch helper for this page's raw fetch() maintenance actions:
+ * redirects to /login on 401 (matching api.ts's http() wrapper) and throws
+ * a readable error instead of feeding a 4xx/5xx HTML error page into
+ * .json(), which used to surface as an opaque "Unexpected token '<'". */
+async function fetchJsonOrThrow(url: string, init?: RequestInit): Promise<any> {
+  const r = await fetch(url, init);
+  if (r.status === 401) {
+    if (typeof window !== 'undefined' && !window.location.pathname.endsWith('/login')) {
+      window.location.href = '/login';
+    }
+    throw new Error('unauthorized');
+  }
+  if (!r.ok) {
+    let detail = `${r.status}`;
+    try {
+      const j = await r.json();
+      detail = j.error || detail;
+    } catch { /* body wasn't JSON */ }
+    throw new Error(detail);
+  }
+  return r.json();
+}
 
 export default function Admin() {
   const qc = useQueryClient();
@@ -157,6 +181,8 @@ export default function Admin() {
       </section>
 
       <ArrImportPanel />
+      <AutoApprovePanel />
+      <DiscoverGenreTabsPanel />
       <MaintenancePanel />
     </div>
   );
@@ -241,11 +267,11 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className={`w-10 h-5 rounded-full transition relative ${on ? 'bg-accent' : 'bg-border'}`}
+      className={`w-10 h-5 rounded-full transition-colors flex items-center px-0.5 ${on ? 'bg-accent' : 'bg-border'}`}
     >
       <span
-        className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-          on ? 'translate-x-5' : 'translate-x-0.5'
+        className={`w-4 h-4 rounded-full bg-white shadow transition-transform ${
+          on ? 'translate-x-5' : 'translate-x-0'
         }`}
       />
     </button>
@@ -292,7 +318,11 @@ function ArrImportPanel() {
             onClick={async () => {
               if (!confirm('Import all Sonarr series + search for all episodes and create .strm files. This runs in the background and may take a while. Continue?')) return;
               setMsg('Series backfill started  -  runs in background, check logs for progress…');
-              await fetch('/ui/api/series-backfill', { method: 'POST' });
+              try {
+                await fetchJsonOrThrow('/ui/api/series-backfill', { method: 'POST', headers: { 'X-CSRFToken': csrfToken() } });
+              } catch (e: any) {
+                setMsg(`Error: ${e.message}`);
+              }
             }}
             disabled={s?.running}
             className="px-3 py-1.5 rounded bg-accent text-sm font-semibold disabled:opacity-50"
@@ -329,6 +359,242 @@ function ArrImportPanel() {
   );
 }
 
+function AutoApprovePanel() {
+  const qc = useQueryClient();
+  const [msg, setMsg] = useState('');
+  const { data } = useQuery({ queryKey: ['auto-approve-rules'], queryFn: api.autoApproveGenreRules });
+  const { data: movieGenres } = useQuery({ queryKey: ['genres', 'movie'], queryFn: () => api.genres('movie') });
+  const { data: tvGenres } = useQuery({ queryKey: ['genres', 'tv'], queryFn: () => api.genres('tv') });
+
+  const [rules, setRules] = useState<GenreRule[] | null>(null);
+  const effectiveRules = rules ?? data?.rules ?? [];
+
+  const saveMutation = useMutation({
+    mutationFn: (r: GenreRule[]) => api.setAutoApproveGenreRules(r),
+    onSuccess: () => { setMsg('Saved.'); qc.invalidateQueries({ queryKey: ['auto-approve-rules'] }); },
+    onError: (e: any) => setMsg(`Error: ${e.message}`),
+  });
+  const runMutation = useMutation({
+    mutationFn: api.runAutoApproveNow,
+    onSuccess: () => setMsg('Started in the background - check logs for progress.'),
+    onError: (e: any) => setMsg(`Error: ${e.message}`),
+  });
+
+  const addRule = () => {
+    const genres = movieGenres?.genres || [];
+    const first = genres[0];
+    setRules([
+      ...effectiveRules,
+      {
+        media_type: 'movie', genre_id: first?.id || 0, genre_name: first?.name || '',
+        year_from: null, year_to: null, enabled: true,
+      },
+    ]);
+  };
+
+  const updateRule = (i: number, patch: Partial<GenreRule>) => {
+    const next = effectiveRules.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
+    setRules(next);
+  };
+
+  const removeRule = (i: number) => {
+    setRules(effectiveRules.filter((_, idx) => idx !== i));
+  };
+
+  return (
+    <section>
+      <h2 className="text-lg font-bold mb-3">Auto-approve (genres + favorite actors)</h2>
+      <div className="bg-card rounded-lg border border-border p-4 space-y-4">
+        <p className="text-muted text-sm">
+          Automatically request titles matching enabled genre rules (year-ranged) and any
+          user's followed actors, up to the daily caps in Settings &gt; Auto-approve.
+        </p>
+
+        <GenreRuleRows
+          rules={effectiveRules}
+          movieGenres={movieGenres?.genres || []}
+          tvGenres={tvGenres?.genres || []}
+          onUpdate={updateRule}
+          onRemove={removeRule}
+        />
+
+        <div className="flex flex-wrap gap-2">
+          <button onClick={addRule} className="px-3 py-1.5 rounded border border-border text-sm hover:bg-bg">
+            + Add genre rule
+          </button>
+          <button
+            onClick={() => saveMutation.mutate(effectiveRules)}
+            disabled={saveMutation.isPending}
+            className="px-3 py-1.5 rounded bg-accent text-sm font-semibold disabled:opacity-50"
+          >
+            {saveMutation.isPending ? 'Saving...' : 'Save rules'}
+          </button>
+          <button
+            onClick={() => runMutation.mutate()}
+            disabled={runMutation.isPending}
+            className="px-3 py-1.5 rounded border border-border text-sm hover:bg-bg disabled:opacity-50"
+          >
+            ▶ Run now
+          </button>
+        </div>
+
+        {msg && <div className="font-mono text-xs text-muted">{msg}</div>}
+      </div>
+    </section>
+  );
+}
+
+function GenreRuleRows({
+  rules,
+  movieGenres,
+  tvGenres,
+  onUpdate,
+  onRemove,
+}: {
+  rules: GenreRule[];
+  movieGenres: Array<{ id: number; name: string }>;
+  tvGenres: Array<{ id: number; name: string }>;
+  onUpdate: (i: number, patch: Partial<GenreRule>) => void;
+  onRemove: (i: number) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      {rules.map((rule, i) => {
+        const genres = rule.media_type === 'movie' ? movieGenres : tvGenres;
+        return (
+          <div key={i} className="flex flex-wrap items-center gap-2 bg-bg rounded-lg p-2">
+            <button
+              type="button"
+              onClick={() => onUpdate(i, { enabled: !rule.enabled })}
+              className={`w-9 h-5 rounded-full transition-colors flex items-center px-0.5 flex-shrink-0
+                ${rule.enabled ? 'bg-accent' : 'bg-border'}`}
+            >
+              <div className={`w-4 h-4 rounded-full bg-white shadow transition-transform
+                ${rule.enabled ? 'translate-x-4' : 'translate-x-0'}`} />
+            </button>
+            <select
+              value={rule.media_type}
+              onChange={(e) => {
+                const mt = e.target.value as 'movie' | 'tv';
+                const g = (mt === 'movie' ? movieGenres : tvGenres)?.[0];
+                onUpdate(i, { media_type: mt, genre_id: g?.id || 0, genre_name: g?.name || '' });
+              }}
+              className="bg-card border border-border rounded px-2 py-1 text-xs"
+            >
+              <option value="movie">Movies</option>
+              <option value="tv">Shows</option>
+            </select>
+            <select
+              value={rule.genre_id}
+              onChange={(e) => {
+                const g = genres.find((x) => x.id === Number(e.target.value));
+                onUpdate(i, { genre_id: g?.id || 0, genre_name: g?.name || '' });
+              }}
+              className="bg-card border border-border rounded px-2 py-1 text-xs"
+            >
+              {genres.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+            <input
+              type="number"
+              placeholder="From year"
+              value={rule.year_from ?? ''}
+              onChange={(e) => onUpdate(i, { year_from: e.target.value ? Number(e.target.value) : null })}
+              className="w-24 bg-card border border-border rounded px-2 py-1 text-xs"
+            />
+            <span className="text-muted text-xs">to</span>
+            <input
+              type="number"
+              placeholder="To year"
+              value={rule.year_to ?? ''}
+              onChange={(e) => onUpdate(i, { year_to: e.target.value ? Number(e.target.value) : null })}
+              className="w-24 bg-card border border-border rounded px-2 py-1 text-xs"
+            />
+            <button
+              type="button"
+              onClick={() => onRemove(i)}
+              className="ml-auto px-2 py-1 rounded text-xs text-red-400 hover:bg-red-500/10"
+            >
+              Remove
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DiscoverGenreTabsPanel() {
+  const qc = useQueryClient();
+  const [msg, setMsg] = useState('');
+  const { data } = useQuery({ queryKey: ['discover-genre-tabs-config'], queryFn: api.genreTabsConfig });
+  const { data: movieGenres } = useQuery({ queryKey: ['genres', 'movie'], queryFn: () => api.genres('movie') });
+  const { data: tvGenres } = useQuery({ queryKey: ['genres', 'tv'], queryFn: () => api.genres('tv') });
+
+  const [tabs, setTabs] = useState<GenreRule[] | null>(null);
+  const effectiveTabs = tabs ?? data?.tabs ?? [];
+
+  const saveMutation = useMutation({
+    mutationFn: (t: GenreRule[]) => api.setGenreTabsConfig(t),
+    onSuccess: () => {
+      setMsg('Saved.');
+      qc.invalidateQueries({ queryKey: ['discover-genre-tabs-config'] });
+      qc.invalidateQueries({ queryKey: ['genre-tabs'] });
+    },
+    onError: (e: any) => setMsg(`Error: ${e.message}`),
+  });
+
+  const addTab = () => {
+    const genres = movieGenres?.genres || [];
+    const first = genres[0];
+    setTabs([
+      ...effectiveTabs,
+      { media_type: 'movie', genre_id: first?.id || 0, genre_name: first?.name || '',
+        year_from: null, year_to: null, enabled: true },
+    ]);
+  };
+  const updateTab = (i: number, patch: Partial<GenreRule>) => {
+    setTabs(effectiveTabs.map((t, idx) => (idx === i ? { ...t, ...patch } : t)));
+  };
+  const removeTab = (i: number) => {
+    setTabs(effectiveTabs.filter((_, idx) => idx !== i));
+  };
+
+  return (
+    <section>
+      <h2 className="text-lg font-bold mb-3">Discover genre tabs</h2>
+      <div className="bg-card rounded-lg border border-border p-4 space-y-4">
+        <p className="text-muted text-sm">
+          Extra rows shown on the Discover page for browsing by genre, optionally bounded
+          by a year range. Purely for browsing - use Auto-approve above to also auto-download.
+        </p>
+
+        <GenreRuleRows
+          rules={effectiveTabs}
+          movieGenres={movieGenres?.genres || []}
+          tvGenres={tvGenres?.genres || []}
+          onUpdate={updateTab}
+          onRemove={removeTab}
+        />
+
+        <div className="flex flex-wrap gap-2">
+          <button onClick={addTab} className="px-3 py-1.5 rounded border border-border text-sm hover:bg-bg">
+            + Add genre tab
+          </button>
+          <button
+            onClick={() => saveMutation.mutate(effectiveTabs)}
+            disabled={saveMutation.isPending}
+            className="px-3 py-1.5 rounded bg-accent text-sm font-semibold disabled:opacity-50"
+          >
+            {saveMutation.isPending ? 'Saving...' : 'Save tabs'}
+          </button>
+        </div>
+
+        {msg && <div className="font-mono text-xs text-muted">{msg}</div>}
+      </div>
+    </section>
+  );
+}
+
 function MaintenancePanel() {
   const [result, setResult] = useState<string>('');
   const [busy, setBusy] = useState(false);
@@ -337,8 +603,7 @@ function MaintenancePanel() {
     setBusy(true);
     setResult('Scanning .strm files…');
     try {
-      const r = await fetch('/ui/api/repair-strms', { method: 'POST' });
-      const data = await r.json();
+      const data = await fetchJsonOrThrow('/ui/api/repair-strms', { method: 'POST', headers: { 'X-CSRFToken': csrfToken() } });
       const parts: string[] = [`scanned: ${data.scanned}`, `ok: ${data.ok}`];
       if (data.missing_strm) parts.push(`missing strm fixed: ${data.missing_strm}`);
       if (data.orphaned_tokens) parts.push(`orphaned tokens fixed: ${data.orphaned_tokens}`);
@@ -358,11 +623,29 @@ function MaintenancePanel() {
     setBusy(true);
     setResult('Scanning for duplicate .strm files…');
     try {
-      const r = await fetch('/ui/api/cleanup-duplicate-strms', { method: 'POST' });
-      const data = await r.json();
+      const data = await fetchJsonOrThrow('/ui/api/cleanup-duplicate-strms', { method: 'POST', headers: { 'X-CSRFToken': csrfToken() } });
       const parts = [`scanned: ${data.scanned}`, `cleaned: ${data.cleaned}`];
       if (data.skipped) parts.push(`skipped: ${data.skipped}`);
       setResult('Done  -  ' + parts.join(', ') + (data.cleaned > 0 ? '  -  do a full Jellyfin library rescan now' : '  -  nothing to clean'));
+    } catch (e: any) {
+      setResult(`Error: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const scanTorboxLibrary = async () => {
+    setBusy(true);
+    setResult('Scanning TorBox library…');
+    try {
+      const data = await fetchJsonOrThrow('/ui/api/torbox/scan-library', { method: 'POST', headers: { 'X-CSRFToken': csrfToken() } });
+      const parts = [
+        `scanned: ${data.scanned}`,
+        `imported: ${data.imported}`,
+        `skipped: ${data.skipped}`,
+        ...(data.failed ? [`failed: ${data.failed}`] : []),
+      ];
+      setResult('Done  -  ' + parts.join(', ') + (data.imported > 0 ? '  -  do a full Jellyfin library rescan now' : ''));
     } catch (e: any) {
       setResult(`Error: ${e.message}`);
     } finally {
@@ -375,8 +658,7 @@ function MaintenancePanel() {
     setBusy(true);
     setResult('Migrating to canonical names…');
     try {
-      const r = await fetch('/ui/api/migrate-canonical', { method: 'POST' });
-      const data = await r.json();
+      const data = await fetchJsonOrThrow('/ui/api/migrate-canonical', { method: 'POST', headers: { 'X-CSRFToken': csrfToken() } });
       const parts = [
         `scanned: ${data.scanned}`,
         `renamed: ${data.renamed}`,
@@ -439,6 +721,21 @@ function MaintenancePanel() {
             className="px-3 py-1.5 rounded bg-accent text-sm font-semibold disabled:opacity-50"
           >
             {busy ? 'Scanning…' : 'Repair broken strm files'}
+          </button>
+        </div>
+        <div className="border-t border-border pt-3">
+          <p className="text-sm font-medium mb-1">Scan TorBox library</p>
+          <p className="text-muted text-xs mb-2">
+            Reads everything already cached in your TorBox account and creates .strm files
+            for anything Mycelium has no record of (e.g. after a database reset, or content
+            added outside Mycelium). Resolves titles via TMDB where possible.
+          </p>
+          <button
+            onClick={scanTorboxLibrary}
+            disabled={busy}
+            className="px-3 py-1.5 rounded bg-accent text-sm font-semibold disabled:opacity-50"
+          >
+            {busy ? 'Scanning…' : 'Scan TorBox library'}
           </button>
         </div>
         {result && <div className="font-mono text-xs text-muted border-t border-border pt-2">{result}</div>}

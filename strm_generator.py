@@ -1,9 +1,11 @@
 import logging
+import os
 import re
 import struct
 import threading
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_quoteattr
 
 import requests as req_lib
 
@@ -14,13 +16,20 @@ import jellyfin
 import settings
 import torbox as torbox_mod
 import config as cfg
-from config import MEDIA_PATH, TORBOX_BASE_URL, SPORE_MEDIA_PATH
+from config import MEDIA_PATH, TORBOX_BASE_URL as _TORBOX_BASE_URL_DEFAULT, SPORE_MEDIA_PATH
+from io_utils import atomic_write_bytes, atomic_write_text
 
 log = logging.getLogger(__name__)
 
 _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.ts', '.m2ts', '.webm'}
 
 _EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
+# Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
+# Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
+_EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')
+# Standalone absolute episode tag with no season, e.g. "E0052", "E283".
+# The lookbehind rejects the E of a seasonal "S01E05" (preceded by a digit).
+_ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(\d{2,4})(?![0-9])', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -75,13 +84,95 @@ def _pick_main_movie_file(files: list[dict]) -> dict | None:
     return max(big or non_trailer, key=lambda f: f.get('size') or 0)
 
 
-def _pick_episode_file(files: list[dict], season: int, episode: int) -> dict | None:
-    """Find the file in a season pack matching SxxExx. Falls back to None if no match."""
-    ep_re = re.compile(rf'[Ss]0?{season}[Ee]0?{episode}\b', re.IGNORECASE)
-    videos = [f for f in files if _is_video(f.get('name') or '')]
-    matched = [f for f in videos if ep_re.search(f.get('name') or '')]
+def _file_episode(name: str) -> tuple[int, int] | None:
+    """Parse (season, episode) from a file name. Handles SxxExx and NNxNN. None if absent."""
+    s = _clean(name)
+    m = _EP_RE.search(s) or _EP_ALT_RE.search(s)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _file_absolute(name: str) -> int | None:
+    """Parse a standalone absolute episode number (e.g. 'E0052') from a file name.
+
+    Only for files with no SxxExx/NNxNN tag; used as a guarded fallback for
+    packs that number by a single running count (common in anime).
+    """
+    m = _ABS_RE.search(_clean(name))
+    return int(m.group(1)) if m else None
+
+
+_FORMAT_NUMS = {240, 264, 265, 360, 480, 576, 720, 1080, 1440, 2160}
+
+
+def _file_has_absolute(name: str, n: int) -> bool:
+    """True if the file name carries absolute number ``n`` as a standalone
+    episode token (handles '- 154', 'E0154', '154.', zero padding), but not
+    when the digits are part of a codec (h.264/x265), resolution (1080p),
+    bit depth (10bit) or another number.
+    """
+    n = int(n)
+    if n in _FORMAT_NUMS:          # never match on a codec/resolution number
+        return False
+    for m in re.finditer(r'(?<![0-9])0*%d(?![0-9])' % n, name):
+        i, j = m.start(), m.end()
+        before = name[i - 1] if i > 0 else ' '
+        after = name[j] if j < len(name) else ' '
+        if before not in ' -_.[(#eE':                  # require an episode delimiter
+            continue
+        if re.search(r'[hx]\.?$', name[:i], re.IGNORECASE):   # codec h.264 / x264
+            continue
+        if after in 'piPI':                            # resolution 1080p / 720i
+            continue
+        if name[j:j + 3].lower() == 'bit':             # 10bit / 8bit
+            continue
+        return True
+    return False
+
+
+def _pick_episode_file(files: list[dict], season: int, episode: int,
+                       absolute: int | None = None) -> dict | None:
+    """Pick the file in a (season) pack for one episode.
+
+    Safest first:
+      1. A file whose name tags exactly this episode (SxxExx or NNxNN);
+         largest if several.
+      2. No tagged match: never return a file whose name tags a DIFFERENT
+         episode. That was the old 'largest file' fallback, which silently
+         served the wrong episode for packs where the wanted file lacked a
+         tag (e.g. an E01 carrying the generic release name). Only accept an
+         untagged file, and only when it is unambiguous (exactly one untagged
+         video). Otherwise return None so the caller re-scrapes instead of
+         playing the wrong episode.
+    """
+    want = (int(season), int(episode))
+    videos = [f for f in files
+              if _is_video(f.get('name') or '') and not _is_trailer(f)]
+    if not videos:
+        return None
+    matched = [f for f in videos if _file_episode(f.get('name') or '') == want]
     if matched:
         return max(matched, key=lambda f: f.get('size') or 0)
+    # Absolute numbering: packs that name files by a single running number with
+    # no SxxExx (e.g. anime "E0052").  Accept only when the request's episode
+    # number equals exactly one untagged file's absolute number, so the worst
+    # case is a miss (fail closed), never a wrong-episode guess.
+    abs_hits = [f for f in videos
+                if _file_episode(f.get('name') or '') is None
+                and _file_absolute(f.get('name') or '') == int(episode)]
+    if len(abs_hits) == 1:
+        return abs_hits[0]
+    # Cross-scheme absolute (anime): the caller resolved this episode's absolute
+    # number via TheXEM. Match a file carrying that number in any scheme, e.g.
+    # request S20E15 -> absolute 446 -> "Naruto Shippuden - 446". Single hit only.
+    if absolute and int(absolute) != int(episode):
+        xem_hits = [f for f in videos
+                    if _file_episode(f.get('name') or '') is None
+                    and _file_has_absolute(f.get('name') or '', int(absolute))]
+        if len(xem_hits) == 1:
+            return xem_hits[0]
+    untagged = [f for f in videos if _file_episode(f.get('name') or '') is None]
+    if len(untagged) == 1:
+        return untagged[0]
     return None
 
 
@@ -144,27 +235,193 @@ def _strm_path(info: dict) -> Path:
     return media / 'series' / title / f"Season {s:02d}" / f"{title} S{s:02d}E{e:02d}.strm"
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header (delta-seconds form) into seconds.
+
+    TorBox sends an integer number of seconds; the rarer HTTP-date form is not
+    worth parsing here, so anything non-numeric returns None and the caller
+    falls back to its normal backoff.
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return secs if secs >= 0 else None
+
+
+# TorBox enforces an account-wide requestdl rate limit (429 with a Retry-After,
+# observed as high as ~130s) and also throws transient 5xx storms on the same
+# endpoint. Interactive playback must still fail fast (a user is waiting and
+# ffmpeg times out), so _requestdl_get keeps its small Retry-After cap. But the
+# background loops (preload, probe) have nobody waiting, and hammering through a
+# 429 cooldown or a 5xx storm just keeps the endpoint saturated and starves the
+# interactive plays that share it. So _requestdl_get records a cooldown here on
+# any 429 or 5xx and the background loops back off for its duration.
+_torbox_throttle_lock = threading.Lock()
+_torbox_throttle_until = {"ts": 0.0}   # monotonic deadline; preload pauses until then
+
+
+def _note_torbox_throttle(retry_after_sec: float | None) -> None:
+    """Record a TorBox cooldown window (429 or 5xx). Observational: this does not
+    change the interactive requestdl retry behavior, it only gates the background
+    loops, which consult _preload_throttled_for() before each requestdl."""
+    cap = cfg.PRELOAD_BREAKER_MAX_COOLDOWN_SEC
+    if cap <= 0 or not retry_after_sec or retry_after_sec <= 0:
+        return
+    deadline = time.monotonic() + min(float(retry_after_sec), float(cap))
+    with _torbox_throttle_lock:
+        if deadline > _torbox_throttle_until["ts"]:
+            _torbox_throttle_until["ts"] = deadline
+
+
+def _preload_throttled_for() -> float:
+    """Seconds left in the current TorBox throttle window, or 0.0 if clear."""
+    with _torbox_throttle_lock:
+        return max(0.0, _torbox_throttle_until["ts"] - time.monotonic())
+
+
+def _requestdl_get(url: str, params: dict, label: str) -> str | None:
+    """GET a TorBox requestdl endpoint, retrying transient failures.
+
+    TorBox's requestdl intermittently returns HTTP 5xx (usually 500) or 429
+    (rate-limit) and recovers within seconds (the same token then succeeds). A
+    single attempt surfaces to Jellyfin as a fatal player error (mycelium 404)
+    and trips the catbox fail-cooldown, so we retry 5xx, 429 and network/timeout
+    errors with a short linear backoff (honoring Retry-After on a 429). The
+    other 4xx (auth / gone / bad request) are deterministic and fail
+    immediately. The happy path adds no latency (returns on attempt 1).
+    """
+    attempts = max(1, cfg.REQUESTDL_RETRIES)
+    last = "no response"
+    for attempt in range(1, attempts + 1):
+        retry_after = None
+        try:
+            resp = req_lib.get(url, params=params, timeout=15)
+            # 429 is transient like 5xx, so retry it. Every other 4xx is a hard
+            # failure (raise_for_status below) and is never retried.
+            if resp.status_code != 429 and resp.status_code < 500:
+                resp.raise_for_status()
+                data = resp.json() or {}
+                return data.get("data") or None
+            last = f"HTTP {resp.status_code}"
+            if resp.status_code == 429:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                # A 429 without a usable Retry-After still means we are over the
+                # account limit, so fall back to the default cooldown rather than
+                # leaving the background loops un-throttled.
+                _note_torbox_throttle(
+                    retry_after if retry_after is not None
+                    else cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
+            elif resp.status_code >= 500:
+                # 5xx is not a rate-limit signal, but pushing more requestdl into
+                # a TorBox 5xx storm keeps it saturated. Back the background loops
+                # off for the default window; interactive callers do not consult
+                # the throttle, so a live play still retries immediately below.
+                _note_torbox_throttle(cfg.PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC)
+        except req_lib.HTTPError as exc:
+            log.warning("%s: %s", label, exc)
+            return None
+        except req_lib.RequestException as exc:
+            last = str(exc)
+        if attempt < attempts:
+            delay = (cfg.REQUESTDL_BACKOFF_MS / 1000.0) * attempt
+            if retry_after is not None:
+                delay = max(delay, min(retry_after, float(cfg.REQUESTDL_RETRY_AFTER_CAP_SEC)))
+            log.info("%s transient (%s); retry %d/%d in %.1fs",
+                     label, last, attempt, attempts - 1, delay)
+            time.sleep(delay)
+    log.warning("%s failed after %d attempt(s): %s", label, attempts, last)
+    return None
+
+
+# requestdl single-flight: on a first play Jellyfin fires several ffmpeg probes
+# at the same file at once. Without coalescing, each calls TorBox requestdl for
+# the same (torrent, file) simultaneously and the burst trips a 429. This lets
+# only the first caller per key hit TorBox; the rest wait and reuse its result
+# (a CDN URL, or None on failure, so a failed burst is one failure, not N).
+class _SFCall:
+    __slots__ = ("event", "result", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: str | None = None
+        self.error: BaseException | None = None
+
+
+_requestdl_sf_lock = threading.Lock()
+_requestdl_sf: dict[str, _SFCall] = {}
+
+
+def _requestdl_single_flight(key: str, fn) -> str | None:
+    with _requestdl_sf_lock:
+        call = _requestdl_sf.get(key)
+        leader = call is None
+        if leader:
+            call = _SFCall()
+            _requestdl_sf[key] = call
+    if not leader:
+        # Bound the wait so a dead leader cannot pin a follower forever; on
+        # timeout the follower degrades to its own direct call.
+        budget = float(max(1, cfg.REQUESTDL_RETRIES)) * 20.0 + 5.0
+        if call.event.wait(timeout=budget):
+            if call.error is not None:
+                raise call.error
+            return call.result
+        return fn()
+    try:
+        call.result = fn()
+        return call.result
+    except BaseException as exc:
+        call.error = exc
+        raise
+    finally:
+        with _requestdl_sf_lock:
+            _requestdl_sf.pop(key, None)
+        call.event.set()
+
+
 def _get_stream_url(torrent_id: int, file_id: int) -> str | None:
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/requestdl"
+    torbox_base_url = settings.get("TORBOX_BASE_URL", _TORBOX_BASE_URL_DEFAULT)
+    url = f"{torbox_base_url.rstrip('/')}/torrents/requestdl"
     params = {
         "token": settings.get("TORBOX_API_KEY", ""),
         "torrent_id": torrent_id,
         "file_id": file_id,
         "zip_link": "false",
     }
-    try:
-        resp = req_lib.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        return data.get("data") or None
-    except Exception as exc:
-        log.warning("requestdl failed torrent=%s file=%s: %s", torrent_id, file_id, exc)
-        return None
+    return _requestdl_single_flight(
+        f"t:{torrent_id}:{file_id}",
+        lambda: _requestdl_get(url, params, f"requestdl torrent={torrent_id} file={file_id}"),
+    )
+
+
+def _get_usenet_stream_url(usenet_id: int, file_id: int) -> str | None:
+    """Resolve a TorBox usenet download to a CDN URL.
+
+    Mirrors _get_stream_url but hits /usenet/requestdl with usenet_id instead
+    of torrent_id."""
+    url = f"{settings.get('TORBOX_BASE_URL', _TORBOX_BASE_URL_DEFAULT).rstrip('/')}/usenet/requestdl"
+    params = {
+        "token": settings.get("TORBOX_API_KEY", ""),
+        "usenet_id": usenet_id,
+        "file_id": file_id,
+        "zip_link": "false",
+    }
+    return _requestdl_single_flight(
+        f"u:{usenet_id}:{file_id}",
+        lambda: _requestdl_get(url, params, f"usenet requestdl usenet={usenet_id} file={file_id}"),
+    )
 
 
 def _extract_year(name: str) -> int | None:
-    m = _YEAR_RE.search(name or "")
-    return int(m.group(1)) if m else None
+    # Prefer the LAST year-like token. Release names are "Title ... <ReleaseYear>
+    # <quality>", so a year embedded in the title ("Blade Runner 2049", "2012",
+    # "1917") must not be mistaken for the release year (first-match did exactly
+    # that, baking wrong-year folders that never match in Plex).
+    ms = _YEAR_RE.findall(name or "")
+    return int(ms[-1]) if ms else None
 
 
 # ── Jellyfin: NFO en mapbeheer ────────────────────────────────────────────────
@@ -258,17 +515,24 @@ def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
 
     fileinfo = _fileinfo_xml(quality)
 
+    # Title comes from the on-disk folder name, which originates in torrent
+    # release titles. Treat as untrusted: escape every interpolation so a
+    # release like `<title>&` cannot break the NFO XML for Jellyfin/Kodi/Plex.
+    safe_title = _xml_escape(title)
+    safe_imdb  = _xml_escape(imdb_id) if imdb_id else None
+    safe_tmdb  = _xml_escape(str(tmdb_id)) if tmdb_id else None
+
     uid_tags = ""
-    if imdb_id:
-        uid_tags += f'  <uniqueid type="imdb" default="true">{imdb_id}</uniqueid>\n'
-    if tmdb_id:
-        uid_tags += f'  <uniqueid type="tmdb">{tmdb_id}</uniqueid>\n'
+    if safe_imdb:
+        uid_tags += f'  <uniqueid type="imdb" default="true">{safe_imdb}</uniqueid>\n'
+    if safe_tmdb:
+        uid_tags += f'  <uniqueid type="tmdb">{safe_tmdb}</uniqueid>\n'
 
     if media_type == "movie":
         year_tag = f"\n  <year>{year}</year>" if year else ""
         content = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-            f"<movie>\n  <title>{title}</title>{year_tag}\n{uid_tags}{fileinfo}</movie>\n"
+            f"<movie>\n  <title>{safe_title}</title>{year_tag}\n{uid_tags}{fileinfo}</movie>\n"
         )
     elif media_type == "episode":
         # Per-episode NFO: Plex uses this to read <fileinfo> codec data for .strm playback
@@ -281,10 +545,10 @@ def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
         # tvshow.nfo - no fileinfo needed (Plex reads episode NFOs for codec info)
         content = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-            f"<tvshow>\n  <title>{title}</title>\n{uid_tags}</tvshow>\n"
+            f"<tvshow>\n  <title>{safe_title}</title>\n{uid_tags}</tvshow>\n"
         )
     try:
-        nfo_path.write_text(content, encoding="utf-8")
+        atomic_write_text(nfo_path, content)
         log.info("Wrote NFO: %s", nfo_path)
     except Exception as exc:
         log.warning("Could not write NFO %s: %s", nfo_path, exc)
@@ -358,23 +622,64 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
                              fallback_year: int | None = None) -> str:
     """Return the canonical 'Title (Year)' folder name from TMDB for this imdb_id.
     Falls back to fallback_title/year if TMDB lookup fails."""
-    try:
-        import tmdb as _tmdb
-        results = _tmdb._get(f"/find/{imdb_id}",
-                             params={"external_source": "imdb_id"}) or {}
-        hits = results.get("movie_results") or []
-        if hits:
-            title = hits[0].get("title") or ""
-            year = (hits[0].get("release_date") or "")[:4]
-            if title:
-                safe = _safe(title)
+    import time as _time
+    import tmdb as _tmdb
+    # Retry on transient TMDB failures (network blips / empty responses) BEFORE
+    # falling back: a bad fallback year gets baked into the folder permanently and
+    # then never matches in Plex. Only give up after real attempts.
+    for _attempt in range(3):
+        try:
+            results = _tmdb._get(f"/find/{imdb_id}",
+                                 params={"external_source": "imdb_id"}) or {}
+            hits = results.get("movie_results") or []
+            if hits and hits[0].get("title"):
+                safe = _safe(hits[0]["title"])
+                year = (hits[0].get("release_date") or "")[:4]
                 return f"{safe} ({year})" if year else safe
-    except Exception as exc:
-        log.debug("_canonical_movie_folder TMDB lookup failed for %s: %s", imdb_id, exc)
+        except Exception as exc:
+            log.debug("_canonical_movie_folder TMDB lookup failed for %s (attempt %d): %s",
+                      imdb_id, _attempt + 1, exc)
+        _time.sleep(0.5 * (_attempt + 1))
     if fallback_title:
         safe = _safe(fallback_title)
+        # Strip a trailing "(YYYY)" already in the fallback title so we never emit a
+        # double-year folder like "Articulo 53 (1937) (1937)".
+        safe = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", safe)
         return f"{safe} ({fallback_year})" if fallback_year else safe
     return ""
+
+
+_PLACEHOLDER_TITLE_RE = re.compile(r"^(tt\d{6,10}|tmdb[:_\- ]?\d+)$", re.IGNORECASE)
+
+
+def _looks_like_placeholder_title(title: str | None) -> bool:
+    """True when the title is not a real show name but an id placeholder
+    (a raw IMDB id like 'tt10231312', or 'tmdb:97727'), or empty. These leak in
+    from request paths that never resolved the human title (webhook without a
+    subject, /ui/submit passing the imdb id, retry-queue replays, etc.)."""
+    if not title or not title.strip():
+        return True
+    return bool(_PLACEHOLDER_TITLE_RE.match(title.strip()))
+
+
+def _canonical_series_folder(imdb_id: str | None,
+                              fallback_title: str | None = None) -> str:
+    """Return the canonical show-folder name from TMDB for this imdb_id (TV).
+
+    Mirrors _canonical_movie_folder so series get a real, matchable folder name
+    instead of an id placeholder. Falls back to fallback_title if the TMDB
+    lookup fails or imdb_id is missing."""
+    if imdb_id:
+        try:
+            import tmdb as _tmdb
+            results = _tmdb._get(f"/find/{imdb_id}",
+                                 params={"external_source": "imdb_id"}) or {}
+            hits = results.get("tv_results") or []
+            if hits and hits[0].get("name"):
+                return _safe(hits[0]["name"])
+        except Exception as exc:
+            log.debug("_canonical_series_folder TMDB lookup failed for %s: %s", imdb_id, exc)
+    return _safe(fallback_title) if fallback_title else ""
 
 
 def fix_imdb_titles() -> dict:
@@ -458,7 +763,7 @@ def fix_imdb_titles() -> dict:
                     old_folder_path.rmdir() if not any(old_folder_path.iterdir()) else None
                 else:
                     old_folder_path.rename(new_folder_path)
-                db.update_virtual_strm_path_prefix(str(old_folder_path), str(new_folder_path))
+                db.rename_virtual_item_paths(str(old_folder_path), str(new_folder_path))
                 renamed = True
 
             fixed.append({'imdb_id': imdb_id, 'old': old_title, 'new': new_title,
@@ -485,12 +790,29 @@ def _find_movie_folder_by_imdb(imdb_id: str) -> Path | None:
     return None
 
 
-_preload_semaphore = threading.Semaphore(3)   # max 3 concurrent preload threads
+_preload_semaphore = threading.Semaphore(max(1, cfg.PRELOAD_CONCURRENCY))  # max concurrent preload threads
 _preload_in_flight: set[str] = set()
 _preload_lock = threading.Lock()
 _preload_add_lock = threading.Lock()          # gate around add_magnet to respect rate limit
 _preload_state = {"last_add": 0.0}            # mutable so no global keyword needed
 _PRELOAD_MIN_INTERVAL = 7.0                   # seconds between add_magnet calls (~8/min, limit is 10/min)
+
+# Pace the preload CDN-cache requestdl calls so the loop never stampedes TorBox
+# into a sustained 429. Serializes to one requestdl per interval across all
+# preload threads. Interactive playback does not use this gate. See config.py.
+_preload_requestdl_lock = threading.Lock()
+_preload_requestdl_state = {"last": 0.0}
+
+
+def _preload_requestdl_pace() -> None:
+    iv = cfg.PRELOAD_REQUESTDL_MIN_INTERVAL_SEC
+    if iv <= 0:
+        return
+    with _preload_requestdl_lock:
+        elapsed = time.monotonic() - _preload_requestdl_state["last"]
+        if elapsed < iv:
+            time.sleep(iv - elapsed)
+        _preload_requestdl_state["last"] = time.monotonic()
 
 
 # ── Catbox: CDN URL cache ─────────────────────────────────────────────────────
@@ -541,6 +863,12 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
                 main = _pick_main_movie_file(files)
                 file_id = (main or files[0]).get("id")
 
+            throttled = _preload_throttled_for()
+            if throttled > 0:
+                log.info("Preload: TorBox throttled %.0fs, backing off %s (%d/%d cached)",
+                         throttled, title, cached_count, len(all_items))
+                break
+            _preload_requestdl_pace()
             cdn_url = _get_stream_url(torrent_id, file_id)
             if not cdn_url:
                 continue
@@ -567,27 +895,54 @@ _SAFE_AUDIO_CODECS = frozenset({
 def _preferred_audio_index(audio_streams: list[dict]) -> int:
     """Return 0-based audio stream index to prefer for FFmpeg -map 0:a:N.
 
-    If the first audio track is TrueHD/MLP and a decode-safe fallback exists
-    (EAC3, AC3, AAC, ...), return the fallback's index. Otherwise return 0.
+    Selection priority:
+    1. Prefer an English-language track when one exists. Many foreign scene
+       releases put a non-English dub first while the stub still advertises
+       a single "English" track, so the default 0:a:0 plays the wrong
+       language and the viewer cannot switch (only one track is exposed).
+    2. Among English tracks, avoid TrueHD/MLP when a decode-safe English
+       track is present.
+    3. With no English track, keep the original behaviour: if the first
+       track is TrueHD/MLP and a decode-safe fallback exists, return that
+       fallback, else return 0.
+
     TrueHD decode often fails mid-stream on CDN files due to missing major-sync
     frames after seeks, causing HLS transcoding (Android/Shield) to stall.
     """
     if not audio_streams:
         return 0
-    first_codec = (audio_streams[0].get("codec_name") or "").lower()
+
+    def _lang(s: dict) -> str:
+        return ((s.get("tags") or {}).get("language") or "").lower()
+
+    def _codec(s: dict) -> str:
+        return (s.get("codec_name") or "").lower()
+
+    eng = [i for i, s in enumerate(audio_streams) if _lang(s).startswith("eng")]
+    if eng:
+        safe_eng = [i for i in eng if _codec(audio_streams[i]) not in _TRUEHD_CODECS]
+        return safe_eng[0] if safe_eng else eng[0]
+
+    first_codec = _codec(audio_streams[0])
     if first_codec not in _TRUEHD_CODECS:
         return 0
     for i, s in enumerate(audio_streams[1:], 1):
-        if (s.get("codec_name") or "").lower() in _SAFE_AUDIO_CODECS:
+        if _codec(s) in _SAFE_AUDIO_CODECS:
             return i
     return 0
 
 
 def update_minfo_preferred_audio(token: str, audio_index: int) -> None:
-    """Add or update preferred_audio=N in the .minfo sidecar for token.
+    """Deprecated: strip any stale preferred_audio= line from the .minfo.
 
-    The Plex transcoder wrapper reads this to remap '-map 0:a:0' to the
-    specified stream index, skipping a corrupt primary TrueHD track.
+    The old '-map 0:a:0' wrapper remap this drove is incompatible with Plex's
+    EAE-only EAC3 decoder: it injected a non-existent plain 'eac3' decoder with
+    no -eae_prefix, which kills the transcode ("Conversion failed"). Audio
+    preference is now expressed by marking the preferred track as the MKV
+    default in the stub itself (make_stub_mkv default_audio_idx), which Plex
+    honours natively and which also lets the viewer switch tracks. This helper
+    now only removes any leftover preferred_audio= line so the dead remap path
+    can never fire. audio_index is kept for call-site compatibility.
     """
     item = db.get_virtual_item(token)
     if not item or not item.get("strm_path"):
@@ -598,11 +953,10 @@ def update_minfo_preferred_audio(token: str, audio_index: int) -> None:
         return
     try:
         lines = minfo_path.read_text(encoding="utf-8").splitlines()
-        lines = [l for l in lines if not l.startswith("preferred_audio=")]
-        if audio_index > 0:
-            lines.append(f"preferred_audio={audio_index}")
-        minfo_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        log.info("Spore: preferred_audio=%d saved to .minfo for token=%s", audio_index, token)
+        new_lines = [l for l in lines if not l.startswith("preferred_audio=")]
+        if new_lines != lines:
+            atomic_write_text(minfo_path, "\n".join(new_lines) + "\n")
+            log.info("Spore: stripped deprecated preferred_audio from .minfo for token=%s", token)
     except Exception as exc:
         log.warning("Spore: could not update .minfo for token=%s: %s", token, exc)
 
@@ -643,14 +997,19 @@ def _preload_spore(cdn_url: str, token: str, build_fsh: bool = True) -> None:
         streams = data.get("streams", [])
         audio   = [s for s in streams if s.get("codec_type") == "audio"]
         subs    = [s for s in streams if s.get("codec_type") == "subtitle"]
+        video   = [s for s in streams if s.get("codec_type") == "video"]
+        v_codec = (video[0].get("codec_name") if video else None)
         dur     = float(data.get("format", {}).get("duration", 0) or 0)
         preferred_idx = _preferred_audio_index(audio)
         db.save_spore_tracks(token, {
             "audio": audio, "subs": subs, "duration_s": dur,
             "video_extradata_hex": v_extra_hex,
+            "video_codec": v_codec,
             "preferred_audio_idx": preferred_idx,
         })
-        update_stub_from_probe(token, audio, subs, duration_s=dur or None)
+        update_stub_from_probe(token, audio, subs, duration_s=dur or None,
+                               video_codec=v_codec,
+                               video_extradata_hex=v_extra_hex)
         if preferred_idx > 0:
             update_minfo_preferred_audio(token, preferred_idx)
             log.info("Preload: preferred_audio=%d for token=%s (TrueHD -> fallback)",
@@ -714,7 +1073,9 @@ def _preload_torrent(info_hash: str, magnet: str, title: str) -> None:
 def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                             year: int | None, imdb_id: str | None = None,
                             tmdb_id: int | None = None, quality: str | None = None,
-                            source: str | None = None, size_gb: float | None = None) -> bool:
+                            source: str | None = None, size_gb: float | None = None,
+                            protocol: str = "torrent", nzb_url: str | None = None,
+                            usenet_id: int | None = None) -> bool:
     """Write a Catbox virtual movie .strm WITHOUT adding the torrent to TorBox.
     createtorrent is deferred until first playback (see catbox.materialize).
     Atomically writes .nfo, poster.jpg, fanart.jpg, and requests subtitles.
@@ -756,8 +1117,16 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
         source=source,
         size_gb=size_gb,
         year=year,
+        protocol=protocol,
+        nzb_url=nzb_url,
+        usenet_id=usenet_id,
     )
     written = _write_strm(path, catbox.proxy_url(token))
+    if not written:
+        # Don't leave a virtual_item row with no backing .strm - it would
+        # permanently block retries via the "already exists" guard above.
+        db.delete_virtual_item(token)
+        return False
     if written:
         _write_spore_stubs(path, token, folder, quality, size_gb)
         if imdb_id or tmdb_id:
@@ -773,7 +1142,12 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
                 subtitles.fetch_for(path, imdb_id, "movie")
             except Exception as exc:
                 log.debug("Subtitle fetch skipped for %s: %s", folder, exc)
-        if settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD) and info_hash and magnet:
+        # Preload only makes sense for torrents (push cached magnet to TorBox
+        # so first-play is instant). Usenet items are already downloading by
+        # the time we get here (we eager-submitted in _lazy_register_movie).
+        if (protocol == "torrent" and
+                settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD)
+                and info_hash and magnet):
             threading.Thread(
                 target=_preload_torrent,
                 args=(info_hash, magnet, folder),
@@ -795,8 +1169,23 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     Atomically writes tvshow.nfo and series poster/fanart on first episode.
     Returns True if a new .strm was written."""
     import catbox
+    # Resolve a real show name when the caller passed an id placeholder
+    # (raw imdb id, "tmdb:NNN", empty). Otherwise the folder/NFO get named after
+    # the placeholder and Plex stores the show as an unmatched "TmdbNNNNN".
+    # Movies already do this via _canonical_movie_folder.
+    if _looks_like_placeholder_title(title):
+        resolved = _canonical_series_folder(imdb_id, fallback_title=title)
+        if resolved:
+            title = resolved
     safe_title = _safe(title)
     if not safe_title:
+        return False
+    # DB-level dedup guard: the path check below only catches the case where
+    # the .strm already lives at the exact same computed path. If the title
+    # was sanitized differently since the episode was first registered (folder
+    # rename, title fix, etc.) that check misses it and we'd register a second
+    # token for the same episode. Checking imdb_id+season+episode catches that.
+    if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
         return False
     season_dir = f"Season {season:02d}"
     ep_name = f"{safe_title} S{season:02d}E{episode:02d}"
@@ -819,6 +1208,11 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         episode=episode,
     )
     written = _write_strm(path, catbox.proxy_url(token))
+    if not written:
+        # Don't leave a virtual_item row with no backing .strm - it would
+        # permanently block retries via the imdb_id+season+episode guard above.
+        db.delete_virtual_item(token)
+        return False
     if written:
         _write_spore_stubs(path, token, ep_name, quality, size_gb)
         if imdb_id:
@@ -885,12 +1279,80 @@ def _ebml_el(id_bytes: bytes, data: bytes) -> bytes:
 
 def _codec_id_for_quality(quality: str | None) -> str:
     """Return MKV CodecID string based on quality hint.
-    4K content is virtually always HEVC; 1080p/720p defaults to H.264."""
+    4K content is virtually always HEVC; 1080p/720p defaults to H.264.
+    Used only as a fallback when the real probed codec is unknown."""
     if quality:
         q = quality.lower()
         if '2160' in q or '4k' in q or 'uhd' in q:
             return 'V_MPEGH/ISO/HEVC'
     return 'V_MPEG4/ISO/AVC'
+
+
+# Maps an ffprobe codec_name to the MKV CodecID written into the Spore stub
+# video track. The stub codec MUST match the real CDN file: Plex builds its
+# decode and bitstream pipeline from the stub, so a wrong codec (for example AVC
+# declared for an HEVC file) makes the transcoder read invalid NAL units and the
+# playback session dies (Plex web error s3014 / s3015).
+_FFCODEC_TO_MKV_VIDEO: dict[str, str] = {
+    "hevc":       "V_MPEGH/ISO/HEVC",
+    "h265":       "V_MPEGH/ISO/HEVC",
+    "h264":       "V_MPEG4/ISO/AVC",
+    "avc":        "V_MPEG4/ISO/AVC",
+    "av1":        "V_AV1",
+    "vp9":        "V_VP9",
+    "vp8":        "V_VP8",
+    "mpeg2video": "V_MPEG2",
+    "mpeg4":      "V_MPEG4/ISO/ASP",
+}
+
+
+def _codec_id_for_video(codec_name: str | None, quality: str | None) -> str:
+    """MKV CodecID from the probed ffprobe codec_name, falling back to the
+    quality based guess when the codec is not yet probed or unrecognised."""
+    if codec_name:
+        cid = _FFCODEC_TO_MKV_VIDEO.get(codec_name.lower())
+        if cid:
+            return cid
+    return _codec_id_for_quality(quality)
+
+
+def _dn_from_magnet(magnet: str | None) -> str | None:
+    """Extract the display name (dn=) from a magnet URI, URL-decoded.
+    This is normally the full release name (e.g. 'Show S01 1080p x265 HEVC-PSA'),
+    which lets us classify the real video codec before any CDN probe. Returns
+    None for non-magnet sources (e.g. the magnet slot holds an NZB URL)."""
+    if not magnet or "magnet:" not in magnet:
+        return None
+    try:
+        from urllib.parse import parse_qs, urlsplit, unquote_plus
+        dn = (parse_qs(urlsplit(magnet).query).get("dn") or [None])[0]
+        return unquote_plus(dn) if dn else None
+    except Exception:
+        return None
+
+
+# Release-name tokens that reliably reveal the real video codec. Checked at stub
+# creation so a 1080p HEVC release is born with an HEVC stub instead of the AVC
+# resolution default (which feeds HEVC into Plex's H.264 pipeline and kills the
+# session with invalid NAL units, web error s3014 / s3015).
+_RELEASE_CODEC_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("av1",  r"\bav1\b"),
+    ("hevc", r"\b(?:x ?265|h\.?265|hevc)\b"),
+    ("h264", r"\b(?:x ?264|h\.?264|avc)\b"),
+)
+
+
+def _codec_from_release_name(name: str | None) -> str | None:
+    """Classify the video codec ('hevc' | 'h264' | 'av1') from a release name.
+    Returns None when no codec token is present, so callers fall back to the
+    quality based guess."""
+    if not name:
+        return None
+    low = name.lower()
+    for codec, pat in _RELEASE_CODEC_PATTERNS:
+        if re.search(pat, low):
+            return codec
+    return None
 
 
 _FFCODEC_TO_MKV_AUDIO: dict[str, str] = {
@@ -941,14 +1403,16 @@ def _ebml_audio_track_entry(track_num: int, codec_mkv: str, lang: str,
     return _ebml_el(b'\xAE', body)
 
 
-def _ebml_subtitle_track_entry(track_num: int, codec_mkv: str, lang: str) -> bytes:
+def _ebml_subtitle_track_entry(track_num: int, codec_mkv: str, lang: str,
+                                is_default: bool = False, is_forced: bool = False) -> bytes:
     lang_bytes = lang.encode("ascii", errors="replace")[:3].ljust(3)[:3]
     body = (
         _ebml_el(b'\xD7', _ebml_uint(track_num)) +
         _ebml_el(b'\x73\xC5', _ebml_uint(track_num)) +
         _ebml_el(b'\x83', _ebml_uint(0x11)) +
         _ebml_el(b'\xB9', _ebml_uint(1)) +
-        _ebml_el(b'\x88', _ebml_uint(0)) +
+        _ebml_el(b'\x88', _ebml_uint(1 if is_default else 0)) +
+        _ebml_el(b'\x55\xAA', _ebml_uint(1 if is_forced else 0)) +
         _ebml_el(b'\x22\xB5\x9C', lang_bytes) +
         _ebml_el(b'\x86', codec_mkv.encode())
     )
@@ -960,10 +1424,14 @@ def make_stub_mkv(title: str, quality: str | None = None,
                    codec_id: str | None = None,
                    audio_tracks: list[dict] | None = None,
                    subtitle_tracks: list[dict] | None = None,
-                   video_codec_private: bytes | None = None) -> bytes:
+                   video_codec_private: bytes | None = None,
+                   default_audio_idx: int = 0) -> bytes:
     """Generate a minimal valid MKV file for Plex scanning.
 
     audio_tracks: list of dicts with keys codec, language, channels, sample_rate.
+    Written in CDN file order (so Plex -map 0:N references forward correctly);
+    default_audio_idx marks which of them carries the MKV default flag, so Plex
+    auto-selects e.g. the English track without reordering the streams.
     subtitle_tracks: list of dicts with keys codec, language.
     When audio_tracks is None, a PCM 16ch placeholder is used so Plex
     always invokes the transcoder (never direct-plays the stub).
@@ -1057,34 +1525,45 @@ def make_stub_mkv(title: str, quality: str | None = None,
                 track_num=next_num,
                 codec_mkv=mkv_codec,
                 lang=(at.get("language") or "und")[:3],
-                channels=int(at.get("channels") or 2),
+                # Declared channel count is floored at 10: HDMI/eARC passthrough
+                # tops out at 8ch, so >8 guarantees no client (Shield included)
+                # can ever Direct Play the stub, regardless of the real CDN
+                # track's actual channel count. The wrapper doesn't read this
+                # value (maps by stream index), only Plex's direct-play check does.
+                channels=max(int(at.get("channels") or 2), 10),
                 sample_rate=float(at.get("sample_rate") or 48000),
-                is_default=(i == 0),
+                is_default=(i == default_audio_idx),
             )
             next_num += 1
     else:
-        # EAC3 5.1 placeholder.
-        #   - A_EAC3 6ch: Plex chooses Direct Stream audio (copy output) for
-        #     clients that support EAC3 passthrough (Shield TV + AV receiver via
-        #     eARC). No EAE needed. Audio packets copied from CDN.
-        #   - For clients that transcode (MiTV -> AC3), EAE decodes EAC3 via
-        #     eac3_eae IPC. The wrapper keeps -eae_prefix for transcode sessions.
+        # EAC3 10ch placeholder: >8ch guarantees no client can Direct Play the
+        # stub (HDMI/eARC passthrough max is 8ch), forcing the transcoder (and
+        # our wrapper) to always be invoked. The wrapper forces video copy to
+        # avoid the wasteful full re-encode this would otherwise trigger.
         tracks_data += _ebml_audio_track_entry(
             track_num=2, codec_mkv="A_EAC3", lang="und",
-            channels=6, sample_rate=48000.0, is_default=True,
+            channels=10, sample_rate=48000.0, is_default=True,
         )
         next_num = 3
 
-    for st in (subtitle_tracks or []):
-        mkv_codec = _FFCODEC_TO_MKV_SUB.get(
-            (st.get("codec") or "").lower(), "S_TEXT/UTF8"
-        )
-        tracks_data += _ebml_subtitle_track_entry(
-            track_num=next_num,
-            codec_mkv=mkv_codec,
-            lang=(st.get("language") or "und")[:3],
-        )
-        next_num += 1
+    # Real subtitle tracks (subtitle_tracks) are intentionally NOT declared in
+    # the stub anymore: Plex prefers a soft/text track (SRT) over image-based
+    # PGS whenever both are available in the same language, which lets it pick
+    # SRT and skip the burn-in requirement entirely, undoing the trick below.
+    # Real subtitle metadata still lives in the DB (save_spore_tracks).
+    #
+    # Forced default PGS (image-based) subtitle track: no client soft-renders
+    # PGS, so Plex must burn it into the video via a real transcode session,
+    # guaranteeing the transcoder (and our wrapper) is invoked instead of
+    # Direct Play. default+forced so Plex can't just ignore it in favor of a
+    # (nonexistent, since we no longer declare one) text track. The wrapper
+    # strips the burn-in filter and forces a plain video copy, so this costs
+    # nothing extra once the wrapper takes over.
+    tracks_data += _ebml_subtitle_track_entry(
+        track_num=next_num, codec_mkv="S_HDMV/PGS", lang="und",
+        is_default=True, is_forced=True,
+    )
+    next_num += 1
 
     tracks_el = _ebml_el(b'\x16\x54\xAE\x6B', tracks_data)
 
@@ -1156,6 +1635,7 @@ def _write_spore_stubs(strm_path: Path, token: str,
     if not mkv_path.exists():
         try:
             duration_sec = 7200.0
+            vi = None
             try:
                 vi = db.get_virtual_item(token)
                 imdb_id = vi.get("imdb_id") if vi else None
@@ -1173,10 +1653,19 @@ def _write_spore_stubs(strm_path: Path, token: str,
             except Exception as _e:
                 log.debug("Spore: TMDB duration lookup failed for %s: %s", title, _e)
 
-            stub = make_stub_mkv(title, quality, duration_sec=duration_sec)
-            mkv_path.write_bytes(stub)
-            log.debug("Spore: wrote stub MKV %s (%d bytes, quality=%s dur=%.0fs)",
-                      mkv_path.name, len(stub), quality or "?", duration_sec)
+            # Born-correct codec: classify from the release name (magnet dn=) so an
+            # HEVC release gets an HEVC stub up front instead of the AVC resolution
+            # default. Falls back to the quality guess when the name is ambiguous.
+            release_name = _dn_from_magnet((vi or {}).get("magnet"))
+            video_codec  = _codec_from_release_name(release_name or title)
+            codec_id     = _codec_id_for_video(video_codec, quality)
+
+            stub = make_stub_mkv(title, quality, duration_sec=duration_sec,
+                                  codec_id=codec_id)
+            atomic_write_bytes(mkv_path, stub)
+            log.debug("Spore: wrote stub MKV %s (%d bytes, quality=%s codec=%s dur=%.0fs)",
+                      mkv_path.name, len(stub), quality or "?",
+                      video_codec or "guess", duration_sec)
         except Exception as exc:
             log.warning("Spore: could not write stub MKV %s: %s", mkv_path, exc)
             return
@@ -1185,13 +1674,23 @@ def _write_spore_stubs(strm_path: Path, token: str,
     if not minfo_path.exists():
         try:
             size_bytes = int((size_gb or 0.0) * 1_000_000_000)
-            minfo_path.write_text(
-                f"token={token}\nsize={size_bytes}\n", encoding="utf-8"
-            )
+            atomic_write_text(minfo_path, f"token={token}\nsize={size_bytes}\n")
             log.debug("Spore: wrote .minfo %s (token=%s size=%d)",
                       minfo_path.name, token, size_bytes)
         except Exception as exc:
             log.warning("Spore: could not write .minfo %s: %s", minfo_path, exc)
+
+    # Notify Plex so it scans AND matches the new episode/movie. The per-item add
+    # path marks via _write_strm, but the bulk backfill (backfill_spore_stubs)
+    # writes stubs with no preceding _write_strm -- without this the item lands in
+    # Plex unmatched (guid=local://): no episode still, no description. mark() keys
+    # off the .strm path under MEDIA_PATH and is debounced per-folder, so a whole
+    # show's episodes coalesce into a single targeted show-folder scan.
+    try:
+        import media_servers
+        media_servers.mark(strm_path)
+    except Exception as exc:
+        log.debug("Spore: Plex scan-notify failed for %s: %s", strm_path, exc)
 
 
 def _delete_spore_stubs(strm_path: Path) -> None:
@@ -1295,15 +1794,18 @@ def regenerate_spore_stubs(token: str | None = None) -> dict:
             except ValueError:
                 log.debug("Spore regenerate: invalid extradata hex for %s, skipping", strm_path.name)
                 v_extra = None
+            codec_id = _codec_id_for_video(saved.get("video_codec"), item.get("quality"))
             stub = make_stub_mkv(
                 item.get("title") or strm_path.stem,
                 item.get("quality"),
                 duration_sec=dur,
+                codec_id=codec_id,
                 audio_tracks=None,
                 subtitle_tracks=sub_tracks,
+                video_codec_private=v_extra,
             )
             stub_dir.mkdir(parents=True, exist_ok=True)
-            mkv_path.write_bytes(stub)
+            atomic_write_bytes(mkv_path, stub)
             log.info("Spore: regenerated stub %s (quality=%s subs=%d)",
                      mkv_path.name, item.get("quality") or "?", len(sub_tracks or []))
             regenerated += 1
@@ -1335,12 +1837,13 @@ def probe_pending_stubs() -> dict:
 
     import catbox as _catbox
 
-    items = db.get_unprobed_spore_items()
+    probe_batch = max(1, int(os.environ.get("SPORE_PROBE_BATCH", "250") or "250"))
+    items = db.get_unprobed_spore_items(limit=probe_batch)
     if not items:
         log.debug("Probe pending: nothing to do")
         return {"probed": 0, "skipped": 0, "queued_preload": 0, "errors": 0}
 
-    log.info("Probe pending: %d stubs without track info", len(items))
+    log.info("Probe pending: processing a bounded batch of %d stubs without track info", len(items))
 
     # Group by info_hash to avoid duplicate TorBox API lookups
     by_hash: dict[str, list[dict]] = {}
@@ -1392,6 +1895,13 @@ def probe_pending_stubs() -> dict:
                     main = _pick_main_movie_file(files)
                     file_id = (main or files[0]).get("id")
 
+                throttled = _preload_throttled_for()
+                if throttled > 0:
+                    log.info("Probe pending: TorBox throttled %.0fs, stopping pass early "
+                             "(probed=%d skipped=%d errors=%d)",
+                             throttled, probed, skipped, errors)
+                    return {"probed": probed, "skipped": skipped, "errors": errors}
+                _preload_requestdl_pace()
                 cdn_url = _get_stream_url(torrent_id, file_id)
                 if not cdn_url:
                     skipped += 1
@@ -1400,7 +1910,6 @@ def probe_pending_stubs() -> dict:
                 _catbox.cache_url(token, cdn_url)
                 _preload_spore(cdn_url, token, build_fsh=False)
                 probed += 1
-                time.sleep(0.3)
 
         except Exception as exc:
             log.warning("Probe pending: error for hash %s: %s", info_hash, exc)
@@ -1413,7 +1922,9 @@ def probe_pending_stubs() -> dict:
 
 def update_stub_from_probe(token: str, audio_streams: list[dict],
                             subtitle_streams: list[dict],
-                            duration_s: float | None = None) -> bool:
+                            duration_s: float | None = None,
+                            video_codec: str | None = None,
+                            video_extradata_hex: str | None = None) -> bool:
     """Rewrite the stub MKV for token with real audio and subtitle tracks from ffprobe.
 
     Called after build_and_cache() completes so subsequent Plex analyses show
@@ -1446,6 +1957,12 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
         for s in audio_streams
     ] or None
 
+    # Mark the preferred (English when present) audio track as the MKV default
+    # so Plex auto-selects it. Streams stay in CDN order so the wrapper's
+    # -map 0:N forwarding to the real file stays correct; only the default flag
+    # moves. Viewers can still switch to any other track in the Plex UI.
+    default_idx = _preferred_audio_index(audio_streams) if audio_streams else 0
+
     subtitle_tracks = [
         {
             "codec":    s.get("codec_name", "subrip"),
@@ -1454,36 +1971,75 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
         for s in subtitle_streams
     ]
 
-    # Write cdn_audio_codec to .minfo so the transcoder wrapper can inject a
-    # native (non-EAE) decoder hint, preventing EAE input-decode timeouts on
-    # heavy sessions (e.g. Shield TV + VAAPI video transcode).
-    cdn_codec = (audio_streams[0].get("codec_name") or "").lower() if audio_streams else ""
-    if cdn_codec:
+    # Write cdn_audio_codec / cdn_video_codec to .minfo so the transcoder wrapper
+    # can inject a native (non-EAE) decoder hint, and so the real codecs are
+    # visible for diagnosis without re-probing.
+    cdn_codec  = (audio_streams[0].get("codec_name") or "").lower() if audio_streams else ""
+    cdn_vcodec = (video_codec or "").lower()
+    if cdn_codec or cdn_vcodec:
         minfo_path = mkv_path.parent / (strm_path.stem + ".minfo")
         try:
             if minfo_path.exists():
                 lines = minfo_path.read_text(encoding="utf-8").splitlines()
-                lines = [l for l in lines if not l.startswith("cdn_audio_codec=")]
-                lines.append(f"cdn_audio_codec={cdn_codec}")
-                minfo_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                log.info("Spore: cdn_audio_codec=%s saved to .minfo for token=%s", cdn_codec, token)
+                lines = [l for l in lines
+                         if not l.startswith("cdn_audio_codec=")
+                         and not l.startswith("cdn_video_codec=")]
+                if cdn_codec:
+                    lines.append(f"cdn_audio_codec={cdn_codec}")
+                if cdn_vcodec:
+                    lines.append(f"cdn_video_codec={cdn_vcodec}")
+                atomic_write_text(minfo_path, "\n".join(lines) + "\n")
+                log.info("Spore: cdn_audio_codec=%s cdn_video_codec=%s saved to .minfo for token=%s",
+                         cdn_codec or "?", cdn_vcodec or "?", token)
         except Exception as exc:
-            log.warning("Spore: could not write cdn_audio_codec to .minfo for token=%s: %s", token, exc)
+            log.warning("Spore: could not write codec info to .minfo for token=%s: %s", token, exc)
+
+    # Derive the real video CodecID from the probe so the stub matches the CDN
+    # file. A mismatch (AVC stub for an HEVC file) makes Plex feed HEVC into an
+    # H.264 pipeline, producing invalid NAL units and a killed transcode session.
+    codec_id = _codec_id_for_video(video_codec, item.get("quality"))
+
+    # Detect a codec flip versus the stub Plex last scanned. Plex caches the codec
+    # at scan time, so when the probe corrects an AVC-guess stub to HEVC we must
+    # ask Plex to re-analyze or it keeps feeding HEVC into an H.264 pipeline.
+    codec_changed = False
+    try:
+        if mkv_path.exists():
+            codec_changed = codec_id.encode("ascii") not in mkv_path.read_bytes()
+    except Exception:
+        codec_changed = False
+
+    v_priv = None
+    if video_extradata_hex:
+        try:
+            v_priv = bytes.fromhex(video_extradata_hex)
+        except ValueError:
+            v_priv = None
 
     try:
         stub = make_stub_mkv(
             item.get("title") or strm_path.stem,
             item.get("quality"),
             duration_sec=duration_s or 7200.0,
+            codec_id=codec_id,
             audio_tracks=audio_tracks,
             subtitle_tracks=subtitle_tracks or None,
-            # video_codec_private omitted: updated via update_stub_from_probe
+            video_codec_private=v_priv,
+            default_audio_idx=default_idx,
         )
-        mkv_path.write_bytes(stub)
+        atomic_write_bytes(mkv_path, stub)
         log.info(
             "Spore: updated stub for token=%s with %d audio + %d subs",
             token, len(audio_streams), len(subtitle_tracks),
         )
+        if codec_changed:
+            try:
+                import media_servers
+                media_servers.request_reanalyze(strm_path)
+                log.info("Spore: codec corrected to %s for token=%s; queued Plex re-analyze",
+                         video_codec or "?", token)
+            except Exception as _ms_exc:
+                log.debug("Spore: re-analyze enqueue failed for token=%s: %s", token, _ms_exc)
         # Also update the NFO sidecar so Plex sees the real codec / language info
         # This applies to both stub MKV library and .strm library
         try:
@@ -1510,18 +2066,29 @@ def _write_strm(path: Path, url: str) -> bool:
         return False
     # Fuzzy duplicate check: skip if any existing sibling folder normalizes to the same title.
     # Catches "The Minecraft Movie (2025)" vs "Minecraft Movie The (2025)", case differences, etc.
-    parent = path.parent.parent  # movies/ or series/
-    norm = _norm_title(path.parent.name)
+    # For movies path.parent is the title folder directly under movies/. For
+    # episodes path.parent is a "Season NN" folder, so the title folder (and
+    # its siblings under series/) is one level further up.
+    if re.match(r"^Season \d+$", path.parent.name):
+        title_folder = path.parent.parent
+    else:
+        title_folder = path.parent
+    parent = title_folder.parent  # movies/ or series/
+    norm = _norm_title(title_folder.name)
     if parent.is_dir():
         for existing in parent.iterdir():
-            if existing.is_dir() and existing != path.parent and _norm_title(existing.name) == norm:
-                if any(existing.glob("*.strm")):
-                    log.info("Skipping duplicate strm %s  -  already have %s", path.parent.name, existing.name)
+            if existing.is_dir() and existing != title_folder and _norm_title(existing.name) == norm:
+                if any(existing.glob("*.strm")) or any(existing.rglob("*.strm")):
+                    log.info("Skipping duplicate strm %s  -  already have %s", title_folder.name, existing.name)
                     return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(url, encoding='utf-8')
+        atomic_write_text(path, url)
         log.info("Created .strm: %s", path)
+        try:
+            import media_servers
+            media_servers.mark(path)
+        except Exception:
+            pass
         return True
     except Exception as exc:
         log.warning("Could not write %s: %s", path, exc)
@@ -1550,8 +2117,19 @@ def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_typ
     return _get_stream_url(torrent_id, file_id)
 
 
-def process_torrent(item: dict) -> int:
-    """Create .strm files for all video files in a ready torrent. Returns new file count."""
+def process_torrent(item: dict, canonical_title: str | None = None,
+                     imdb_id: str | None = None, tmdb_id: int | None = None) -> int:
+    """Create .strm files for all video files in a ready torrent. Returns new file count.
+
+    canonical_title/imdb_id/tmdb_id: when the caller already knows which show/movie
+    this torrent belongs to (e.g. right after adding it for a specific request),
+    pass them so the folder uses the known canonical title instead of whatever
+    _parse_info() derives from this particular torrent's raw name. Different
+    torrent uploaders name the same show differently, so leaving every add to
+    parse its own folder name is how the same series ends up in 5+ separate
+    folders. A tvshow.nfo is also written so later duplicate-merge passes can
+    match reliably by IMDb id instead of by fuzzy title guessing.
+    """
     torrent_id = item.get('id')
     torrent_name = _clean_torrent_name(item.get('name') or '')
     files = item.get('files') or []
@@ -1587,6 +2165,7 @@ def process_torrent(item: dict) -> int:
         return 0
 
     written = 0
+    nfo_written = False
     for f in video_files:
         file_id = f.get('id')
         file_name = f.get('name') or ''
@@ -1594,6 +2173,10 @@ def process_torrent(item: dict) -> int:
         if info is None:
             log.warning("Cannot determine placement: torrent=%r file=%r", torrent_name, file_name)
             continue
+        if canonical_title and info['type'] != 'movie':
+            clean_canonical = _safe(canonical_title)
+            if clean_canonical:
+                info = dict(info, title=clean_canonical)
         path = _strm_path(info)
         if path.exists():
             continue
@@ -1602,6 +2185,12 @@ def process_torrent(item: dict) -> int:
             continue
         if _write_strm(path, url):
             written += 1
+            if imdb_id and info['type'] != 'movie' and not nfo_written:
+                series_root = path.parent.parent
+                tvshow_nfo = series_root / "tvshow.nfo"
+                if not tvshow_nfo.exists():
+                    _write_nfo(path, imdb_id, tmdb_id=tmdb_id, nfo_path=tvshow_nfo, media_type="series")
+                nfo_written = True
 
     return written
 
@@ -1617,6 +2206,9 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
     item = torbox_mod.find_by_id(torrent_id)
     if not item:
         log.warning("Torrent %s not found in mylist for strm creation", torrent_id)
+        return 0
+    if not torbox_mod._is_ready(item):
+        log.info("Torrent %s (%s) not ready yet  -  skipping strm creation for now", torrent_id, title)
         return 0
 
     if media_type == 'movie':
@@ -1638,7 +2230,66 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
             _write_nfo(path, imdb_id, tmdb_id)
         return 1 if written else 0
 
-    return process_torrent(item)
+    return process_torrent(item, canonical_title=title, imdb_id=imdb_id, tmdb_id=tmdb_id)
+
+
+def scan_torbox_library() -> dict:
+    """Reconcile TorBox's own library against ours: find torrents TorBox already
+    has cached that we have no record of (e.g. after a DB reset, or content
+    added outside Mycelium) and materialize .strm files for them.
+
+    For each unknown torrent, guesses title/year/season/episode from the
+    release name, resolves a real title via TMDB when possible so the item
+    lands in a properly named, deduplicated folder (same canonical-title path
+    normal requests use), and falls back to the raw parsed name otherwise.
+    """
+    import tmdb
+    items = torbox_mod.list_torrents(force_refresh=True)
+    scanned = imported = skipped = failed = 0
+    for item in items:
+        if not torbox_mod._is_ready(item):
+            continue
+        scanned += 1
+        info_hash = (item.get('hash') or '').lower()
+        if not info_hash:
+            skipped += 1
+            continue
+        if db.get_virtual_item_by_hash(info_hash):
+            skipped += 1
+            continue
+        try:
+            torrent_name = _clean_torrent_name(item.get('name') or '')
+            guess = _parse_info(torrent_name, torrent_name)
+            if not guess:
+                skipped += 1
+                continue
+            media_type = 'series' if guess['type'] == 'episode' else 'movie'
+            imdb_id = None
+            try:
+                if media_type == 'movie':
+                    imdb_id = tmdb.search_movie(guess['title'], guess.get('year'))
+                else:
+                    imdb_id = tmdb.search_tv(guess['title'])
+            except Exception as exc:
+                log.debug("scan_torbox_library: TMDB lookup failed for %r: %s", guess['title'], exc)
+            resolved_title = tmdb.display_title(imdb_id, media_type) if imdb_id else None
+            if resolved_title:
+                title = resolved_title
+            elif guess['type'] == 'movie' and guess.get('year'):
+                title = f"{guess['title']} ({guess['year']})"
+            else:
+                title = guess['title']
+            written = create_strm_for_torrent(item['id'], title, media_type, imdb_id=imdb_id)
+            if written:
+                imported += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            log.warning("scan_torbox_library: failed for %s: %s", item.get('name'), exc)
+            failed += 1
+    log.info("scan_torbox_library: scanned=%d imported=%d skipped=%d failed=%d",
+              scanned, imported, skipped, failed)
+    return {"scanned": scanned, "imported": imported, "skipped": skipped, "failed": failed}
 
 
 def create_series_strms_from_files(torrent_name: str, files_with_urls: list) -> int:
@@ -1656,8 +2307,7 @@ def create_series_strms_from_files(torrent_name: str, files_with_urls: list) -> 
         if path.exists():
             continue
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(url, encoding="utf-8")
+            atomic_write_text(path, url)
             log.info("Created series .strm: %s", path)
             written += 1
         except Exception as exc:
@@ -1679,8 +2329,7 @@ def create_episode_strm_from_url(title: str, season: int, episode: int,
     if path.exists():
         return path
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(url, encoding="utf-8")
+        atomic_write_text(path, url)
         log.info("Created episode .strm: %s", path)
         return path
     except Exception as exc:
@@ -1702,8 +2351,7 @@ def create_movie_strm_from_url(title: str, url: str) -> Path | None:
     if path.exists():
         return path
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(url, encoding="utf-8")
+        atomic_write_text(path, url)
         log.info("Created RD .strm: %s", path)
         return path
     except Exception as exc:
@@ -1780,9 +2428,6 @@ def migrate_to_canonical_names() -> dict:
 
     Returns: {scanned, renamed, merged, skipped, errors, no_imdb}
     """
-    import re as _re
-    import shutil
-
     if not _maintenance_lock.acquire(blocking=False):
         log.warning("migrate_to_canonical_names: maintenance already running  -  skipping")
         return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0, "no_imdb": 0}
@@ -1819,8 +2464,13 @@ def _migrate_to_canonical_names_locked() -> dict:
     def _do_rename(old: Path, new: Path) -> bool:
         try:
             old.rename(new)
-            # Update DB strm_path: any virtual_item pointing into old folder
-            db.update_virtual_strm_path_prefix(str(old), str(new))
+            # Update DB strm_path: any virtual_item pointing into old folder.
+            # rename_virtual_item_paths() anchors the match to a directory
+            # boundary (trailing "/"), unlike update_virtual_strm_path_prefix()
+            # - without that, renaming "Alien (1979)" would also corrupt
+            # strm_path rows for a sibling folder like "Alien (1979) Directors
+            # Cut" whose name happens to start with the same string.
+            db.rename_virtual_item_paths(str(old), str(new))
             # Rename .strm/.nfo files inside that still use the old folder stem
             old_stem = old.name
             new_stem = new.name
@@ -1831,14 +2481,36 @@ def _migrate_to_canonical_names_locked() -> dict:
                     if not new_file.exists():
                         old_file.rename(new_file)
                         if suffix == ".strm":
-                            db.update_virtual_strm_path_prefix(str(old_file), str(new_file))
+                            db.update_virtual_item_strm_path(str(old_file), str(new_file))
             log.info("migrate: renamed '%s' → '%s'", old.name, new.name)
             return True
         except Exception as exc:
             log.error("migrate: rename failed %s → %s: %s", old.name, new.name, exc)
             return False
 
-    def _do_delete(folder: Path) -> None:
+    def _do_delete(folder: Path, keep: Path) -> None:
+        """Merge any .strm this duplicate has that `keep` doesn't, then remove
+        it - unlike a plain rmtree, this can't silently lose a differently
+        named/quality .strm (or its virtual_item row) that only existed in
+        the folder being discarded."""
+        fully_merged = True
+        for strm in folder.glob("*.strm"):
+            dest = keep / strm.name
+            if dest.exists():
+                db.delete_virtual_item_by_strm_path(str(strm))
+                continue
+            try:
+                content = strm.read_text(encoding="utf-8")
+                dest.write_text(content, encoding="utf-8")
+            except Exception as exc:
+                log.warning("migrate: could not copy %s to %s: %s", strm, dest, exc)
+                fully_merged = False
+                continue
+            db.update_virtual_item_strm_path(str(strm), str(dest))
+        if not fully_merged:
+            log.warning("migrate: not all files could be merged out of '%s' - leaving folder in place",
+                        folder.name)
+            return
         try:
             shutil.rmtree(folder)
             log.info("migrate: deleted duplicate '%s'", folder.name)
@@ -1914,7 +2586,7 @@ def _migrate_to_canonical_names_locked() -> dict:
                 for dup in ordered[1:]:
                     if dup.resolve() == keep.resolve():
                         continue
-                    _do_delete(dup)
+                    _do_delete(dup, keep)
                     merged += 1
 
         except Exception as exc:
@@ -2014,8 +2686,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
         item = next((i for i in items if i.get("strm_path") == str(strm_path)), items[0])
         new_url = _catbox.proxy_url(item["token"])
         try:
-            strm_path.parent.mkdir(parents=True, exist_ok=True)
-            strm_path.write_text(new_url, encoding="utf-8")
+            atomic_write_text(strm_path, new_url)
             log.info("repair_strms: wrote %s → token %s", strm_path.name, item["token"])
             return True
         except Exception as exc:
@@ -2154,7 +2825,7 @@ def _cleanup_duplicate_strms_locked() -> dict:
             if not new_path.exists():
                 try:
                     keep.rename(new_path)
-                    db.update_virtual_strm_path_prefix(str(keep), str(new_path))
+                    db.update_virtual_item_strm_path(str(keep), str(new_path))
                     nfo_old = keep.with_suffix(".nfo")
                     nfo_new = new_path.with_suffix(".nfo")
                     if nfo_old.exists() and not nfo_new.exists():

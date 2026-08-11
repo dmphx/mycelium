@@ -1,9 +1,24 @@
 #!/bin/bash
 # Mycelium Plex Transcoder wrapper.
-# Rewrites -i /plex-media/*.mkv to http://127.0.0.1:8088/spore-stream/<token>
+# Rewrites -i /plex-media/*.mkv to http://${SPORE_HOST}/spore-stream/<token>
 # so FFmpeg reads from the CDN directly (MKV) or via moov-first proxy (MP4).
+#
+# SPORE_MYCELIUM_HOST lets multi-container deploys point at mycelium's real
+# host:port (e.g. 172.20.5.20:8088) instead of localhost. Plex passes it via env.
+SPORE_HOST="${SPORE_MYCELIUM_HOST:-127.0.0.1:8088}"
 
 SPORE_LOG=/config/spore-wrap-debug.log
+FFMPEG_STDERR_LOG=/config/spore-ffmpeg-stderr.log
+
+# These logs are appended to on every transcode session with no rotation -
+# truncate once they cross ~20MB so a long-running Plex container doesn't
+# grow them unbounded.
+for _log in "$SPORE_LOG" "$FFMPEG_STDERR_LOG"; do
+    if [ -f "$_log" ] && [ "$(stat -c%s "$_log" 2>/dev/null || echo 0)" -gt 20971520 ]; then
+        : > "$_log"
+    fi
+done
+
 echo "$(date '+%H:%M:%S') WRAP started" >> "$SPORE_LOG"
 
 # ── EAE_ROOT discovery ─────────────────────────────────────────────────────────
@@ -31,7 +46,7 @@ for a in "$@"; do
                 tok=$(grep "^token=" "$minfo" | head -1 | cut -d= -f2)
                 if [ -n "$tok" ]; then
                     echo "SPORE-WRAP: -i $a -> spore-stream/$tok" >&2
-                    a="http://127.0.0.1:8088/spore-stream/$tok"
+                    a="http://${SPORE_HOST}/spore-stream/$tok"
                     spore_replaced=1
                     spore_minfo="$minfo"
                 fi
@@ -43,10 +58,10 @@ for a in "$@"; do
             if [[ "$strm_url" =~ /s(tream|pore-stream)/([a-f0-9]{8,}) ]]; then
                 tok="${BASH_REMATCH[2]}"
                 echo "SPORE-WRAP: .strm path $a -> token=$tok -> spore-stream" >&2
-                a="http://127.0.0.1:8088/spore-stream/$tok"
+                a="http://${SPORE_HOST}/spore-stream/$tok"
                 spore_replaced=1
-                _strm_tmp_minfo="/tmp/spore-minfo-$tok.txt"
-                curl -sf "http://127.0.0.1:8088/ui/api/spore-minfo/$tok" \
+                _strm_tmp_minfo=$(mktemp "/tmp/spore-minfo-$tok.XXXXXX")
+                curl -sf "http://${SPORE_HOST}/ui/api/spore-minfo/$tok" \
                      -o "$_strm_tmp_minfo" 2>/dev/null \
                      || echo "token=$tok" > "$_strm_tmp_minfo"
                 spore_minfo="$_strm_tmp_minfo"
@@ -56,14 +71,24 @@ for a in "$@"; do
             # Plex passes the stream URL directly as -i (fallback for URL-based inputs).
             tok="${BASH_REMATCH[2]}"
             echo "SPORE-WRAP: -i stream URL tok=$tok -> spore-stream/$tok" >&2
-            a="http://127.0.0.1:8088/spore-stream/$tok"
+            a="http://${SPORE_HOST}/spore-stream/$tok"
             spore_replaced=1
-            _strm_tmp_minfo="/tmp/spore-minfo-$tok.txt"
-            curl -sf "http://127.0.0.1:8088/ui/api/spore-minfo/$tok" \
+            _strm_tmp_minfo=$(mktemp "/tmp/spore-minfo-$tok.XXXXXX")
+            curl -sf "http://${SPORE_HOST}/ui/api/spore-minfo/$tok" \
                  -o "$_strm_tmp_minfo" 2>/dev/null \
                  || echo "token=$tok" > "$_strm_tmp_minfo"
             spore_minfo="$_strm_tmp_minfo"
             echo "$(date '+%H:%M:%S') WRAP stream URL: token=$tok minfo fetched" >> "$SPORE_LOG"
+        fi
+        # TorBox CDN intermittently 429s bursts of input opens (every Plex seek
+        # re-opens the input through mycelium's 302) and a bare 4XX at open is
+        # fatal to the session. Retry with backoff instead: pop the already-
+        # appended -i and re-append it behind HTTP reconnect flags (input
+        # options must precede -i).
+        if [[ "$a" == "http://${SPORE_HOST}/spore-stream/"* ]]; then
+            unset "newargs[$((${#newargs[@]}-1))]"
+            newargs+=(-reconnect 1 -reconnect_on_network_error 1 -reconnect_on_http_error 429,5xx -reconnect_delay_max 10 -i)
+            echo "$(date '+%H:%M:%S') WRAP injected HTTP reconnect flags before -i" >> "$SPORE_LOG"
         fi
     fi
     [ "$a" = "-i" ] && found_i=1
@@ -155,7 +180,7 @@ if [ "$spore_replaced" = "1" ]; then
                 # Always remove PCM hints. For EAE hints: only remove on copy mode.
                 _is_pcm=0
                 [[ "$next_arg" =~ ^pcm_s[0-9]+(le|be)$ ]] && _is_pcm=1
-                if [ "$_is_pcm" = "1" ] || [ "$_audio_output_is_copy" = "1" ]; then
+                if [ "$_is_pcm" = "1" ] || [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
                     skip_next=1
                     stream_n="${arg#-codec:}"
                     removed_eae_indices+=("$stream_n")
@@ -170,7 +195,7 @@ if [ "$spore_replaced" = "1" ]; then
             # When transcoding (e.g. EAC3->AC3 for MiTV), -eae_prefix tells
             # eac3_eae which watchfolder to use. Removing it causes EAE timeout.
             if [ "$idx" -lt "$i_pos" ] && { [[ "$arg" =~ ^-eae_prefix:[0-9]+$ ]] || [[ "$arg" =~ ^-eae_prefix:[a-z]:[0-9]+$ ]]; }; then
-                if [ "$_audio_output_is_copy" = "1" ]; then
+                if [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
                     skip_next=1
                     echo "$(date '+%H:%M:%S') WRAP removed -eae_prefix: $arg $next_arg (copy mode, no EAE)" >> "$SPORE_LOG"
                     echo "SPORE-WRAP: removed EAE prefix hint: $arg" >&2
@@ -281,7 +306,7 @@ if [ "$spore_replaced" = "1" ]; then
         # Inject native decoder only when audio output is copy -- EAE not needed,
         # native decoder prevents eac3_eae from being auto-selected on HTTP input.
         # Stale PCM + EAC3 CDN case is handled above via force-copy (_needs_eae=1).
-        if [ "$i_pos_n" -gt 0 ] && [ "$_audio_output_is_copy" = "1" ]; then
+        if [ "$i_pos_n" -gt 0 ] && { [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; }; then
             front=("${newargs[@]:0:$i_pos_n}")
             back=("${newargs[@]:$i_pos_n}")
             # Use removed EAE stream indices if available; otherwise default to 1
@@ -325,7 +350,48 @@ if [ "$spore_replaced" = "1" ]; then
         fi
     done
 
+    # Pre-input -codec:0 is Plex's decoder hint for the source; it reflects the
+    # stub video codec, which now matches the real CDN codec. Compare its codec
+    # family to the chosen output encoder family. When they match (or the source
+    # is unknown), the client accepts the source codec, so copy it through
+    # untouched (pristine, no GPU). When they differ (e.g. HEVC source but H264
+    # output for a client that cannot decode HEVC), let Plex transcode instead of
+    # force-copying, so the stream actually plays on that client.
+    _vcodec_pre=""
+    for idx in "${!newargs[@]}"; do
+        [ "${newargs[$idx]}" = "-i" ] && break
+        [ "${newargs[$idx]}" = "-codec:0" ] && _vcodec_pre="${newargs[$((idx+1))]:-}"
+    done
+    _codec_family() {
+        case "$1" in
+            *hevc*|*h265*|*265*) echo "hevc" ;;
+            *h264*|*264*|*avc*)  echo "h264" ;;
+            *av1*)               echo "av1" ;;
+            *vp9*)               echo "vp9" ;;
+            *)                   echo "$1" ;;
+        esac
+    }
+    _src_fam=$(_codec_family "$_vcodec_pre")
+    _out_fam=$(_codec_family "$_vcodec_post")
+
+    # By default copy the source through (the efficient passthrough capable
+    # clients want). Transcode ONLY when Plex downgraded to H.264 from an advanced
+    # source codec (HEVC / AV1 / VP9): that means the client cannot decode the
+    # source, so a copy would fail and a real re-encode is needed. Same-codec
+    # outputs, "upgrades" the client merely prefers (e.g. H264 source to HEVC),
+    # and unknown sources all stay copy, so currently working playback is
+    # untouched.
+    _do_video_copy=0
     if [ -n "$_vcodec_post" ] && [ "$_vcodec_post" != "copy" ]; then
+        if [ "$_out_fam" = "h264" ] && { [ "$_src_fam" = "hevc" ] || [ "$_src_fam" = "av1" ] || [ "$_src_fam" = "vp9" ]; }; then
+            echo "$(date '+%H:%M:%S') WRAP letting Plex transcode video (src=${_src_fam:-?} -> h264; client cannot decode source)" >> "$SPORE_LOG"
+            echo "SPORE-WRAP: letting Plex transcode video (src=${_src_fam:-?} -> ${_out_fam:-?})" >&2
+        else
+            _do_video_copy=1
+        fi
+    fi
+
+    if [ "$_do_video_copy" = "1" ]; then
         echo "$(date '+%H:%M:%S') WRAP force video copy (was: $_vcodec_post)" >> "$SPORE_LOG"
         echo "SPORE-WRAP: forcing video copy (was: $_vcodec_post)" >&2
         _vhl=""
@@ -509,6 +575,23 @@ if [ "$spore_replaced" = "1" ]; then
     [ "$_sub_optional_count" -gt 0 ] && \
         echo "$(date '+%H:%M:%S') WRAP made $_sub_optional_count sub-map(s) optional" >> "$SPORE_LOG"
 
+    # ── Trim oversized probe for spore inputs ────────────────────────────────
+    # Plex passes -analyzeduration/-probesize 20000000 (20 MB / 20 s), sized for
+    # blind network sources. Spore inputs are served moov-first (or via the
+    # hardened cold proxy), so FFmpeg gets full stream info from the moov up
+    # front and needn't buffer 20 MB before emitting the first segment — which
+    # just delays playback start. Trim the oversized default to a still-safe
+    # 5 MB / 5 s. Only rewrites the exact 20000000 default, nothing else.
+    for idx in "${!newargs[@]}"; do
+        case "${newargs[$idx]}" in
+            -analyzeduration|-probesize)
+                if [ "${newargs[$((idx+1))]:-}" = "20000000" ]; then
+                    newargs[$((idx+1))]="5000000"
+                fi ;;
+        esac
+    done
+    echo "$(date '+%H:%M:%S') WRAP trimmed probe/analyzeduration 20M->5M (moov-first)" >> "$SPORE_LOG"
+
     # ── Muxer error tolerance ──────────────────────────────────────────────────
     # -max_interleave_delta 0 : video keeps flowing even if audio stalls
     # -max_muxing_queue_size  : bigger buffer for audio seek-sync recovery
@@ -532,8 +615,12 @@ if [ "$spore_replaced" = "1" ]; then
 fi
 
 if [ "$spore_replaced" = "1" ]; then
-    echo "=== $(date '+%H:%M:%S') SPORE session ===" >> /config/spore-ffmpeg-stderr.log
+    echo "=== $(date '+%H:%M:%S') SPORE session ===" >> "$FFMPEG_STDERR_LOG"
+    # The EXIT trap above never fires here: exec replaces this process image
+    # instead of letting the shell exit normally, so clean up explicitly first.
+    [ -n "$_strm_tmp_minfo" ] && rm -f "$_strm_tmp_minfo"
     exec '/usr/lib/plexmediaserver/Plex Transcoder.real' "${newargs[@]}" \
-        2>>/config/spore-ffmpeg-stderr.log
+        2>>"$FFMPEG_STDERR_LOG"
 fi
+[ -n "$_strm_tmp_minfo" ] && rm -f "$_strm_tmp_minfo"
 exec '/usr/lib/plexmediaserver/Plex Transcoder.real' "${newargs[@]}"

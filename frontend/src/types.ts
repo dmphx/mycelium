@@ -39,10 +39,20 @@ export interface TmdbDetail extends TmdbItem {
   }>;
   number_of_seasons?: number;
   number_of_episodes?: number;
-  cast?: Array<{ name: string; character: string; profile_path: string | null }>;
+  cast?: Array<{ id: number; name: string; character: string; profile_path: string | null }>;
   trailers?: Array<{ key: string; name: string; site: string }>;
   providers?: { flatrate: Provider[]; link: string | null };
   recommendations?: TmdbItem[];
+}
+
+export interface PersonDetail {
+  id: number;
+  name: string;
+  biography: string;
+  profile_path: string | null;
+  birthday: string | null;
+  place_of_birth: string | null;
+  filmography: Array<TmdbItem & { character?: string }>;
 }
 
 export interface WatchlistItem {
@@ -91,6 +101,10 @@ export interface SessionInfo {
     auto_approve: boolean;
     region: string;
     library_click_jellyfin?: boolean;
+    trakt_connected?: boolean;
+    trakt_username?: string | null;
+    discover_language_include?: string;
+    discover_language_exclude?: string;
   } | null;
 }
 

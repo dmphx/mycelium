@@ -2,6 +2,72 @@
 
 All notable changes to Mycelium are documented in this file.
 
+## [0.6.1] - 2026-07-05
+
+A security- and correctness-focused release from a full multi-pass code review. No new features.
+
+### Security
+
+- OIDC and trusted-proxy logins no longer implicitly become admin - `auth.py` now resolves or creates a real per-user role (`user` by default; only the very first user ever provisioned this way becomes admin, and only during initial, incomplete setup)
+- `AUTH_SESSION_SECRET` is no longer used to sign sessions when left at the well-known default value - a random secret is generated and persisted instead, same pattern as the existing `WEBHOOK_SECRET_AUTO`
+- Added `is_admin()` checks to roughly 30 previously-unprotected `/ui/*` and `/ui/api/*` routes: settings save/reset, backup restore, DB vacuum/prune, cleanup/repair/migrate triggers, Zilean sync/import, wanted-recheck, NFO/strm regeneration, and several legacy `/api/*` aliases that had slipped through
+- `/admin` itself now redirects non-admin users to login instead of only checking that setup is complete
+- Web Player `/stream/<token>/*` playback routes now require an authenticated session with the Web Player feature enabled - previously reachable by anyone who obtained a token
+- `TRUSTED_PROXY_NETWORKS` default narrowed from broad private-IP ranges to loopback only
+- Webhook secret and internal token comparisons now use constant-time comparison throughout
+- The Spore TCP server (port 8089, unauthenticated protocol) now binds to loopback by default instead of all interfaces
+
+### Fixed
+
+- A transient scraper/cache-check error on a single episode could mark an entire multi-season request "failed", discarding seasons that had already been added successfully
+- The retry queue could silently drop a failed retry and abort the rest of that cycle's batch instead of continuing
+- Cleanup/repair and canonical-name migration could leave orphaned database rows behind after deleting or merging `.strm` files, permanently blocking recreation of that title
+- Folder rename/merge database updates could corrupt a sibling folder's paths when one folder name was a literal prefix of another (e.g. "Alien (1979)" vs. "Alien (1979) Directors Cut")
+- Duplicate-folder merges could silently delete a file that was never actually copied over first
+- Plex's fast-start MP4 cache could corrupt sample offsets for CDN files with a second data block after the `moov` atom (dual-mdat layout)
+- HTTP suffix byte-ranges (`bytes=-N`) were parsed as the first N bytes instead of the last N
+- CSRF protection was effectively disabled on roughly 27 internal API routes because the exemption predated the frontend actually sending the CSRF token
+- Several background jobs (series monitor, retry queue) could abort an entire batch when a single item raised an unexpected error instead of continuing with the rest
+- Assorted smaller fixes: SQLite `LIKE` wildcard characters in folder names could cause wrong-path matches during renames; a webplayer seek race could start two concurrent FFmpeg processes for the same session; two `/api/*` routes referenced an unimported module and would have raised on use
+
+## [0.6.0] - 2026-07-04
+
+### Credits
+
+Several of the bugfixes in this release were discovered and/or confirmed through the work of [Ventrex](https://github.com/Ventrex/mycelium) in his fork ("VenFlix") and the accompanying [GitHub Discussions](https://github.com/corveck79/mycelium/discussions). Thanks for digging into these issues and sharing the fixes/ideas with the community.
+
+Thanks also to [Damosso](https://github.com/Damosso) for the Seerr webhook secret tip in [#41](https://github.com/corveck79/mycelium/issues/41), which shaped a docs fix earlier in this cycle.
+
+### Added
+
+- **Trakt**: auto-request new watchlist items for download (not just watchlist sync), capped daily, built into the existing Trakt plugin
+- **MDBList integration**: connect your own API key, pick lists to sync, capped auto-request
+- **Auto-approve**: per-genre rules with year ranges, follow favorite actors (auto-requests their filmography, excludes talk shows/soaps), shared daily budget
+- **Discover genre tabs**: admin-configurable browse rows per genre + year range
+- **Language filter**: per-user include/exclude of content by original language in Discover
+- **Clickable cast**: cast in the detail modal opens an actor page with bio + filmography + Follow button
+- **TorBox library scan**: reads existing TorBox cache and creates `.strm` files for anything missing (e.g. after a DB reset)
+- **Notification settings** in the React Settings page (Discord/Telegram)
+- **Real topbar search bar** instead of just a link to the search page
+- **React Admin dashboard finally routed**: `/admin` now shows a tab between the new dashboard (user management, Radarr/Sonarr import, Auto-approve, genre tabs, maintenance) and the existing Jinja page - this page already existed but was never wired to a route
+
+### Fixed
+
+- Settings-UI overrides were silently ignored in several places (Zilean, TMDB, RealDebrid, TorBox, OpenSubtitles, catbox) due to frozen `config.py` imports instead of `settings.get()`
+- Mislabeled cams/trailers (e.g. "2160p" that's actually a cam) are now rejected based on physically plausible file size vs. TMDB runtime
+- Unreleased titles could pull in fake/cam releases - now blocked via TMDB release date
+- Multi-season series only got season 1 into the library
+- Duplicate episode tokens/strms when title sanitizing landed differently
+- `db.insert_request()` could update the wrong row on retry (SQLite `lastrowid` quirk), leaving requests permanently stuck on "rate_limited"
+- TorBox timeouts were treated as success, writing a `.strm` before the torrent was actually ready
+- Series could end up split across multiple folders due to varying release names
+- Jellyfin library refresh had no debounce, could fire excessively during bulk operations
+- Raw IMDb IDs (`tt1234567`) instead of titles shown in notifications/UI for requests without a title in the payload
+- Toggle switches in the admin user panel rendered incorrectly (knob always on the right regardless of state)
+- Clickable cast was invisible due to a z-index conflict between the detail and actor modals
+- Removed a duplicate, colliding Trakt integration (a new build on top of an already-existing plugin) - including a database schema conflict that broke the existing plugin
+- Web Player: `/ui/api/web-player/status/<job_id>` silently dropped `token`/`stream_type` from its JSON response, so the frontend always fell into the HLS.js branch (pointed at a raw MP4 redirect instead of a playlist) instead of direct-playing eligible files, causing an infinite retry/timeout loop
+
 ## [0.5.2] - 2026-06-12
 
 ### Added

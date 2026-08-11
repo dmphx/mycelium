@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import date
 
+import blacklist
 import db
 import seerr
 import tmdb
@@ -100,53 +101,80 @@ def _sync_wanted(imdb_id: str, tmdb_id: int, title: str, seasons: list[int],
                 db.mark_episode_status(imdb_id, season, ep_num, "wanted")
 
 
+def _check_one_series(series: dict) -> None:
+    """Refresh one monitored series: resolve TMDB id, detect new seasons,
+    refresh its wanted-episode list. Split out of run_series_check so a
+    failure on one series (network error, bad TMDB response, ...) can't
+    abort the whole batch - the caller wraps this in try/except per series."""
+    imdb_id = series["imdb_id"]
+    title = series["title"]
+    tmdb_id = series["tmdb_id"]
+    seasons = [int(s) for s in (series["seasons"] or "1").split(",") if s.strip().isdigit()]
+    monitor_mode = series.get("monitor_mode") or "all"
+    since = series.get("added_at_date")
+
+    # Resolve TMDB ID if missing
+    if not tmdb_id:
+        tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
+        if tmdb_id:
+            db.update_monitored_series(series["id"], tmdb_id=tmdb_id)
+
+    if not tmdb_id:
+        log.warning("Monitor: no TMDB ID for %s; skipping", title)
+        db.update_monitored_series(series["id"])
+        return
+
+    # Detect new seasons via TMDB. For 'selected' mode we never auto-expand  -
+    # the user picked specific seasons. For 'all' and 'future' we pick up new
+    # seasons as they're announced.
+    if monitor_mode != "selected":
+        show = tmdb.get_show_info(tmdb_id)
+        if show:
+            total = show.get("number_of_seasons") or 0
+            new_seasons = [s for s in range(1, total + 1) if s not in seasons]
+            if new_seasons:
+                log.info("Monitor: new season(s) %s detected for %s", new_seasons, title)
+                seasons = sorted(set(seasons) | set(new_seasons))
+                db.update_monitored_series(series["id"], seasons=seasons)
+
+    # Refresh wanted list (mode-aware)
+    _sync_wanted(imdb_id, tmdb_id, title, seasons, monitor_mode=monitor_mode, since=since)
+    db.update_monitored_series(series["id"])
+
+
 def run_series_check() -> None:
     """Periodic: refresh episode lists, detect new seasons, retry wanted."""
     log.info("Monitor: starting series check")
     today = _TODAY()
 
-    for series in db.get_monitored_series(status="active"):
-        imdb_id = series["imdb_id"]
+    series_batch = max(1, int(os.environ.get("MONITORED_SERIES_BATCH", "250") or "250"))
+    episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
+    retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
+
+    for series in db.get_monitored_series(status="active", limit=series_batch):
         title = series["title"]
-        tmdb_id = series["tmdb_id"]
-        seasons = [int(s) for s in (series["seasons"] or "1").split(",") if s.strip().isdigit()]
-        monitor_mode = series.get("monitor_mode") or "all"
-        since = series.get("added_at_date")
-
-        # Resolve TMDB ID if missing
-        if not tmdb_id:
-            tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
-            if tmdb_id:
-                db.update_monitored_series(series["id"], tmdb_id=tmdb_id)
-
-        if not tmdb_id:
-            log.warning("Monitor: no TMDB ID for %s; skipping", title)
-            db.update_monitored_series(series["id"])
-            continue
-
-        # Detect new seasons via TMDB. For 'selected' mode we never auto-expand  - 
-        # the user picked specific seasons. For 'all' and 'future' we pick up new
-        # seasons as they're announced.
-        if monitor_mode != "selected":
-            show = tmdb.get_show_info(tmdb_id)
-            if show:
-                total = show.get("number_of_seasons") or 0
-                new_seasons = [s for s in range(1, total + 1) if s not in seasons]
-                if new_seasons:
-                    log.info("Monitor: new season(s) %s detected for %s", new_seasons, title)
-                    seasons = sorted(set(seasons) | set(new_seasons))
-                    db.update_monitored_series(series["id"], seasons=seasons)
-
-        # Refresh wanted list (mode-aware)
-        _sync_wanted(imdb_id, tmdb_id, title, seasons, monitor_mode=monitor_mode, since=since)
-        db.update_monitored_series(series["id"])
+        try:
+            _check_one_series(series)
+        except Exception as exc:
+            log.error("Monitor: series check failed for %s: %s", title, exc)
 
     # Retry wanted episodes  -  keep watching indefinitely (like Radarr/Sonarr).
     # In catbox mode no TorBox quota is consumed so we never pause for budget.
     import processor
+    import time
+    import indexer_backoff
     catbox_mode = _settings.get("CATBOX_MODE", False)
-    wanted = db.get_wanted_episodes(max_attempts=10_000)
+    wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
     for ep in wanted:
+        # Respect Torrentio's 429 backoff: when the scraper pool is throttled,
+        # sleep it off before searching the next episode instead of hammering a
+        # provider that has already told us we're too fast. Only the monitor
+        # waits here; interactive/webhook searches never block on this.
+        _cooldown = indexer_backoff.remaining()
+        if _cooldown > 0:
+            log.info("Monitor: scraper pool in 429 backoff  -  sleeping %.0fs before next search",
+                     _cooldown)
+            time.sleep(_cooldown)
         air_date = ep.get("air_date")
         if air_date and air_date > today:
             db.mark_episode_status(ep["imdb_id"], ep["season"], ep["episode"], "not_aired")
@@ -169,6 +197,13 @@ def run_series_check() -> None:
                 continue
             log.info("Monitor: rate limited  -  pausing episode retries until next run")
             break
+        except Exception as exc:
+            # One bad episode (network error, unexpected API shape, ...) must
+            # not abort retries for every other wanted episode this cycle.
+            log.error("Monitor: retry failed for %s S%02dE%02d: %s",
+                      ep["title"], ep["season"], ep["episode"], exc)
+        if retry_delay > 0:
+            time.sleep(retry_delay)
 
     log.info("Monitor: series check complete")
 
@@ -213,8 +248,22 @@ def _retry_episode(ep: dict) -> bool:
         if s.info_hash not in seen_hashes:
             seen_hashes.add(s.info_hash)
             streams.append(s)
+    import mediafusion as _mf
+    import prowlarr as _pa
+    for s in _mf.fetch_streams("series", imdb_id, season=season, episode=episode):
+        if s.info_hash not in seen_hashes:
+            seen_hashes.add(s.info_hash)
+            streams.append(s)
+    for s in _pa.fetch_streams("series", imdb_id, season=season, episode=episode):
+        if s.info_hash not in seen_hashes:
+            seen_hashes.add(s.info_hash)
+            streams.append(s)
 
     candidates = torrentio.rank_streams(streams)
+    # Drop hashes already known to fail. processor.py filters at every grab site;
+    # this path did not, so a hash blacklisted after a bad grab was re-picked on
+    # the very next retry and the episode re-broke the same way indefinitely.
+    candidates = blacklist.filter_candidates(candidates)
     if not candidates:
         log.info("Monitor: no acceptable candidates for %s S%02dE%02d (still wanted)",
                  title, season, episode)
@@ -224,7 +273,12 @@ def _retry_episode(ep: dict) -> bool:
     # TorBox add is deferred until first playback  -  no quota consumed here.
     if _settings.get("CATBOX_MODE", False):
         cached_hashes = torbox.check_cached([s.info_hash for s in candidates])
-        best = next((s for s in candidates if s.info_hash in cached_hashes), None)
+        cached = [s for s in candidates if s.info_hash in cached_hashes]
+        import release_sanity
+        cached = release_sanity.filter_cached(
+            cached, kind="episode", season=season, episode=episode,
+            imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+        best = cached[0] if cached else None
         if not best:
             log.info("Monitor: no cached release for %s S%02dE%02d  -  still wanted",
                      title, season, episode)
@@ -243,9 +297,42 @@ def _retry_episode(ep: dict) -> bool:
             log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
         return bool(written)
 
-    cached_hashes = torbox.check_cached([s.info_hash for s in candidates])
-    ordered = [s for s in candidates if s.info_hash in cached_hashes] or candidates[:1]
+    # check_cached is torrent-only; usenet candidates always look "uncached"
+    # so they get prioritised after cached torrents. That's the desired order:
+    # cached torrent (instant) > NZB (downloaded fresh, usually fast) > uncached torrent.
+    torrent_hashes = [s.info_hash for s in candidates if not s.is_usenet]
+    cached_hashes = torbox.check_cached(torrent_hashes) if torrent_hashes else set()
+    cached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes]
+    # Drop any cached torrent whose real TorBox files aren't this episode (e.g. a
+    # full-season/complete-series pack with no identifiable SxxEyy file), so we
+    # don't add a hash that can never materialise this episode.
+    import release_sanity
+    cached_torrents = release_sanity.filter_cached(
+        cached_torrents, kind="episode", season=season, episode=episode,
+        imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+    nzbs = [s for s in candidates if s.is_usenet]
+    uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
+    ordered = cached_torrents + nzbs + uncached_torrents
+    if not ordered:
+        ordered = candidates[:1]
     for stream in ordered:
+        if stream.is_usenet:
+            if not stream.nzb_url:
+                continue
+            try:
+                torbox.add_nzb(stream.nzb_url, name=stream.title, reason="series-monitor-nzb")
+                log.info("Monitor: added NZB %s S%02dE%02d (%s)",
+                         title, season, episode, stream.source)
+                return True
+            except torbox.RateLimited:
+                raise processor.RateLimited()
+            except Exception as exc:
+                if "429" in str(exc):
+                    raise processor.RateLimited()
+                log.warning("Monitor: NZB add failed %s S%02dE%02d: %s",
+                            title, season, episode, exc)
+                continue
+
         # Skip createtorrent if already in the TorBox library.
         existing = torbox.find_by_hash(stream.info_hash)
         if existing and torbox._is_ready(existing):
@@ -253,13 +340,17 @@ def _retry_episode(ep: dict) -> bool:
             return True
         try:
             torbox.add_magnet(stream.magnet, reason="series-monitor")
-            torbox.wait_until_ready(stream.info_hash)
+            added_item = torbox.wait_until_ready(stream.info_hash)
+            if not added_item or not torbox._is_ready(added_item):
+                log.info("Monitor: %s S%02dE%02d still downloading  -  strm will follow once ready",
+                         title, season, episode)
+                return False
             log.info("Monitor: added %s S%02dE%02d", title, season, episode)
             return True
         except torbox.RateLimited:
             raise processor.RateLimited()
         except Exception as exc:
-            if "429" in str(exc):
+            if processor._is_429(exc):
                 raise processor.RateLimited()
             log.warning("Monitor: failed to add %s S%02dE%02d: %s", title, season, episode, exc)
 
@@ -289,10 +380,22 @@ def search_episode_now(imdb_id: str, title: str, season: int, episode: int) -> b
 def _search_and_add_season(imdb_id: str, title: str, seasons: list[int]) -> None:
     for season in seasons:
         streams: list = []
+        seen_pack: set = set()
         if _settings.get("ZILEAN_ENABLED", False):
-            streams = zilean.fetch_streams(imdb_id, season=season, episode=1)
-        if not streams:
-            streams = torrentio.fetch_streams("series", imdb_id, season=season, episode=1)
+            for s in zilean.fetch_streams(imdb_id, season=season, episode=1):
+                if s.info_hash not in seen_pack:
+                    seen_pack.add(s.info_hash); streams.append(s)
+        for s in torrentio.fetch_streams("series", imdb_id, season=season, episode=1):
+            if s.info_hash not in seen_pack:
+                seen_pack.add(s.info_hash); streams.append(s)
+        import mediafusion as _mf
+        import prowlarr as _pa
+        for s in _mf.fetch_streams("series", imdb_id, season=season, episode=1):
+            if s.info_hash not in seen_pack:
+                seen_pack.add(s.info_hash); streams.append(s)
+        for s in _pa.fetch_streams("series", imdb_id, season=season, episode=1):
+            if s.info_hash not in seen_pack:
+                seen_pack.add(s.info_hash); streams.append(s)
         candidates = torrentio.rank_streams(streams, prefer_season_pack=True)
         if not candidates:
             continue

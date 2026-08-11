@@ -7,11 +7,20 @@ services:
     ports:
       - "8088:8088"
       - "8089:8089"
+      # spore-nfs: unauthenticated NFSv3 export. Pin to host loopback so it is
+      # reachable only by Plex (network_mode: host mounts 127.0.0.1:/), never
+      # from the LAN. Do not widen this without adding auth in front.
+      - "127.0.0.1:2049:2049"
     env_file:
       - .env
     environment:
       - LISTEN_HOST=0.0.0.0
       - LISTEN_PORT=8088
+      # WARNING: opens the dashboard to anyone who reaches port 8088.
+      # Acceptable for local development on a trusted LAN. For any deploy
+      # reachable beyond localhost, remove this line and configure one of
+      # AUTH_ENABLED, OIDC_ENABLED, or TRUSTED_PROXY_AUTH instead.
+      - INSECURE_ALLOW_ANON=true
     devices:
       - /dev/dri:/dev/dri
     group_add:

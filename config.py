@@ -21,14 +21,54 @@ def _env_int(name: str, default: int) -> int:
         raise RuntimeError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be a number, got {raw!r}") from exc
+
+
 TORBOX_API_KEY = _env("TORBOX_API_KEY", "")
 TORBOX_BASE_URL = _env("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
 
 ZILEAN_URL = _env("ZILEAN_URL", "")
 ZILEAN_ENABLED = _env("ZILEAN_ENABLED", "false").lower() in ("1", "true", "yes")
+# "external": call an existing iPromKnight/zilean HTTP service (ZILEAN_URL above).
+# "native": run a built-in DMM hashlist index in SQLite, no separate service needed.
+ZILEAN_MODE = _env("ZILEAN_MODE", "external")
+ZILEAN_DB_PATH = _env("ZILEAN_DB_PATH", "/data/zilean_native.db")
+# One-time bulk import from an existing external Zilean's Postgres database,
+# for users switching to native mode who don't want to re-scrape from scratch.
+# Only used when explicitly triggered (see /ui/api/zilean/import).
+ZILEAN_PG_HOST = _env("ZILEAN_PG_HOST", "")
+ZILEAN_PG_PORT = _env_int("ZILEAN_PG_PORT", 5432)
+ZILEAN_PG_DB = _env("ZILEAN_PG_DB", "zilean")
+ZILEAN_PG_USER = _env("ZILEAN_PG_USER", "postgres")
+ZILEAN_PG_PASSWORD = _env("ZILEAN_PG_PASSWORD", "")
 
 TORRENTIO_BASE_URL = _env("TORRENTIO_BASE_URL", "https://torrentio.strem.fun")
 TORRENTIO_OPTS = _env("TORRENTIO_OPTS", "")
+
+# MediaFusion (https://github.com/mhdzumair/MediaFusion). Stremio addon
+# aggregator that fans out to Prowlarr indexers + its own scrapers. Note:
+# MediaFusion only returns results for titles already present in its TMDB-
+# synced metadata catalog (it's a browse-first system), so for the on-demand
+# rebuild flow we prefer Prowlarr-direct (see below). Leave MediaFusion
+# enabled too so it slowly populates and serves cached results back.
+MEDIAFUSION_BASE_URL = _env("MEDIAFUSION_BASE_URL", "")
+MEDIAFUSION_ENABLED  = _env("MEDIAFUSION_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# Prowlarr (https://prowlarr.com). Direct Newznab-style search across every
+# configured indexer (Nyaa for anime, YTS, EZTV, TorrentGalaxy, Pirate Bay,
+# Knaben, Internet Archive, LimeTorrents, MixtapeTorrent, Zilean, ...).
+# Unlike MediaFusion this hits indexers live per call (no pre-seeded
+# catalog required), which is the right shape for the on-demand pipeline.
+PROWLARR_BASE_URL = _env("PROWLARR_BASE_URL", "")
+PROWLARR_API_KEY  = _env("PROWLARR_API_KEY", "")
+PROWLARR_ENABLED  = _env("PROWLARR_ENABLED", "false").lower() in ("1", "true", "yes")
 
 JELLYFIN_URL = _env("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = _env("JELLYFIN_API_KEY", "")
@@ -37,6 +77,18 @@ SEERR_URL = _env("SEERR_URL", "")
 SEERR_API_KEY = _env("SEERR_API_KEY", "")
 
 TMDB_API_KEY = _env("TMDB_API_KEY", "")
+
+# Trakt.tv OAuth app credentials (create one at https://trakt.tv/oauth/applications).
+# Per-user access/refresh tokens are stored in the users table after the device-code
+# flow completes; these are only the app-level client id/secret.
+TRAKT_CLIENT_ID = _env("TRAKT_CLIENT_ID", "")
+TRAKT_CLIENT_SECRET = _env("TRAKT_CLIENT_SECRET", "")
+# Cap on how many watchlist items a single sync run will auto-request, so a huge
+# imported watchlist can't flood TorBox's createtorrent quota in one go.
+TRAKT_AUTO_REQUEST_CAP = _env_int("TRAKT_AUTO_REQUEST_CAP", 10)
+
+# MDBList: per-user API key (mdblist.com/preferences), no app-level credentials needed.
+MDBLIST_AUTO_REQUEST_CAP = _env_int("MDBLIST_AUTO_REQUEST_CAP", 10)
 
 LISTEN_HOST = _env("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = _env_int("LISTEN_PORT", 8088)
@@ -56,6 +108,11 @@ EXCLUDE_DV_P5 = _env("EXCLUDE_DV_P5", "true").lower() in ("1", "true", "yes")
 # "only cam available, allowing them" fallback). When false, cam is allowed
 # only if it's the sole option.
 STRICT_NO_CAM = _env("STRICT_NO_CAM", "false").lower() in ("1", "true", "yes")
+# Reject candidates whose file size is implausibly small for their claimed
+# quality and the title's real (TMDB) runtime  -  catches releases that lie
+# about their quality (a cam mislabeled as "2160p") or aren't the full title
+# at all (a trailer standing in for the movie).
+EXCLUDE_UNDERSIZED_RELEASES = _env("EXCLUDE_UNDERSIZED_RELEASES", "true").lower() in ("1", "true", "yes")
 PREFER_WEBDL = _env("PREFER_WEBDL", "true").lower() in ("1", "true", "yes")
 PREFER_HEVC = _env("PREFER_HEVC", "true").lower() in ("1", "true", "yes")
 # Minimum seeders to include a candidate (0 = no filter; unknown seeders always pass).
@@ -64,6 +121,54 @@ MIN_SEEDERS = _env_int("MIN_SEEDERS", 3)
 MAX_SIZE_GB = _env_int("MAX_SIZE_GB", 0)
 # Audio language preference (comma-separated codes: nl, en, multi). Empty = no preference.
 AUDIO_LANGUAGE_PREFERENCE = [l.strip().lower() for l in _env("AUDIO_LANGUAGE_PREFERENCE", "").split(",") if l.strip()]
+
+# ── Release sanity check (mislabeled-pack guard) ──────────────────────────────
+# When a requested title has no *properly* cached release, TorBox can still
+# report a cache HIT on a hash that shares the imdb_id but is obviously not the
+# requested single movie/episode  -  the classic case is a single-movie request
+# latching onto a 525 GB "Complete Series" pack that happens to carry the same
+# imdb_id (TMDB original_title collisions, e.g. "2099: The Soldier Protocol"
+# scraping as "The.Wheel.2019.*"). Grabbing it marks the request success while
+# playback 404s. These knobs let the pipeline reject such candidates at grab
+# time so a wrong hash is never stored or marked success.
+#
+# A single movie whose total (or main-file) size exceeds this is almost always a
+# pack/collection, not one film. 0 disables the size check.
+#
+# Default 100 (not ~25): this library holds many single 4K/2160p movies that
+# legitimately run 25-90 GB (a 4K WEB-DL or upscaled remux of a long film), so a
+# 25 GB cap flags hundreds of real movies. Multi-hundred-GB series packs and
+# movie collections (the "525 GB Star Trek Complete Series" incident) sit well
+# above 100 GB, and pack-NAMED collections are caught by SERIES_PACK_NAME_REGEX
+# at any size, so 100 GB is the size backstop for packs with an innocent name.
+MAX_MOVIE_SIZE_GB = _env_float("MAX_MOVIE_SIZE_GB", 100.0)
+# Release names matching this regex are season/series/multi-title packs, never a
+# single movie. Deliberately narrow (requires a digit/range/plural or an
+# unambiguous multi-title word next to the pack word) so single films like
+# "A Complete Unknown", "Season of the Witch" or "Seven Samurai (Criterion
+# Collection)" are NOT caught. Empty disables it.
+SERIES_PACK_NAME_REGEX = _env(
+    "SERIES_PACK_NAME_REGEX",
+    r"(?:"
+    r"complete[\s._-]*(?:series|collection|seasons?|set|pack|saga|anthology)"
+    r"|complete[\s._-]*(?:tv[\s._-]*)?show"
+    r"|\bseasons\b"
+    r"|\bseason[\s._-]*\d{1,2}[\s._-]*[-–][\s._-]*\d{1,2}\b"
+    r"|\bseason[\s._-]*\d{1,2}\b"
+    r"|\bs\d{1,2}[\s._-]*[-–][\s._-]*s?\d{1,2}\b"
+    r"|\b\d{1,2}[\s._-]*[-–][\s._-]*\d{1,2}[\s._-]*seasons?\b"
+    r"|\b(?:tri|du|quadri|penta|hexa)logy\b"
+    r"|\b\d{1,3}[\s._-]*(?:movie|film)s?[\s._-]*(?:collection|pack|set|anthology)\b"
+    r"|\b\d{2,3}[\s._-]*(?:movies|films)\b"
+    r"|\bmega[\s._-]*pack\b"
+    r"|\bbox[\s._-]?set\b"
+    r"|\ball[\s._-]*\d{1,2}[\s._-]*(?:movies|films)\b"
+    r")",
+)
+# When true, verify a chosen (usually cached) release actually resolves to a
+# sane single video file that matches the request before writing its .strm and
+# marking success. When nothing sane is cached the title stays 'wanted' instead.
+VERIFY_RELEASE_BEFORE_GRAB = _env("VERIFY_RELEASE_BEFORE_GRAB", "true").lower() in ("1", "true", "yes")
 # Languages to hard-block (comma-separated codes, e.g. ru). Torrents detected as
 # exclusively in a blocked language are filtered out before sorting.
 EXCLUDE_LANGUAGES = [l.strip().lower() for l in _env("EXCLUDE_LANGUAGES", "").split(",") if l.strip()]
@@ -73,6 +178,10 @@ TORBOX_POLL_INTERVAL_SEC = _env_int("TORBOX_POLL_INTERVAL_SEC", 2)
 TORBOX_POLL_TIMEOUT_SEC = _env_int("TORBOX_POLL_TIMEOUT_SEC", 600)
 
 WEBHOOK_SECRET = _env("WEBHOOK_SECRET", "")
+# Separate secret guarding the TorBox completion-notification endpoint. Empty
+# means unauthenticated (legacy behaviour); set it and configure the same
+# value as the TorBox webhook signing header to reject spoofed callbacks.
+TORBOX_WEBHOOK_SECRET = _env("TORBOX_WEBHOOK_SECRET", "")
 METRICS_TOKEN  = _env("METRICS_TOKEN", "")   # optional Bearer token for /metrics scraping
 
 DB_PATH = _env("DB_PATH", "/data/requests.db")
@@ -90,6 +199,14 @@ MAX_RETRY_ATTEMPTS = _env_int("MAX_RETRY_ATTEMPTS", 10)
 
 # Automatic Jellyfin merge of duplicate movie versions (every N hours; 0 disables).
 MERGE_VERSIONS_INTERVAL_HOURS = _env_int("MERGE_VERSIONS_INTERVAL_HOURS", 6)
+
+# Debounce/coalesce Jellyfin full-library scans (jellyfin.refresh_library). Many
+# code paths call it unconditionally; a burst of /Library/Refresh would otherwise
+# trigger overlapping full scans that cancel-restart each other, pinning CPU and
+# OOM-killing Jellyfin. Collapse a burst into one scan after this quiet window,
+# then enforce a cooldown so scans fire no more often than the minimum interval.
+JELLYFIN_REFRESH_DEBOUNCE_SEC = _env_int("JELLYFIN_REFRESH_DEBOUNCE_SEC", 30)
+JELLYFIN_REFRESH_MIN_INTERVAL_SEC = _env_int("JELLYFIN_REFRESH_MIN_INTERVAL_SEC", 300)
 
 # Cleanup/repair scan every N hours (0 disables).
 CLEANUP_INTERVAL_HOURS = _env_int("CLEANUP_INTERVAL_HOURS", 24)
@@ -135,6 +252,48 @@ BACKUP_INTERVAL_HOURS = _env_int("BACKUP_INTERVAL_HOURS", 24)
 RETRY_BACKOFF_MINUTES = [int(x) for x in _env("RETRY_BACKOFF_MINUTES", "60,360,1440").split(",") if x.strip()]
 RETRY_QUEUE_INTERVAL_MINUTES = _env_int("RETRY_QUEUE_INTERVAL_MINUTES", 15)
 
+# TorBox requestdl is intermittently flaky: it returns HTTP 5xx (usually 500)
+# or 429 (rate-limit, typically when several ffmpeg probes hit the same file at
+# once on a first play) and recovers within seconds, so the same token succeeds
+# on a quick retry. Without retrying, a blip surfaces to Jellyfin as a fatal
+# player error (mycelium 404). Retry transient 5xx / 429 / network errors
+# REQUESTDL_RETRIES times (total attempts, incl. the first) with a linear
+# backoff of BACKOFF_MS*attempt. The other 4xx (auth / gone / bad request) are
+# deterministic and never retried.
+REQUESTDL_RETRIES = _env_int("REQUESTDL_RETRIES", 4)
+REQUESTDL_BACKOFF_MS = _env_int("REQUESTDL_BACKOFF_MS", 600)
+# On a 429 we honor the server's Retry-After header when present, but never wait
+# longer than this many seconds (a large suggested delay would stall playback
+# past ffmpeg's own timeout); above the cap we fall back to the linear backoff.
+REQUESTDL_RETRY_AFTER_CAP_SEC = _env_int("REQUESTDL_RETRY_AFTER_CAP_SEC", 5)
+
+# Preload CDN-cache pacing. The catbox preload loop calls requestdl once per
+# episode token with no spacing, and up to PRELOAD_CONCURRENCY shows preload at
+# once, so a few season packs stampede TorBox requestdl into a sustained 429.
+# A failed (429) requestdl skips the slow spore probe, so the loop then fires
+# the next file almost instantly, which keeps the rate limit tripped (a feedback
+# loop). Gate preload requestdl calls to one per MIN_INTERVAL globally, and cap
+# concurrent preload threads. Interactive playback (/stream and /spore-stream)
+# does NOT go through this gate and stays low latency. Set INTERVAL to 0 to
+# restore the old un-paced behavior.
+PRELOAD_REQUESTDL_MIN_INTERVAL_SEC = _env_float("PRELOAD_REQUESTDL_MIN_INTERVAL_SEC", 1.5)
+PRELOAD_CONCURRENCY = _env_int("PRELOAD_CONCURRENCY", 2)
+# Preload circuit breaker. When TorBox trips its account-wide requestdl rate
+# limit it returns 429 with a Retry-After (observed up to ~130s). Rather than
+# the preload loop poking it every few seconds for the whole window, record the
+# cooldown and pause preload requestdl until it passes, capped at this many
+# seconds so a pathological Retry-After cannot freeze preload. Set to 0 to
+# disable the breaker. Interactive playback is never gated by this.
+PRELOAD_BREAKER_MAX_COOLDOWN_SEC = _env_int("PRELOAD_BREAKER_MAX_COOLDOWN_SEC", 600)
+
+# Default cooldown applied when requestdl fails without a usable Retry-After:
+# any 5xx, or a 429 whose Retry-After header is missing or unparseable. Without
+# this the breaker only armed on 429+Retry-After, so a TorBox 5xx storm sailed
+# straight through and the background loops kept hammering requestdl, starving
+# interactive playback that shares the endpoint. Capped by the max above; set to
+# 0 to disable the default-cooldown behavior.
+PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC = _env_int("PRELOAD_BREAKER_DEFAULT_COOLDOWN_SEC", 30)
+
 # ── Auto-upgrade ──────────────────────────────────────────────────────────────
 # Periodically check for higher-quality cached releases and upgrade existing strm.
 AUTO_UPGRADE_ENABLED = _env("AUTO_UPGRADE_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -163,6 +322,13 @@ DISNEY_NL_TOP_COUNT = _env_int("DISNEY_NL_TOP_COUNT", 0)
 AUTO_ADD_MIN_RATING = float(_env("AUTO_ADD_MIN_RATING", "6.0"))
 AUTO_ADD_MIN_VOTES = _env_int("AUTO_ADD_MIN_VOTES", 100)
 AUTO_ADD_REGION = _env("AUTO_ADD_REGION", "NL")
+
+# Per-genre auto-approve (year-ranged genre fill) + favorite-actor auto-request.
+# Genre rules themselves are configured at runtime (AUTO_APPROVE_GENRE_RULES,
+# a JSON list) since they're a variable-length list, not a scalar env var.
+AUTO_APPROVE_DAILY_LIMIT = _env_int("AUTO_APPROVE_DAILY_LIMIT", 5)
+AUTO_APPROVE_ACTOR_DAILY_LIMIT = _env_int("AUTO_APPROVE_ACTOR_DAILY_LIMIT", 5)
+AUTO_APPROVE_INTERVAL_HOURS = _env_int("AUTO_APPROVE_INTERVAL_HOURS", 24)
 
 # ── Radarr / Sonarr import ────────────────────────────────────────────────────
 RADARR_URL = _env("RADARR_URL", "")
@@ -219,6 +385,13 @@ AUTH_PASSWORD = _env("AUTH_PASSWORD", "")  # plain (will be upgraded), or empty
 AUTH_SESSION_SECRET = _env("AUTH_SESSION_SECRET", "mycelium-please-change-me")
 COOKIE_SECURE = _env("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 
+# Explicit opt-in for unauthenticated mode. When true, the dashboard and JSON
+# APIs accept any caller as admin (legacy single-user behaviour). When false
+# (default), startup refuses unless AUTH_ENABLED, OIDC_ENABLED, or
+# TRUSTED_PROXY_AUTH is configured. Setting this true on an internet-exposed
+# port grants full admin to anyone who reaches the listener.
+INSECURE_ALLOW_ANON = _env("INSECURE_ALLOW_ANON", "false").lower() in ("1", "true", "yes")
+
 # Trust an upstream proxy that does auth (Authelia / Authentik / Traefik /
 # Cloudflare Access). Only honoured when the request originates from a
 # trusted network so headers can't be spoofed from the public internet.
@@ -226,7 +399,7 @@ TRUSTED_PROXY_AUTH = _env("TRUSTED_PROXY_AUTH", "false").lower() in ("1", "true"
 TRUSTED_PROXY_USER_HEADER = _env("TRUSTED_PROXY_USER_HEADER", "X-Forwarded-User")
 TRUSTED_PROXY_NETWORKS = _env(
     "TRUSTED_PROXY_NETWORKS",
-    "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+    "127.0.0.1/32",
 )
 
 # ── OIDC (native single sign-on, opt-in) ──────────────────────────────────────
@@ -239,6 +412,11 @@ OIDC_CLIENT_SECRET = _env("OIDC_CLIENT_SECRET", "")
 OIDC_SCOPES = _env("OIDC_SCOPES", "openid email profile")
 OIDC_USER_CLAIM = _env("OIDC_USER_CLAIM", "preferred_username")
 OIDC_PROVIDER_NAME = _env("OIDC_PROVIDER_NAME", "SSO")
+# Name of the OIDC `groups` claim entry that grants admin role on first login.
+# Membership is re-evaluated on every login: dropping out of the group demotes
+# the DB user to role='user' on the next sign-in.
+OIDC_GROUPS_CLAIM = _env("OIDC_GROUPS_CLAIM", "groups")
+OIDC_ADMIN_GROUP  = _env("OIDC_ADMIN_GROUP", "admins")
 
 
 def configure_logging() -> None:

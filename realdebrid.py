@@ -8,8 +8,9 @@ import time
 
 import requests
 
+import settings as _settings
 from config import (
-    REALDEBRID_API_KEY,
+    REALDEBRID_API_KEY as _REALDEBRID_API_KEY_DEFAULT,
     REALDEBRID_BASE_URL,
     TORBOX_POLL_INTERVAL_SEC,
     TORBOX_POLL_TIMEOUT_SEC,
@@ -18,12 +19,22 @@ from config import (
 log = logging.getLogger(__name__)
 
 
+def _api_key() -> str:
+    return _settings.get("REALDEBRID_API_KEY", _REALDEBRID_API_KEY_DEFAULT)
+
+
+class RateLimited(Exception):
+    """Raised when RealDebrid returns HTTP 429 and the short in-call retry
+    did not clear it. Callers should reschedule via the retry queue rather
+    than hammering the API or marking the request failed."""
+
+
 def is_configured() -> bool:
-    return bool(REALDEBRID_API_KEY)
+    return bool(_api_key())
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {REALDEBRID_API_KEY}"}
+    return {"Authorization": f"Bearer {_api_key()}"}
 
 
 def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
@@ -102,15 +113,28 @@ def wait_until_ready(rd_id: str) -> dict | None:
     return None
 
 
+_UNRESTRICT_THROTTLE_SEC = 0.25  # 4 req/sec ceiling, well below RD's hard caps
+
+
 def unrestrict_link(link: str, timeout: int = 15) -> str | None:
-    """Convert a RealDebrid hoster link to a direct streaming URL."""
+    """Convert a RealDebrid hoster link to a direct streaming URL.
+
+    Raises RateLimited on HTTP 429 so season-pack callers can back off via
+    the retry queue instead of pounding the same hoster_link in a tight
+    loop (which is what produced multi-minute 429 storms when expanding a
+    20-episode season pack)."""
     try:
         r = requests.post(
             f"{REALDEBRID_BASE_URL.rstrip('/')}/unrestrict/link",
             headers=_headers(), data={"link": link}, timeout=timeout,
         )
+        if r.status_code == 429:
+            log.warning("RealDebrid unrestrict 429 (rate limited)")
+            raise RateLimited("HTTP 429 from /unrestrict/link")
         r.raise_for_status()
         return (r.json() or {}).get("download")
+    except RateLimited:
+        raise
     except Exception as exc:
         log.warning("RealDebrid unrestrict failed: %s", exc)
         return None
@@ -152,12 +176,17 @@ def get_main_video_url(rd_id: str) -> str | None:
 def get_video_files_with_urls(rd_id: str) -> list[tuple[dict, str]]:
     """For a ready RD torrent (typically a season pack), return (file_dict,
     unrestricted_url) for every video file. Used to fan out per-episode
-    .strm files."""
+    .strm files.
+
+    Sleeps _UNRESTRICT_THROTTLE_SEC between consecutive unrestrict calls
+    and re-raises RateLimited so the caller can reschedule the remaining
+    files via the retry queue instead of marking the whole pack failed."""
     info = get_info(rd_id)
     if not info:
         return []
     pairs = _selected_with_links(info)
     out: list[tuple[dict, str]] = []
+    first = True
     for f, hoster_link in pairs:
         path = f.get("path") or f.get("name") or ""
         if not _is_video(path):
@@ -165,6 +194,9 @@ def get_video_files_with_urls(rd_id: str) -> list[tuple[dict, str]]:
         # Skip tiny files (likely featurettes/extras)
         if (f.get("bytes") or 0) < 50 * 1024 * 1024:
             continue
+        if not first:
+            time.sleep(_UNRESTRICT_THROTTLE_SEC)
+        first = False
         direct = unrestrict_link(hoster_link)
         if direct:
             out.append((f, direct))

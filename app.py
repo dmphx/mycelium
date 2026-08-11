@@ -8,6 +8,7 @@ import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, stream_with_context, url_for
 
+import auto_approve
 import backup
 import catbox
 import nfo_generator
@@ -35,6 +36,7 @@ import upgrader
 import watchdog
 import zilean
 from config import (
+    AUTO_APPROVE_INTERVAL_HOURS,
     AUTO_UPGRADE_ENABLED,
     AUTO_UPGRADE_INTERVAL_HOURS,
     BACKUP_INTERVAL_HOURS,
@@ -56,6 +58,7 @@ from config import (
     SEASON_PACK_CHECK_INTERVAL_HOURS,
     SEASON_PACK_CONSOLIDATION_ENABLED,
     STRM_GENERATOR_INTERVAL_HOURS,
+    TORBOX_WEBHOOK_SECRET,
     TRENDING_CHECK_INTERVAL_HOURS,
     TRENDING_PRECACHE_COUNT,
     WEBHOOK_SECRET,
@@ -67,7 +70,21 @@ configure_logging()
 log_buffer.install()
 log = logging.getLogger("mycelium")
 
-APP_VERSION = "0.5.2"
+# ── Startup gate: refuse to run unauthenticated unless explicitly opted in ───
+# Without this gate, a deploy with no auth config + an exposed port hands full
+# admin to any caller. INSECURE_ALLOW_ANON=true preserves the legacy single
+# user experience for local development.
+if not (cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH or cfg.INSECURE_ALLOW_ANON):
+    import sys as _sys
+    log.error(
+        "Refusing to start: no authentication configured. Set one of "
+        "AUTH_ENABLED, OIDC_ENABLED, TRUSTED_PROXY_AUTH, or "
+        "INSECURE_ALLOW_ANON=true (acknowledges that the dashboard is open "
+        "to any caller that reaches the listener)."
+    )
+    _sys.exit(1)
+
+APP_VERSION = "0.6.1"
 
 with open(_path.join(_path.dirname(__file__), "releases.json"), encoding="utf-8") as _f:
     RELEASES: list[dict] = _json.load(_f)
@@ -76,6 +93,7 @@ db.init()
 
 import settings as _settings_mod
 import os as _os
+from pathlib import Path
 LITE_MODE: bool = (
     _settings_mod.get("LITE_MODE", False)
     or _os.getenv("LITE_MODE", "").lower() in ("1", "true", "yes")
@@ -84,14 +102,46 @@ if LITE_MODE:
     log.info("LITE_MODE enabled  -  heavy background schedulers and startup tasks disabled")
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-if cfg.AUTH_SESSION_SECRET == "mycelium-please-change-me":
-    import warnings
-    warnings.warn(
-        "AUTH_SESSION_SECRET is still the default value. "
-        "Set a random string in your environment for production use.",
-        stacklevel=1,
+
+# Session cookies are signed with AUTH_SESSION_SECRET. The default value is
+# a hard-coded public string, so anyone running auth with the default can
+# forge cookies for any user. This hardened fork fails closed: refuse to
+# start when any auth mechanism is active and the secret is still the
+# default, rather than silently auto-generating one (upstream's fallback
+# below still applies to anon deploys, where no session is ever issued).
+_DEFAULT_SESSION_SECRET = "mycelium-please-change-me"
+_secret = (cfg.AUTH_SESSION_SECRET or "").strip()
+_auth_active = cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH
+if not _secret or _secret == _DEFAULT_SESSION_SECRET:
+    if _auth_active:
+        import sys as _sys
+        log.error(
+            "Refusing to start: AUTH_SESSION_SECRET is unset or default while "
+            "auth is enabled. Set it to a long random string (e.g. "
+            "`openssl rand -hex 32`). Session cookies signed with the default "
+            "value are forgeable by anyone with access to the source."
+        )
+        _sys.exit(1)
+    log.warning(
+        "AUTH_SESSION_SECRET is unset or default. OK for INSECURE_ALLOW_ANON "
+        "mode (no sessions are issued), but set a real secret before enabling "
+        "any auth method."
     )
+    _secret = _DEFAULT_SESSION_SECRET
+cfg.AUTH_SESSION_SECRET = _secret
 import secrets as _secrets_mod
+_session_secret = cfg.AUTH_SESSION_SECRET
+if _session_secret == "mycelium-please-change-me":
+    # Never sign session cookies with the well-known default - anyone could
+    # forge an admin session. Auto-generate and persist one instead, same
+    # pattern as WEBHOOK_SECRET_AUTO below.
+    _session_secret = _settings_mod.get("AUTH_SESSION_SECRET_AUTO", "")
+    if not _session_secret:
+        _session_secret = _secrets_mod.token_urlsafe(32)
+        _settings_mod.set("AUTH_SESSION_SECRET_AUTO", _session_secret)
+        log.info("Auto-generated AUTH_SESSION_SECRET - set your own in the environment to keep sessions valid across DB restores")
+    else:
+        log.debug("Using auto-generated AUTH_SESSION_SECRET from settings")
 if not WEBHOOK_SECRET:
     _stored = _settings_mod.get("WEBHOOK_SECRET_AUTO", "")
     if not _stored:
@@ -100,7 +150,7 @@ if not WEBHOOK_SECRET:
         log.info("Auto-generated WEBHOOK_SECRET - copy from Admin > Settings > Webhooks to your Seerr config")
     else:
         log.debug("Using auto-generated WEBHOOK_SECRET from settings")
-app.secret_key = cfg.AUTH_SESSION_SECRET
+app.secret_key = _session_secret
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SECURE"] = cfg.COOKIE_SECURE
@@ -108,6 +158,33 @@ app.config["SESSION_COOKIE_SECURE"] = cfg.COOKIE_SECURE
 # CSRF protection on all state-changing endpoints; external webhooks opt out below.
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 _csrf = CSRFProtect(app)
+
+# Some admin/UI POST endpoints below are @_csrf.exempt so non-browser automation
+# (ops/Cronicle scripts, curl on the trusted network authing via the trusted-proxy
+# header) can call them without a rotating CSRF token. That exemption must NOT
+# cover browser callers: a browser always sends the session cookie, so a cross-site
+# POST could ride it. @_browser_csrf re-imposes CSRF validation only when the request
+# carries our session cookie (a browser). Cookieless automation is unaffected. The
+# SPA already sends X-CSRFToken on every non-GET (frontend/src/api.ts), so the UI is
+# unchanged. (SESSION_COOKIE_SAMESITE=Lax above already blocks the cross-site cookie;
+# this is defense in depth.)
+from flask_wtf.csrf import validate_csrf as _validate_csrf
+from functools import wraps as _wraps
+_SESSION_COOKIE = app.config.get("SESSION_COOKIE_NAME") or "session"
+
+def _browser_csrf(view):
+    @_wraps(view)
+    def _wrapped(*args, **kwargs):
+        if request.cookies.get(_SESSION_COOKIE):
+            token = (request.headers.get("X-CSRFToken")
+                     or request.headers.get("X-CSRF-Token")
+                     or (request.form.get("csrf_token") if request.form else None))
+            try:
+                _validate_csrf(token)
+            except Exception:
+                abort(400, description="CSRF token missing or invalid")
+        return view(*args, **kwargs)
+    return _wrapped
 
 
 @app.after_request
@@ -210,6 +287,180 @@ def ui_api_me_password():
     return jsonify(ok=True)
 
 
+# ---- spore-nfs cached/size status cache ---------------------------------
+# Per-token (cached, real_size), refreshed in the background with a single
+# batched checkcached sweep so /spore-nfs/tree and /spore-nfs/size answer
+# instantly, with no per-file TorBox call during a Plex library scan. spore-nfs
+# serves cached tokens as the real file (Direct Play) and uncached tokens as the
+# on-disk stub (forces transcode, lazy-adds only on a real play). Defined before
+# _start_scheduler() since the scheduler primes it at boot.
+_spore_status: "dict[str, tuple[bool, int]]" = {}
+_spore_status_lock = threading.Lock()
+
+
+# A title is "cached" (serve the real file) when its torrent is already in the
+# TorBox account and ready to stream. Deriving this from the mylist (~20 paged
+# calls, cached) instead of a per-hash checkcached (one call per 100 items, i.e.
+# ~1000+ calls over a 100k-item library) keeps the sweep to a few seconds, and is
+# the right semantic: a torrent already in the account has a CDN URL ready, so
+# serving its real bytes needs no scan-time add. Titles not (yet) in the account
+# stay stubs and lazy-add on a real play.
+_SPORE_READY_STATES = {"cached", "completed"}
+
+
+def _refresh_spore_status() -> None:
+    import time as _t
+    t0 = _t.monotonic()
+    try:
+        items = db.get_virtual_item_spore_index()
+    except Exception as exc:
+        log.warning("spore-nfs status: db error: %s", exc)
+        return
+    by_hash: "dict[str, list[str]]" = {}
+    newmap: "dict[str, tuple[bool, int]]" = {}
+    for it in items:
+        h = (it.get("info_hash") or "").lower()
+        token = it["token"]
+        newmap[token] = (False, 0)
+        if h:
+            by_hash.setdefault(h, []).append(token)
+    try:
+        # Page the whole account so cached titles beyond the recent hot-path
+        # window are seen, while discarding each response page after projection.
+        torrents = torbox.iter_torrents(
+            max_pages=int(_os.environ.get("SPORE_MYLIST_MAX_PAGES", "500") or "500"))
+        for torrent in torrents:
+            h = (torrent.get("hash") or "").lower()
+            tokens = by_hash.get(h)
+            if not tokens or (torrent.get("download_state") or "").lower() not in _SPORE_READY_STATES:
+                continue
+            files = torrent.get("files") or []
+            main = strm_generator._pick_main_movie_file(files) if files else None
+            size = int((main.get("size") if main else torrent.get("size")) or 0)
+            if size > 0:
+                for token in tokens:
+                    newmap[token] = (True, size)
+    except Exception as exc:
+        log.warning("spore-nfs status: mylist error: %s", exc)
+        return
+    with _spore_status_lock:
+        _spore_status.clear()
+        _spore_status.update(newmap)
+    cached_n = sum(1 for c, _ in newmap.values() if c)
+    log.info("spore-nfs status refreshed: %d items, %d cached (%.1fs)",
+             len(newmap), cached_n, _t.monotonic() - t0)
+
+
+def _spore_status_for(token: str):
+    with _spore_status_lock:
+        return _spore_status.get(token)
+
+
+def _spore_mark_cached(token: str) -> None:
+    """Event-driven flip: a token that just materialized on a real play is now in
+    the TorBox account, so mark it cached immediately (with real size) instead of
+    waiting for the next sweep. spore-nfs then serves the real file, and Plex is
+    poked to re-analyze that one title so it Direct Plays. No-op once cached, so it
+    is cheap even if reached repeatedly."""
+    st = _spore_status_for(token)
+    if st and st[0]:
+        return
+    try:
+        item = db.get_virtual_item(token)
+        if not item or not item.get("info_hash"):
+            return
+        h = item["info_hash"].lower()
+        entry = torbox.check_cached_files([h]).get(h)
+        if not entry:
+            return
+        files = entry.get("files") or []
+        main = strm_generator._pick_main_movie_file(files) if files else None
+        size = int((main.get("size") if main else entry.get("size")) or 0)
+        if size <= 0:
+            return
+        with _spore_status_lock:
+            cur = _spore_status.get(token)
+            if cur and cur[0]:
+                return
+            _spore_status[token] = (True, size)
+        log.info("spore-nfs: token=%s flipped stub->cached on play (size=%d)", token, size)
+        _spore_plex_rescan(item)
+    except Exception as exc:
+        log.debug("spore-nfs mark-cached failed for %s: %s", token, exc)
+
+
+def _spore_plex_rescan(item: dict) -> None:
+    """Best-effort: poke Plex to re-scan just this title's folder so a stub->real
+    flip is re-analyzed and Direct Plays. Needs PLEX_URL + PLEX_TOKEN and the
+    section id (PLEX_MOVIE_SECTION / PLEX_SERIES_SECTION) in the env; if any is
+    missing this is skipped and Plex's own scheduled scan is the backstop."""
+    plex_url = _os.environ.get("PLEX_URL", "").rstrip("/")
+    plex_token = _os.environ.get("PLEX_TOKEN", "")
+    is_series = bool(item.get("season") and item.get("episode"))
+    section = _os.environ.get(
+        "PLEX_SERIES_SECTION" if is_series else "PLEX_MOVIE_SECTION", "")
+    if not (plex_url and plex_token and section):
+        return
+    strm_path_str = item.get("strm_path")
+    if not strm_path_str:
+        return
+    from pathlib import Path as _P
+    parts = _P(strm_path_str).parts
+    rel_idx = next((i for i in range(len(parts) - 1, -1, -1)
+                    if parts[i] in ("movies", "series")), None)
+    if rel_idx is None:
+        return
+    media_root = _os.environ.get("SPORE_NFS_PLEX_ROOT", "/spore-nfs-media")
+    folder = str(_P(media_root, *parts[rel_idx:-1]))
+    try:
+        import requests as _rq
+        _rq.get(f"{plex_url}/library/sections/{section}/refresh",
+                params={"path": folder, "X-Plex-Token": plex_token}, timeout=10)
+        log.debug("spore-nfs: poked Plex re-scan section=%s path=%s", section, folder)
+    except Exception as exc:
+        log.debug("spore-nfs: Plex re-scan poke failed: %s", exc)
+
+
+# Bounded flip pipeline. /spore-stream fires on every read (and the preload hits
+# it in bulk), so spawning a thread per hit piled up thousands of blocking TorBox/
+# Plex calls and hung mycelium. Instead enqueue tokens (deduped) onto a bounded
+# queue drained by ONE worker: at most one flip runs at a time, bursts are capped,
+# and anything dropped is caught by the next cache-status sweep.
+import queue as _queue
+_spore_flip_q: "_queue.Queue" = _queue.Queue(maxsize=4096)
+_spore_flip_seen: set = set()
+_spore_flip_lock = threading.Lock()
+
+
+def _enqueue_flip(token: str) -> None:
+    st = _spore_status_for(token)
+    if st and st[0]:
+        return  # already cached -> nothing to do
+    with _spore_flip_lock:
+        if token in _spore_flip_seen:
+            return
+        if len(_spore_flip_seen) > 100000:
+            _spore_flip_seen.clear()
+        _spore_flip_seen.add(token)
+    try:
+        _spore_flip_q.put_nowait(token)
+    except _queue.Full:
+        # Queue saturated: drop (the sweep will pick it up) and allow a later retry.
+        with _spore_flip_lock:
+            _spore_flip_seen.discard(token)
+
+
+def _spore_flip_worker() -> None:
+    while True:
+        token = _spore_flip_q.get()
+        try:
+            _spore_mark_cached(token)
+        except Exception as exc:
+            log.debug("spore flip worker: %s", exc)
+        finally:
+            _spore_flip_q.task_done()
+
+
 def _start_scheduler() -> BackgroundScheduler:
     # job_defaults: every interval job gets +/-60s jitter to avoid stampede when
     # multiple long-running jobs hit the same minute mark.
@@ -292,24 +543,33 @@ def _start_scheduler() -> BackgroundScheduler:
         log.info("Scheduled retry queue every %dm", RETRY_QUEUE_INTERVAL_MINUTES)
 
     # Probe CDN files for Plex stubs that have no track info yet (duration, audio, subs).
-    # Runs every 30 min in a background thread to avoid blocking the scheduler.
+    # APScheduler already runs jobs in its executor. Keep the function attached
+    # to the job so max_instances can prevent overlapping probe passes.
     # build_fsh=False: only ffprobe, no 32MB download per file.
     if cfg.SPORE_ENABLED:
-        def _run_probe_pending():
-            import threading as _t
-            _t.Thread(
-                target=strm_generator.probe_pending_stubs,
-                daemon=True,
-                name="probe-pending-stubs",
-            ).start()
-
         scheduler.add_job(
-            _run_probe_pending,
+            strm_generator.probe_pending_stubs,
             trigger="interval", minutes=30,
             id="probe_pending_stubs",
-            next_run_time=None,
+            next_run_time=None, max_instances=1, coalesce=True,
         )
         log.info("Scheduled probe_pending_stubs every 30m")
+
+        # Refresh the cached/uncached status map so spore-nfs can serve cached
+        # titles as real files (Direct Play) and uncached ones as stubs. Primed
+        # once at startup in a thread so a long checkcached sweep never blocks boot.
+        _spore_refresh_min = int(_os.environ.get("SPORE_CACHE_REFRESH_MIN", "15") or "15")
+        scheduler.add_job(
+            _refresh_spore_status,
+            trigger="interval", minutes=_spore_refresh_min,
+            id="spore_status", next_run_time=None,
+        )
+        threading.Thread(target=_refresh_spore_status, name="spore-status-init",
+                         daemon=True).start()
+        # Single drain worker for the bounded flip queue.
+        threading.Thread(target=_spore_flip_worker, name="spore-flip-worker",
+                         daemon=True).start()
+        log.info("Scheduled spore-nfs cache-status refresh every %dm", _spore_refresh_min)
 
     if not LITE_MODE:
         if AUTO_UPGRADE_ENABLED and AUTO_UPGRADE_INTERVAL_HOURS > 0:
@@ -354,6 +614,15 @@ def _start_scheduler() -> BackgroundScheduler:
             log.info("Scheduled auto-add every %dh (total slots: %d)",
                      TRENDING_CHECK_INTERVAL_HOURS, _auto_add_total)
 
+        if AUTO_APPROVE_INTERVAL_HOURS > 0:
+            scheduler.add_job(
+                auto_approve.run,
+                trigger="interval", hours=AUTO_APPROVE_INTERVAL_HOURS,
+                id="auto_approve", next_run_time=None,
+            )
+            log.info("Scheduled auto-approve (genres + favorite actors) every %dh",
+                     AUTO_APPROVE_INTERVAL_HOURS)
+
         if CONTINUE_WATCHING_INTERVAL_MINUTES > 0:
             scheduler.add_job(
                 continue_watching.prioritize_next_episodes,
@@ -377,6 +646,16 @@ def _start_scheduler() -> BackgroundScheduler:
             id="quota_warn", next_run_time=None,
         )
         log.info("Scheduled TorBox quota check every %dh", QUOTA_CHECK_INTERVAL_HOURS)
+
+    def _zilean_native_sync():
+        if _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE) != "native":
+            return
+        import zilean_index
+        zilean_index.sync()
+
+    scheduler.add_job(_zilean_native_sync, trigger="interval", hours=6,
+                       id="zilean_native_sync", next_run_time=None, max_instances=1)
+    log.info("Scheduled Zilean native index sync every 6h (no-op unless ZILEAN_MODE=native)")
 
     # Watchdogs + maintenance
     scheduler.add_job(watchdog.deadman_check, trigger="interval", hours=2,
@@ -404,6 +683,18 @@ def _start_scheduler() -> BackgroundScheduler:
             log.debug("modify_job(%s): %s", jid, exc)
 
     scheduler.start()
+    # 2026-06-05 fix: jobs above were added with next_run_time=None, which APScheduler 3.x
+    # treats as PAUSED -> the entire automation layer never fired. Resume each so it runs
+    # on its configured interval (first run = now + interval; naturally staggered).
+    _resumed = 0
+    for _job in scheduler.get_jobs():
+        if _job.next_run_time is None:
+            try:
+                scheduler.resume_job(_job.id)
+                _resumed += 1
+            except Exception as _exc:
+                log.warning("resume_job(%s) failed: %s", _job.id, _exc)
+    log.info("Resumed %d paused scheduler job(s)", _resumed)
     return scheduler
 
 
@@ -480,6 +771,7 @@ _delayed(60.0, library_sync.resolve_unknowns, "resolve-unknowns-init")
 _delayed(90.0, library_sync.import_series_to_monitored, "series-monitored-init")
 _delayed(120.0, nfo_generator.generate_all, "nfo-init")
 _delayed(150.0, nfo_generator.fetch_local_images, "images-init")
+_delayed(180.0, nfo_generator.repair_tvshow_titles, "nfo-repair")
 _delayed(45.0, _backfill_tmdb_ids, "tmdb-id-backfill")
 
 
@@ -502,8 +794,25 @@ def _check_auth() -> None:
         # Migrate to the X-Webhook-Secret header.
         log.warning("Webhook secret passed via ?secret= query param from %s"
                     " - migrate to X-Webhook-Secret header", request.remote_addr)
-    if provided != secret:
+    # Constant-time compare to avoid leaking the secret one character at a time
+    # via response-time side-channels.
+    if not hmac.compare_digest(provided or "", secret):
         log.warning("Rejected webhook with bad/missing secret from %s", request.remote_addr)
+        abort(401)
+
+
+def _check_torbox_auth() -> None:
+    """Optional auth for the TorBox completion-notification endpoint.
+
+    If TORBOX_WEBHOOK_SECRET is set, the caller must present it via the
+    X-Webhook-Secret header. Empty secret preserves the legacy unauthenticated
+    behaviour."""
+    if not TORBOX_WEBHOOK_SECRET:
+        return
+    provided = request.headers.get("X-Webhook-Secret") or request.args.get("secret") or ""
+    if not hmac.compare_digest(provided, TORBOX_WEBHOOK_SECRET):
+        log.warning("Rejected torbox-webhook with bad/missing secret from %s",
+                    request.remote_addr)
         abort(401)
 
 
@@ -511,12 +820,26 @@ def _check_auth() -> None:
 
 @app.get("/health")
 def health_simple():
-    """Liveness probe used by Docker HEALTHCHECK  -  process up + DB reachable."""
+    """Liveness plus cgroup pressure signal used by Docker HEALTHCHECK."""
     try:
         db.get_recent(1)
-        return jsonify(status="ok")
-    except Exception:
-        return jsonify(status="degraded"), 503
+    except Exception as exc:
+        return jsonify(status="degraded", failures=[f"db: {exc}"]), 503
+
+    memory = None
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        maximum_text = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        maximum = int(maximum_text) if maximum_text != "max" else 0
+        ratio = current / maximum if maximum else 0.0
+        memory = {"current": current, "max": maximum, "ratio": round(ratio, 4)}
+        fail_ratio = float(_os.environ.get("MEMORY_HEALTH_FAIL_RATIO", "0.95") or "0.95")
+        if maximum and ratio >= fail_ratio:
+            return jsonify(status="degraded", failures=["cgroup memory pressure"],
+                           memory=memory), 503
+    except (OSError, ValueError):
+        pass
+    return jsonify(status="ok", memory=memory)
 
 
 @app.get("/metrics")
@@ -592,7 +915,7 @@ def webhook():
 def torbox_webhook():
     """Endpoint for TorBox to push completion notifications.
     Triggers strm_generator to catch the newly-ready torrent."""
-    _check_auth()
+    _check_torbox_auth()
     payload = request.get_json(silent=True) or {}
     log.info("TorBox webhook: %s", payload)
     threading.Thread(target=strm_generator.run_and_refresh, name="torbox-push", daemon=True).start()
@@ -606,6 +929,8 @@ def ui_dashboard():
     import settings as _settings
     if not _settings.get("SETUP_COMPLETE", False):
         return redirect(url_for("setup_wizard"))
+    if not auth.is_admin():
+        return redirect(url_for("login_view", next="/admin"))
     return render_template(
         "ui.html",
         repair_items=db.get_repair_items(200),
@@ -648,26 +973,95 @@ def setup_skip():
     return jsonify(ok=True)
 
 
+# Keys the unauthenticated /setup/save endpoint is allowed to write. Auth-
+# related keys (AUTH_*, OIDC_*, TRUSTED_PROXY_*, *_SECRET) are excluded:
+# without this whitelist, an attacker reaching /setup before the first admin
+# is created can set AUTH_PASSWORD_HASH to a value they control and lock the
+# instance to themselves. Keep in sync with the IDs in templates/setup.html.
+_SETUP_ALLOWED_KEYS = frozenset({
+    "LITE_MODE",
+    "TORBOX_API_KEY", "TORBOX_BASE_URL",
+    "JELLYFIN_URL", "JELLYFIN_API_KEY",
+    "SEERR_URL", "SEERR_API_KEY",
+    "TMDB_API_KEY",
+    "QUALITY_PREFERENCE", "ALLOW_4K", "EXCLUDE_REMUX", "EXCLUDE_BLURAY",
+    "EXCLUDE_CAM", "STRICT_NO_CAM", "PREFER_WEBDL", "PREFER_HEVC",
+    "MIN_SEEDERS", "MAX_SIZE_GB",
+    "AUDIO_LANGUAGE_PREFERENCE", "EXCLUDE_LANGUAGES",
+    "CATBOX_MODE", "CATBOX_HOST", "CATBOX_IDLE_MINUTES",
+    "CATBOX_GC_INTERVAL_MINUTES", "CATBOX_LAZY_ADD", "CATBOX_PRELOAD",
+    "DISCORD_WEBHOOK_URL",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "NOTIFY_ON_SUCCESS", "NOTIFY_ON_FAILURE",
+    "TRAKT_CLIENT_ID", "TRAKT_CLIENT_SECRET",
+    "OPENSUBTITLES_API_KEY", "OPENSUBTITLES_LANGUAGES",
+    "ZILEAN_URL", "ZILEAN_ENABLED",
+    "RADARR_URL", "RADARR_API_KEY",
+    "SONARR_URL", "SONARR_API_KEY",
+})
+
+
+@app.post("/setup/create-admin")
+@_csrf.exempt
+@limiter.limit("5 per minute; 20 per hour")
+def setup_create_admin():
+    """Create the first admin account. Only callable when the users table is
+    empty; subsequent admin creation goes through the regular /ui/api/users
+    routes guarded by require_role('admin')."""
+    if db.user_count() > 0:
+        return jsonify(error="admin already exists"), 409
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    if not username or len(username) > 64:
+        return jsonify(error="username required (max 64 chars)"), 400
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    try:
+        uid = auth.create_user_account(username, password, role="admin",
+                                       auto_approve=True)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    # Log the new admin in so the wizard can proceed without a second round-trip.
+    from flask import session as _session
+    _session["user"] = username
+    _session["user_id"] = uid
+    _session["role"] = "admin"
+    log.info("Setup: created first admin account %r (id=%d)", username, uid)
+    return jsonify(ok=True, user_id=uid)
+
+
 @app.post("/setup/save")
 @limiter.limit("10 per minute")
 def setup_save():
-    if db.user_count() > 0 and not auth.is_admin():
+    # Anonymous access is only allowed during the first-run window AND only
+    # for whitelisted keys. The first admin must be created via
+    # /setup/create-admin before any settings write that touches auth.
+    first_run = (db.user_count() == 0)
+    if not first_run and not auth.is_admin():
         return jsonify(error="unauthorized"), 401
     import settings as _settings
-    _allowed_keys = {k for g in _settings.SETTING_GROUPS for k in g["keys"]} | {"SETUP_COMPLETE"}
     saved = 0
+    rejected = []
     for key, value in request.form.items():
-        if key not in _allowed_keys:
-            log.warning("setup_save: rejected unknown key %r", key)
+        if key not in _SETUP_ALLOWED_KEYS:
+            rejected.append(key)
             continue
-        # Treat empty strings as "clear override"
-        if value == "":
-            _settings.set(key, None)
-        elif key in _settings._BOOL_KEYS:
-            _settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
-        else:
-            _settings.set(key, value)
-        saved += 1
+        try:
+            # Treat empty strings as "clear override"
+            if value == "":
+                _settings.set(key, None)
+            elif key in _settings._BOOL_KEYS:
+                _settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
+            else:
+                _settings.set(key, value)
+            saved += 1
+        except ValueError as exc:
+            log.warning("setup_save: rejected invalid value for %s: %s", key, exc)
+    if rejected:
+        log.warning("Setup wizard rejected non-whitelisted keys: %s",
+                    ", ".join(sorted(rejected)))
+        return jsonify(error="non-whitelisted keys rejected",
+                       rejected=sorted(rejected)), 400
     _settings.set("SETUP_COMPLETE", True)
     log.info("Setup wizard saved %d settings", saved)
     return jsonify(ok=True, saved=saved)
@@ -676,8 +1070,14 @@ def setup_save():
 @app.post("/setup/test/<kind>")
 @limiter.limit("20 per minute")
 def setup_test(kind: str):
-    """Test a single integration using values posted from the wizard form."""
-    if db.user_count() > 0 and not auth.is_admin():
+    """Test a single integration using values posted from the wizard form.
+
+    Only reachable without an admin session while the setup wizard itself is
+    still incomplete - once SETUP_COMPLETE is set this is a real admin-only
+    action (it makes the server issue requests to an attacker-chosen host),
+    independent of auth.is_admin()'s "auth disabled = full access" shortcut."""
+    import settings as _settings
+    if _settings.get("SETUP_COMPLETE", False) and not auth.is_admin():
         return jsonify(error="unauthorized"), 401
     f = request.form
     try:
@@ -803,6 +1203,8 @@ def setup_test(kind: str):
 
 @app.post("/ui/submit")
 def ui_submit():
+    if not auth.is_admin():
+        abort(403)
     imdb_id = (request.form.get("imdb_id") or "").strip()
     media_type = request.form.get("media_type", "movie")
     seasons_raw = request.form.get("seasons", "1")
@@ -818,17 +1220,20 @@ def ui_submit():
     if media_type == "series" and not seasons:
         seasons = [1]
 
+    display_title = tmdb.display_title(imdb_id, media_type) or imdb_id
     media_request = MediaRequest(
-        title=imdb_id, media_type=media_type, imdb_id=imdb_id, seasons=seasons,
+        title=display_title, media_type=media_type, imdb_id=imdb_id, seasons=seasons,
     )
     threading.Thread(target=processor.process, args=(media_request,),
                      name=f"manual-{imdb_id}", daemon=True).start()
-    flash(f"Queued: {imdb_id} ({media_type})", "ok")
+    flash(f"Queued: {display_title} ({media_type})", "ok")
     return redirect(url_for("ui_dashboard"))
 
 
 @app.post("/ui/search-episode")
 def ui_search_episode():
+    if not auth.is_admin():
+        abort(403)
     imdb_id = request.form.get("imdb_id", "")
     title = request.form.get("title", imdb_id)
     season = int(request.form.get("season", 1))
@@ -843,20 +1248,27 @@ def ui_search_episode():
 
 
 @app.post("/ui/download-movie")
+@auth.require_role("admin")
 def ui_download_movie():
+    if not auth.is_admin():
+        abort(403)
     imdb_id = request.form.get("imdb_id", "")
+    display_title = tmdb.display_title(imdb_id, "movie") or imdb_id
     media_request = MediaRequest(
-        title=imdb_id, media_type="movie", imdb_id=imdb_id, seasons=[],
+        title=display_title, media_type="movie", imdb_id=imdb_id, seasons=[],
     )
     db.update_media_item_status(imdb_id, "movie", "processing")
     threading.Thread(target=processor.process, args=(media_request,),
                      name=f"movie-{imdb_id}", daemon=True).start()
-    flash(f"Download queued for {imdb_id}", "ok")
+    flash(f"Download queued for {display_title}", "ok")
     return redirect(url_for("ui_dashboard") + "#movies")
 
 
 @app.post("/ui/sync-movies")
+@auth.require_role("admin")
 def ui_sync_movies():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=monitor.sync_movies, name="movie-sync-manual", daemon=True).start()
     flash("Movie sync started", "ok")
     return redirect(url_for("ui_dashboard") + "#movies")
@@ -868,35 +1280,46 @@ def ui_logs():
 
 
 @app.post("/ui/run-cleanup")
+@auth.require_role("admin")
 def ui_run_cleanup():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=cleanup.run_cleanup, name="cleanup-manual", daemon=True).start()
     flash("Cleanup scan started  -  check Repair tab for results", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/repair-all")
+@auth.require_role("admin")
 def ui_repair_all():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=cleanup.run_cleanup, name="repair-all-manual", daemon=True).start()
     flash("Repair All started  -  check Repair tab for results", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/refresh-images")
+@auth.require_role("admin")
 def ui_refresh_images():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=jellyfin.refresh_missing_images, name="jf-images", daemon=True).start()
     flash("Jellyfin image refresh started  -  missing posters will be fetched", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/merge-series")
+@auth.require_role("admin")
 def ui_merge_series():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=cleanup.merge_series_duplicates, name="merge-series", daemon=True).start()
     flash("Series merge started  -  duplicate folders will be consolidated", "ok")
     return redirect(url_for("ui_dashboard") + "#repair")
 
 
 @app.post("/ui/api/repair-tvshow-titles")
-@_csrf.exempt
 @auth.require_role("admin")
 def ui_api_repair_tvshow_titles():
     """Rewrite tvshow.nfo files whose title is 'Season XX' instead of the real show name."""
@@ -905,7 +1328,6 @@ def ui_api_repair_tvshow_titles():
 
 
 @app.post("/ui/api/fix-imdb-titles")
-@_csrf.exempt
 @auth.require_role("admin")
 def ui_api_fix_imdb_titles():
     """Find items whose title is still a raw IMDB code, fetch real title from TMDB,
@@ -915,7 +1337,10 @@ def ui_api_fix_imdb_titles():
 
 
 @app.post("/ui/generate-nfos")
+@auth.require_role("admin")
 def ui_generate_nfos():
+    if not auth.is_admin():
+        abort(403)
     def _run():
         nfo_generator.generate_all()
         nfo_generator.fetch_local_images()
@@ -926,14 +1351,22 @@ def ui_generate_nfos():
 
 @app.post("/api/run-cleanup")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def api_run_cleanup():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     threading.Thread(target=cleanup.run_cleanup, name="cleanup-api", daemon=True).start()
     return jsonify(ok=True, started="run_cleanup")
 
 
 @app.post("/api/generate-nfos")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def api_generate_nfos():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     def _run():
         nfo_generator.generate_all()
         nfo_generator.fetch_local_images()
@@ -943,7 +1376,8 @@ def api_generate_nfos():
 
 @app.post("/ui/api/repair-strms")
 @_csrf.exempt
-@auth.require_auth
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_repair_strms():
     """Scan movie .strm files for expired direct TorBox CDN URLs and repair them.
     Files with a catbox token → left alone. Files with a direct URL:
@@ -956,8 +1390,19 @@ def ui_api_repair_strms():
     return jsonify(**result)
 
 
+@app.post("/ui/api/torbox/scan-library")
+@auth.require_auth
+def ui_api_torbox_scan_library():
+    """Scan TorBox's own library for torrents we have no record of (e.g. after
+    a DB reset) and materialize .strm files for them, resolving titles via
+    TMDB where possible."""
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    result = strm_generator.scan_torbox_library()
+    return jsonify(**result)
+
+
 @app.post("/ui/api/spore/backfill")
-@_csrf.exempt
 @auth.require_role("admin")
 def ui_api_spore_backfill():
     """Generate missing Spore stub .mkv + .minfo files for all existing virtual_items."""
@@ -966,7 +1411,6 @@ def ui_api_spore_backfill():
 
 
 @app.post("/ui/api/spore/regenerate")
-@_csrf.exempt
 @auth.require_role("admin")
 def ui_api_spore_regenerate():
     """Force-regenerate stub MKVs with correct codec metadata.
@@ -978,24 +1422,36 @@ def ui_api_spore_regenerate():
 
 @app.post("/ui/api/migrate-canonical")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_migrate_canonical():
     """Rename all movie folders to TMDB canonical names and merge duplicates."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     result = strm_generator.migrate_to_canonical_names()
     return jsonify(**result)
 
 
 @app.post("/ui/api/cleanup-duplicate-strms")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_cleanup_duplicate_strms():
     """Remove extra .strm files from folders that have more than one."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     result = strm_generator.cleanup_duplicate_strms()
     return jsonify(**result)
 
 
 @app.post("/ui/api/series-backfill")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_series_backfill():
     """Import all Sonarr series + run series check to create .strm files for all episodes."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     threading.Thread(target=monitor.run_series_backfill, name="series-backfill", daemon=True).start()
     return jsonify(ok=True, started="series_backfill")
 
@@ -1053,7 +1509,10 @@ def ui_api_torbox_list():
 
 
 @app.post("/ui/torbox-delete")
+@auth.require_role("admin")
 def ui_torbox_delete():
+    if not auth.is_admin():
+        abort(403)
     torrent_id = request.form.get("torrent_id")
     if not torrent_id:
         return jsonify(error="missing torrent_id"), 400
@@ -1066,20 +1525,28 @@ def ui_torbox_delete():
 
 
 @app.post("/ui/strm-rescan")
+@auth.require_role("admin")
 def ui_strm_rescan():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=strm_generator.run_and_refresh, name="strm-manual", daemon=True).start()
     flash("strm rescan started", "ok")
     return redirect(url_for("ui_dashboard"))
 
 
 @app.post("/ui/test-notify")
+@auth.require_role("admin")
 def ui_test_notify():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     results = notify.test()
     return jsonify(results)
 
 
 @app.post("/ui/api/search-candidates")
 def ui_api_search_candidates():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     imdb_id = (request.form.get("imdb_id") or "").strip()
     media_type = request.form.get("media_type", "movie")
     season = int(request.form.get("season", 1))
@@ -1088,13 +1555,13 @@ def ui_api_search_candidates():
         return jsonify(error="invalid imdb id"), 400
 
     if media_type == "movie":
-        streams = zilean.fetch_streams(imdb_id) if cfg.ZILEAN_ENABLED else []
+        streams = zilean.fetch_streams(imdb_id) if _settings_mod.get("ZILEAN_ENABLED", cfg.ZILEAN_ENABLED) else []
         candidates = torrentio.rank_streams(streams)
         if not candidates:
             streams = torrentio.fetch_streams("movie", imdb_id)
             candidates = torrentio.rank_streams(streams)
     else:
-        streams = zilean.fetch_streams(imdb_id, season=season, episode=episode) if cfg.ZILEAN_ENABLED else []
+        streams = zilean.fetch_streams(imdb_id, season=season, episode=episode) if _settings_mod.get("ZILEAN_ENABLED", cfg.ZILEAN_ENABLED) else []
         candidates = torrentio.rank_streams(streams)
         if not candidates:
             streams = torrentio.fetch_streams("series", imdb_id, season=season, episode=episode)
@@ -1115,7 +1582,10 @@ def ui_api_search_candidates():
 
 
 @app.post("/ui/add-magnet")
+@auth.require_role("admin")
 def ui_add_magnet():
+    if not auth.is_admin():
+        abort(403)
     magnet = (request.form.get("magnet") or "").strip()
     if not magnet.startswith("magnet:"):
         flash("Not a magnet link", "err")
@@ -1130,7 +1600,10 @@ def ui_add_magnet():
 
 
 @app.post("/ui/retry-request/<int:row_id>")
+@auth.require_role("admin")
 def ui_retry_request(row_id: int):
+    if not auth.is_admin():
+        abort(403)
     rows = [r for r in db.get_recent(1000) if r["id"] == row_id]
     if not rows:
         flash("Request not found", "err")
@@ -1153,28 +1626,268 @@ def ui_api_poster(imdb_id: str):
     return jsonify(poster=f"https://image.tmdb.org/t/p/w154{path}" if path else None)
 
 
+@app.get("/ui/api/person/<int:person_id>")
+def ui_api_person(person_id: int):
+    """Actor/person detail: bio + combined filmography, for the clickable-cast view."""
+    person = tmdb.person_details(person_id)
+    if not person:
+        return jsonify(error="not found"), 404
+    return jsonify(**person)
+
+
+@app.get("/ui/api/favorite-actors")
+@auth.require_auth
+def ui_api_favorite_actors_list():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    return jsonify(actors=db.get_favorite_actors(rec["id"]))
+
+
+@app.post("/ui/api/favorite-actors/<int:person_id>")
+@auth.require_auth
+def ui_api_favorite_actors_add(person_id: int):
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    db.add_favorite_actor(rec["id"], person_id, p.get("name") or str(person_id), p.get("profile_path"))
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/favorite-actors/<int:person_id>/remove")
+@auth.require_auth
+def ui_api_favorite_actors_remove(person_id: int):
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    db.remove_favorite_actor(rec["id"], person_id)
+    return jsonify(ok=True)
+
+
+@app.get("/ui/api/genres")
+def ui_api_genres():
+    media_type = request.args.get("type", "movie")
+    return jsonify(genres=tmdb.list_genres(media_type))
+
+
+@app.get("/ui/api/auto-approve/genre-rules")
+@auth.require_auth
+def ui_api_auto_approve_genre_rules_get():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    return jsonify(rules=auto_approve._genre_rules())
+
+
+@app.post("/ui/api/auto-approve/genre-rules")
+@auth.require_auth
+def ui_api_auto_approve_genre_rules_set():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    p = request.get_json(silent=True) or {}
+    rules = p.get("rules")
+    if not isinstance(rules, list):
+        return jsonify(error="rules must be a list"), 400
+    auto_approve.set_genre_rules(rules)
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/auto-approve/run-now")
+@auth.require_auth
+def ui_api_auto_approve_run_now():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import threading
+    threading.Thread(target=auto_approve.run, name="auto-approve-manual", daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
 # ── Catbox lazy materialization ───────────────────────────────────────────────
+
+def _parse_byte_range(range_hdr: str, file_size: int) -> tuple[int, int]:
+    """Parse a single-range RFC 7233 'Range: bytes=...' header.
+
+    Handles all three forms: 'start-end', 'start-' (to EOF), and the suffix
+    form '-N' (last N bytes) - the suffix form was previously parsed as
+    start=0,end=N (first N bytes) instead of the last N, since split("-", 1)
+    on "-500" yields ("", "500") same as the "start-" case would if start
+    were empty. Raises ValueError on anything unparsable."""
+    _, ranges_str = range_hdr.split("=", 1)
+    r_start_s, r_end_s = ranges_str.split("-", 1)
+    if not r_start_s:
+        if not r_end_s:
+            raise ValueError(f"empty range: {range_hdr!r}")
+        suffix_len = int(r_end_s)
+        r_start = max(0, file_size - suffix_len)
+        r_end = file_size - 1
+    else:
+        r_start = int(r_start_s)
+        r_end = int(r_end_s) if r_end_s else file_size - 1
+    if r_start < 0 or r_start >= file_size or r_start > r_end:
+        # e.g. bytes=999999999- on a smaller file: without this, callers would
+        # clamp r_end to file_size-1 and compute a negative Content-Length
+        # instead of the correct 416 Range Not Satisfiable.
+        raise ValueError(f"range {range_hdr!r} not satisfiable for file_size={file_size}")
+    return r_start, r_end
+
 
 @app.get("/stream/<token>")
 def stream_redirect(token: str):
-    """Jellyfin catbox endpoint: always 302 → CDN. Zero server bandwidth."""
-    import time as _t
-    started = _t.monotonic()
+    """Catbox endpoint: 302 → /spore-stream/<token> (moov-first proxy).
+
+    Redirecting to spore-stream instead of the raw CDN URL ensures all clients
+    (Jellyfin, Plex direct-stream, Android TV) get moov-first MP4 so playback
+    starts immediately. spore-stream handles catbox materialization itself.
+    """
     ua  = request.headers.get("User-Agent", "?")[:80]
     rng = request.headers.get("Range", "-")
-    url = catbox.materialize(token)
-    elapsed = _t.monotonic() - started
-    if not url:
-        log.warning("stream: materialize FAILED token=%s ua=%r range=%s (%.1fs)",
-                    token, ua, rng, elapsed)
-        abort(404)
-    log.info("stream: token=%s → 302 CDN (%.1fs) ua=%r range=%s",
-             token, elapsed, ua, rng)
-    return redirect(url, code=302)
+    log.info("stream: token=%s → /spore-stream/ ua=%r range=%s", token, ua, rng)
+    return redirect(f"/spore-stream/{token}", code=302)
 
 
-_spore_cold_sizes: dict = {}  # token -> file_size, avoids repeated HEAD on CDN
+import cachetools as _cachetools
+# Bounded to keep memory finite when a Plex transcoder churns through many
+# distinct tokens; entries are cheap (int file_size) so 10k is generous.
+_spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=86400)
 _spore_probing: set  = set()  # tokens currently running a background probe
+
+# One playback session reopens the source several times a minute (seek, transcode
+# restart, client reconnect), so an unconditional liveness check would spend a CDN
+# round trip re-confirming a link it confirmed moments ago.
+_ALIVE_CHECK_TTL_SEC = 120
+_spore_alive_cache: "_cachetools.TTLCache[str, bool]" = _cachetools.TTLCache(
+    maxsize=10000, ttl=_ALIVE_CHECK_TTL_SEC
+)
+
+# Only these mean the link itself is no longer valid, which is the single case
+# where re-resolving yields a working URL. Everything else, a 429 above all, keeps
+# the cached URL: TorBox hands back the same URL, so re-resolving a live-but-
+# throttled link doubles the request rate that is feeding the throttle. Same split
+# as spore-nfs's errRateLimited.
+_CDN_DEAD_STATUSES = frozenset({400, 401, 403, 404, 410})
+
+
+def _cdn_url_alive(cdn_url: str) -> bool:
+    """Confirm a cached CDN link still resolves, memoised for _ALIVE_CHECK_TTL_SEC.
+
+    Only an explicit link-invalid status counts as dead. A 429, a transient 5xx or
+    a HEAD that never answered are not evidence the link expired, so they keep the
+    URL and stay uncached, leaving the next request to re-check.
+    """
+    if cdn_url in _spore_alive_cache:
+        return True
+    import requests as _req
+    try:
+        head = _req.head(cdn_url, timeout=5, allow_redirects=True)
+    except Exception as exc:
+        log.warning("spore-stream: liveness HEAD did not answer, assuming alive: %s", exc)
+        return True
+    if head.status_code in _CDN_DEAD_STATUSES:
+        return False
+    if head.status_code >= 400:
+        log.info("spore-stream: CDN status=%d, url is live but busy", head.status_code)
+        return True
+    _spore_alive_cache[cdn_url] = True
+    return True
+
+# Per-CDN-fetch chunk size. TorBox's CDN rate-limits per *request*, so fetching
+# in large gulps (vs many small ones) keeps a single transcode — which reads the
+# file in bursts — under the per-file limit. 16 MiB cuts request count ~8x vs the
+# old 2 MiB while staying well within mycelium's memory budget.
+_SPORE_CHUNK = 16 << 20
+
+
+_spore_tree_cache = {"body": None, "ts": 0.0}
+_spore_tree_lock = threading.Lock()
+_SPORE_TREE_TTL = 30.0  # seconds
+
+
+def _build_spore_tree_json() -> str:
+    from pathlib import Path
+    import json as _json
+    entries = []
+    for item in db.get_all_virtual_items():
+        strm_path_str = item.get("strm_path")
+        if not strm_path_str:
+            continue
+        parts = Path(strm_path_str).parts
+        # Take everything from the last "movies"/"series" segment onward,
+        # regardless of what absolute prefix precedes it -- strm_path in the
+        # DB isn't guaranteed to have been written with today's MEDIA_PATH
+        # (older rows can predate an env change or come from a different
+        # mount context), so relative_to() against the current MEDIA_PATH
+        # silently drops anything that doesn't match exactly.
+        rel_idx = None
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i] in ("movies", "series"):
+                rel_idx = i
+                break
+        if rel_idx is None:
+            continue
+        rel = Path(*parts[rel_idx:])
+        st = _spore_status_for(item["token"])
+        cached, size = (st[0], st[1]) if st else (False, 0)
+        entries.append({
+            "token": item["token"],
+            # Real container is unknown until first probe; .mkv is a safe
+            # default since our proxy transparently redirects/remuxes
+            # regardless of the client-visible extension.
+            "path": str(rel.with_suffix(".mkv")),
+            # cached => spore-nfs serves the real file (Direct Play); otherwise
+            # it serves the on-disk stub. size is the real byte size when cached.
+            "size": size,
+            "cached": cached,
+        })
+    return _json.dumps({"entries": entries})
+
+
+@app.get("/spore-nfs/tree")
+def spore_nfs_tree():
+    """Virtual directory tree for the spore-nfs server. spore-nfs polls this every
+    ~10s and the response is a large (100k-entry, ~11MB) JSON. It is cached and
+    rebuilt at most once per _SPORE_TREE_TTL under a lock: without the cache,
+    concurrent polls each rebuilt it and piled up on the single gunicorn worker,
+    starving playback (/spore-stream) under any added load."""
+    import time as _t
+    body = _spore_tree_cache["body"]
+    if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
+        return app.response_class(body, mimetype="application/json")
+    with _spore_tree_lock:
+        body = _spore_tree_cache["body"]
+        if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
+            return app.response_class(body, mimetype="application/json")
+        body = _build_spore_tree_json()
+        _spore_tree_cache["body"] = body
+        _spore_tree_cache["ts"] = _t.monotonic()
+    return app.response_class(body, mimetype="application/json")
+
+
+@app.get("/spore-nfs/size/<token>")
+def spore_nfs_size(token: str):
+    """Cheap file-size lookup for spore-nfs's Attr()/ReadDir(): a TorBox
+    checkcached call, which reports cached files without adding anything to
+    the account. Used for library scans; actual playback still goes through
+    /spore-stream/<token>, which materializes for real."""
+    # Fast path: answer from the background-refreshed status cache.
+    st = _spore_status_for(token)
+    if st is not None:
+        return jsonify({"size": st[1], "cached": st[0]})
+    # Cold fallback (token not swept yet): a live, non-materializing checkcached.
+    item = db.get_virtual_item(token)
+    if not item:
+        abort(404)
+    by_hash = torbox.check_cached_files([item["info_hash"]])
+    entry = by_hash.get(item["info_hash"].lower())
+    if not entry:
+        # Not cached (or a torrent Mycelium has never checked yet): no size
+        # to report without materializing, which a bulk scan must not do.
+        return jsonify({"size": 0, "cached": False})
+    files = entry.get("files") or []
+    main = strm_generator._pick_main_movie_file(files) if files else None
+    # Single-file torrents (the common case for movies) have no "files"
+    # list at all -- size/name live directly on the entry.
+    size = int((main.get("size") if main else entry.get("size")) or 0)
+    return jsonify({"size": size, "cached": size > 0})
 
 
 @app.get("/spore-stream/<token>")
@@ -1196,6 +1909,12 @@ def spore_stream_proxy(token: str):
         log.warning("spore-stream: materialize FAILED token=%s ua=%r range=%s (%.1fs)",
                     token, ua, rng, _t.monotonic() - started)
         abort(404)
+
+    # Materialized => this token is now in the TorBox account. Enqueue a flip so
+    # spore-nfs serves the real file and Plex re-analyzes it ("watch once, becomes
+    # NFS"). Bounded single-worker queue -- never spawns per-request threads, so a
+    # burst (e.g. the preload) can't pile up and hang mycelium.
+    _enqueue_flip(token)
 
     info = mp4_faststart.load(token)
 
@@ -1228,15 +1947,20 @@ def spore_stream_proxy(token: str):
             streams = data.get("streams", [])
             audio   = [s for s in streams if s.get("codec_type") == "audio"]
             subs    = [s for s in streams if s.get("codec_type") == "subtitle"]
+            video   = [s for s in streams if s.get("codec_type") == "video"]
+            v_codec = (video[0].get("codec_name") if video else None)
             dur     = float(data.get("format", {}).get("duration", 0) or 0)
             preferred_idx = _sg._preferred_audio_index(audio)
             _db.save_spore_tracks(tok, {
                 "audio": audio, "subs": subs, "duration_s": dur,
                 "video_extradata_hex": v_extra_hex,
+                "video_codec": v_codec,
                 "preferred_audio_idx": preferred_idx,
             })
             if audio or subs or dur or v_extra_hex:
-                _sg.update_stub_from_probe(tok, audio, subs, duration_s=dur or None)
+                _sg.update_stub_from_probe(tok, audio, subs, duration_s=dur or None,
+                                           video_codec=v_codec,
+                                           video_extradata_hex=v_extra_hex)
             if preferred_idx > 0:
                 _sg.update_minfo_preferred_audio(tok, preferred_idx)
                 log.info("spore-stream: preferred_audio=%d for token=%s (TrueHD -> fallback)",
@@ -1246,36 +1970,48 @@ def spore_stream_proxy(token: str):
         finally:
             _spore_probing.discard(tok)
 
-    if info is None:
-        # Cold cache: build .fsh in background, immediately proxy Range requests
-        # to CDN so FFmpeg doesn't stall. _spore_cold_sizes caches file_size so
-        # repeated Range requests (FFmpeg seeks) skip the HEAD round-trip.
-        if token not in _spore_cold_sizes:
-            threading.Thread(
-                target=_build_then_probe,
-                args=(cdn_url, token),
-                daemon=True,
-                name=f"fsh-{token[:8]}",
-            ).start()
-            import requests as _req
-            try:
-                head = _req.head(cdn_url, timeout=10, allow_redirects=True)
-                _spore_cold_sizes[token] = int(head.headers.get("Content-Length", 0))
-            except Exception as exc:
-                log.warning("spore-stream: HEAD failed for cold token=%s: %s", token, exc)
-                abort(502)
+    if info is None and token not in _spore_cold_sizes:
+        # First play of a cold catalog item (most of the backfilled library was
+        # probed with build_fsh=False, so its .fsh is unbuilt). Build the
+        # fast-start header synchronously but *bounded*: if it finishes quickly
+        # this play uses the moov-first path (fast start, no seek-to-EOF for the
+        # moov). If it is slow or fails, fall through to the hardened cold proxy
+        # — the join timeout guarantees we never block the request thread long.
+        _warm: dict = {}
 
-        file_size = _spore_cold_sizes.get(token, 0)
+        def _warm_build() -> None:
+            try:
+                if mp4_faststart.build_and_cache(cdn_url, token):
+                    _warm["info"] = mp4_faststart.load(token)
+            except Exception as exc:
+                log.warning("spore-stream: sync warm failed token=%s: %s", token, exc)
+
+        _wt = threading.Thread(target=_warm_build, daemon=True, name=f"warm-{token[:8]}")
+        _wt.start()
+        _wt.join(5.0)
+        warm_info = _warm.get("info")
+        if warm_info is not None:
+            info = warm_info
+            log.info("spore-stream: token=%s warmed synchronously (%.1fs)",
+                     token, _t.monotonic() - started)
+            # Header is built; run the audio/subtitle probe in the background.
+            if token not in _spore_probing:
+                _spore_probing.add(token)
+                threading.Thread(target=_build_then_probe, args=(cdn_url, token),
+                                 daemon=True, name=f"probe-{token[:8]}").start()
+
+    def _cold_proxy_response(file_size: int):
+        """Range-passthrough straight to the CDN. Used both while the .fsh
+        cache is still building and for the already-fast-start case below,
+        where we still proxy (rather than 302) so Plex never caches the raw
+        CDN URL."""
         if not file_size:
             abort(502)
 
         range_hdr = request.headers.get("Range")
         if range_hdr:
             try:
-                _, ranges_str = range_hdr.split("=", 1)
-                r_start_s, r_end_s = ranges_str.split("-", 1)
-                r_start = int(r_start_s) if r_start_s else 0
-                r_end   = int(r_end_s)   if r_end_s   else file_size - 1
+                r_start, r_end = _parse_byte_range(range_hdr, file_size)
             except Exception:
                 abort(416)
             r_end  = min(r_end, file_size - 1)
@@ -1285,23 +2021,45 @@ def spore_stream_proxy(token: str):
 
         length = r_end - r_start + 1
 
-        import requests as _req
-
         def _gen_passthrough():
-            CHUNK = 2 << 20
+            CHUNK = _SPORE_CHUNK
             pos = r_start
+            url_ref = cdn_url
             while pos <= r_end:
                 end = min(pos + CHUNK - 1, r_end)
-                hdrs = {"Range": f"bytes={pos}-{end}"}
                 try:
-                    resp = _req.get(cdn_url, headers=hdrs, timeout=(10, 60), stream=True)
-                    for chunk in resp.iter_content(65536):
-                        yield chunk
-                    pos = end + 1
+                    data = mp4_faststart.fetch_range(url_ref, pos, end)
                 except Exception as exc:
-                    log.warning("spore-stream cold proxy: error pos=%d token=%s: %s",
-                                pos, token, exc)
+                    # A stale/expired CDN URL or a TorBox hiccup: re-materialize a
+                    # fresh URL once and retry this chunk before giving up, so a
+                    # transient failure doesn't truncate the stream mid-playback.
+                    # A 429 is the exception: the URL is alive but throttled, and
+                    # re-resolving returns the same URL while doubling the request
+                    # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
+                    if getattr(exc, "status", None) == 429:
+                        log.warning("spore-stream cold proxy: throttled pos=%d token=%s: %s",
+                                    pos, token, exc)
+                        break
+                    # materialize() consults the same URL cache the stale URL came
+                    # from; drop the entry first or it hands the dead URL back.
+                    catbox.invalidate_url_cache(token)
+                    fresh = catbox.materialize(token)
+                    if fresh and fresh != url_ref:
+                        url_ref = fresh
+                        try:
+                            data = mp4_faststart.fetch_range(url_ref, pos, end)
+                        except Exception as exc2:
+                            log.warning("spore-stream cold proxy: giving up pos=%d token=%s: %s",
+                                        pos, token, exc2)
+                            break
+                    else:
+                        log.warning("spore-stream cold proxy: error pos=%d token=%s: %s",
+                                    pos, token, exc)
+                        break
+                if not data:
                     break
+                yield data
+                pos += len(data)
 
         resp = Response(
             stream_with_context(_gen_passthrough()),
@@ -1322,11 +2080,35 @@ def spore_stream_proxy(token: str):
 
         return resp
 
-    # CDN file is already moov-first (or MKV redirect sentinel): redirect to CDN.
-    # For MKV files _build_then_probe is never triggered by the cold-cache path,
-    # so we trigger it here once to probe audio streams and detect TrueHD.
+    if info is None:
+        # Cold cache: build .fsh in background, immediately proxy Range requests
+        # to CDN so FFmpeg doesn't stall. _spore_cold_sizes caches file_size so
+        # repeated Range requests (FFmpeg seeks) skip the HEAD round-trip.
+        if token not in _spore_cold_sizes:
+            threading.Thread(
+                target=_build_then_probe,
+                args=(cdn_url, token),
+                daemon=True,
+                name=f"fsh-{token[:8]}",
+            ).start()
+            import requests as _req
+            try:
+                head = _req.head(cdn_url, timeout=10, allow_redirects=True)
+                _spore_cold_sizes[token] = int(head.headers.get("Content-Length", 0))
+            except Exception as exc:
+                log.warning("spore-stream: HEAD failed for cold token=%s: %s", token, exc)
+                abort(502)
+
+        return _cold_proxy_response(_spore_cold_sizes.get(token, 0))
+
+    # CDN file is already moov-first (or MKV redirect sentinel).
+    # MKV files (ftyp_size == 0): redirect to CDN — FFmpeg reads MKV from byte 0,
+    #   no seeking needed, and CDN redirect avoids unnecessary proxy bandwidth.
+    # Already fast-start MP4 (ftyp_size > 0): proxy bytes through our server so
+    #   Plex Server cannot cache the raw CDN URL. Plex stores our /spore-stream/
+    #   URL instead; when any client (MiTV, Shield, etc.) plays, they always hit
+    #   our server which resolves a fresh CDN URL — expired URLs never reach clients.
     if info.get("already_fast"):
-        _spore_cold_sizes.pop(token, None)
         existing = db.load_spore_tracks(token)
         if (not existing or "preferred_audio_idx" not in existing) and token not in _spore_probing:
             _spore_probing.add(token)
@@ -1337,18 +2119,34 @@ def spore_stream_proxy(token: str):
                 name=f"probe-{token[:8]}",
             ).start()
             log.info("spore-stream: token=%s triggering background probe", token)
-        log.info("spore-stream: token=%s already fast-start, 302 to CDN", token)
-        return redirect(cdn_url, code=302)
+        if info["ftyp_size"] == 0:
+            # Non-MP4 sentinel (MKV/other): 302 to CDN, no moov seeking required.
+            # The URL cache holds a link for up to 23h but TorBox retires them
+            # sooner, and a 302 hands the client a link we never get to revalidate:
+            # the MP4 path proxies through mp4_faststart and recovers, this one
+            # leaves ffmpeg following a redirect into an error page. Confirm the
+            # link resolves before pointing a client at it.
+            if not _cdn_url_alive(cdn_url):
+                log.warning("spore-stream: cached CDN url dead for token=%s, re-resolving", token)
+                catbox.invalidate_url_cache(token)
+                fresh = catbox.materialize(token)
+                if not fresh:
+                    abort(502)
+                cdn_url = fresh
+            _spore_cold_sizes.pop(token, None)
+            log.info("spore-stream: token=%s non-MP4 sentinel, 302 to CDN", token)
+            return redirect(cdn_url, code=302)
+        # Already fast-start MP4: proxy bytes; Plex stores our URL not the CDN URL.
+        log.info("spore-stream: token=%s already fast-start MP4, proxying bytes", token)
+        _spore_cold_sizes[token] = info["cdn_size"]
+        return _cold_proxy_response(info["cdn_size"])
 
     file_size = info["cdn_size"]
     range_hdr = request.headers.get("Range")
 
     if range_hdr:
         try:
-            _, ranges_str    = range_hdr.split("=", 1)
-            r_start_s, r_end_s = ranges_str.split("-", 1)
-            v_start = int(r_start_s) if r_start_s else 0
-            v_end   = int(r_end_s)   if r_end_s   else file_size - 1
+            v_start, v_end = _parse_byte_range(range_hdr, file_size)
         except Exception:
             abort(416)
         v_end  = min(v_end, file_size - 1)
@@ -1359,15 +2157,39 @@ def spore_stream_proxy(token: str):
     length = v_end - v_start + 1
 
     def _generate():
-        CHUNK = 2 << 20
+        CHUNK = _SPORE_CHUNK
         pos = v_start
+        url_ref = cdn_url
         while pos <= v_end:
             end = min(pos + CHUNK - 1, v_end)
             try:
-                data = mp4_faststart.serve_bytes(info, cdn_url, pos, end)
+                data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
             except Exception as exc:
-                log.warning("spore-stream proxy: error v=%d token=%s: %s", pos, token, exc)
-                break
+                # Re-materialize a fresh CDN URL once (handles mid-stream URL
+                # expiry / transient TorBox errors) and retry before giving up,
+                # rather than truncating the response or serving garbage.
+                # A 429 is the exception: the URL is alive but throttled, and
+                # re-resolving returns the same URL while doubling the request
+                # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
+                if getattr(exc, "status", None) == 429:
+                    log.warning("spore-stream proxy: throttled v=%d token=%s: %s",
+                                pos, token, exc)
+                    break
+                # materialize() consults the same URL cache the stale URL came
+                # from; drop the entry first or it hands the dead URL back.
+                catbox.invalidate_url_cache(token)
+                fresh = catbox.materialize(token)
+                if fresh and fresh != url_ref:
+                    url_ref = fresh
+                    try:
+                        data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
+                    except Exception as exc2:
+                        log.warning("spore-stream proxy: giving up v=%d token=%s: %s",
+                                    pos, token, exc2)
+                        break
+                else:
+                    log.warning("spore-stream proxy: error v=%d token=%s: %s", pos, token, exc)
+                    break
             if not data:
                 break
             yield data
@@ -1401,8 +2223,12 @@ def ui_api_virtual_items():
 
 @app.post("/ui/api/virtual-items/<token>/re-resolve")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_re_resolve(token: str):
     """Clear fail state for a token and trigger a fresh materialize attempt."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     item = db.get_virtual_item(token)
     if not item:
         return jsonify(error="unknown token"), 404
@@ -1444,8 +2270,57 @@ def ui_api_integrity():
     return jsonify(db.integrity_report())
 
 
+@app.get("/ui/api/zilean/status")
+def ui_api_zilean_status():
+    """Status of the native Zilean index (mode, hash count, last sync/import)."""
+    mode = _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE)
+    status = {"mode": mode}
+    if mode == "native":
+        import zilean_index
+        status.update(zilean_index.get_status())
+    return jsonify(status)
+
+
+@app.post("/ui/api/zilean/sync")
+def ui_api_zilean_sync():
+    """Trigger an immediate native Zilean hashlist sync in the background."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+    import threading as _threading
+    import zilean_index
+    force = bool(request.get_json(silent=True) and request.get_json(silent=True).get("force"))
+    _threading.Thread(target=zilean_index.sync, kwargs={"force": force}, daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
+@app.post("/ui/api/zilean/import")
+def ui_api_zilean_import():
+    """One-time bulk import from an existing external Zilean's Postgres database
+    into the native index. Connection settings come from the Zilean native
+    settings group (Postgres host/port/db/user/password)."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+    host = _settings_mod.get("ZILEAN_PG_HOST", cfg.ZILEAN_PG_HOST)
+    if not host:
+        return jsonify(error="ZILEAN_PG_HOST not configured"), 400
+    import threading as _threading
+    import zilean_index
+    kwargs = dict(
+        host=host,
+        port=_settings_mod.get("ZILEAN_PG_PORT", cfg.ZILEAN_PG_PORT),
+        dbname=_settings_mod.get("ZILEAN_PG_DB", cfg.ZILEAN_PG_DB),
+        user=_settings_mod.get("ZILEAN_PG_USER", cfg.ZILEAN_PG_USER),
+        password=_settings_mod.get("ZILEAN_PG_PASSWORD", cfg.ZILEAN_PG_PASSWORD),
+    )
+    _threading.Thread(target=zilean_index.import_from_postgres, kwargs=kwargs, daemon=True).start()
+    return jsonify(ok=True, started=True)
+
+
 @app.post("/ui/catbox-gc")
+@auth.require_role("admin")
 def ui_catbox_gc():
+    if not auth.is_admin():
+        abort(403)
     n = catbox.release_idle()
     flash(f"Released {n} idle torrent(s)", "ok")
     return redirect(url_for("ui_dashboard") + "#catbox")
@@ -1457,13 +2332,17 @@ def ui_api_blacklist():
 
 
 @app.post("/ui/blacklist-clear/<info_hash>")
+@auth.require_role("admin")
 def ui_blacklist_clear(info_hash: str):
+    if not auth.is_admin():
+        abort(403)
     db.clear_failed_hash(info_hash)
     flash(f"Cleared blacklist for {info_hash[:12]}…", "ok")
     return redirect(url_for("ui_dashboard") + "#blacklist")
 
 
 @app.post("/ui/backup-now")
+@auth.require_role("admin")
 def ui_backup_now():
     threading.Thread(target=backup.run, name="backup-manual", daemon=True).start()
     flash("DB backup started", "ok")
@@ -1476,7 +2355,10 @@ def ui_api_backups():
 
 
 @app.post("/ui/backup-restore")
+@auth.require_role("admin")
 def ui_backup_restore():
+    if not auth.is_admin():
+        abort(403)
     name = request.form.get("name", "").strip()
     if not backup.restore(name):
         flash(f"Restore failed for {name}", "err")
@@ -1488,28 +2370,40 @@ def ui_backup_restore():
 # ── Upgrader / consolidation / trending triggers ──────────────────────────────
 
 @app.post("/ui/auto-upgrade")
+@auth.require_role("admin")
 def ui_auto_upgrade():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=upgrader.run_auto_upgrade, name="upgrade-manual", daemon=True).start()
     flash("Auto-upgrade scan started", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/pack-consolidate")
+@auth.require_role("admin")
 def ui_pack_consolidate():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=upgrader.run_pack_consolidation, name="pack-manual", daemon=True).start()
     flash("Season-pack consolidation started", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/trending-now")
+@auth.require_role("admin")
 def ui_trending_now():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=trending.run, name="trending-manual", daemon=True).start()
     flash("Trending pre-cache started", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/continue-watching")
+@auth.require_role("admin")
 def ui_continue_watching():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=continue_watching.prioritize_next_episodes,
                      name="cw-manual", daemon=True).start()
     flash("Continue-watching scan started", "ok")
@@ -1518,12 +2412,39 @@ def ui_continue_watching():
 
 @app.get("/ui/api/settings")
 def ui_api_settings():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     import settings
     return jsonify(groups=settings.all_for_ui(), hot_reload=list(settings.HOT_RELOAD))
 
 
+_NOTIFICATION_KEYS = {"NOTIFY_ON_SUCCESS", "NOTIFY_ON_FAILURE",
+                      "DISCORD_WEBHOOK_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+
+
+@app.post("/ui/api/settings/notifications")
+@auth.require_auth
+def ui_api_settings_notifications_set():
+    """Focused write endpoint for the React Settings page's Notifications card."""
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import settings as _s
+    p = request.get_json(silent=True) or {}
+    for key, value in p.items():
+        if key not in _NOTIFICATION_KEYS:
+            continue
+        if key in _s._BOOL_KEYS:
+            _s.set(key, bool(value))
+        else:
+            _s.set(key, value)
+    return jsonify(ok=True)
+
+
 @app.post("/ui/settings")
+@auth.require_role("admin")
 def ui_save_settings():
+    if not auth.is_admin():
+        abort(403)
     import settings
     saved = 0
     for raw_key, raw_value in request.form.items():
@@ -1534,19 +2455,25 @@ def ui_save_settings():
         # before each checkbox so the value always arrives. Handle multi-value here.
         values = request.form.getlist(raw_key)
         value = values[-1] if values else raw_value
-        if key in settings._BOOL_KEYS:
-            settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
-        elif value == "":
-            settings.set(key, None)
-        else:
-            settings.set(key, value)
-        saved += 1
+        try:
+            if key in settings._BOOL_KEYS:
+                settings.set(key, str(value).lower() in ("1", "true", "yes", "on"))
+            elif value == "":
+                settings.set(key, None)
+            else:
+                settings.set(key, value)
+            saved += 1
+        except ValueError as exc:
+            flash(str(exc), "error")
     flash(f"Saved {saved} setting(s). Hot-reload settings apply immediately; others need a restart.", "ok")
     return redirect(url_for("ui_dashboard") + "#settings")
 
 
 @app.post("/ui/settings-reset/<key>")
+@auth.require_role("admin")
 def ui_settings_reset(key: str):
+    if not auth.is_admin():
+        abort(403)
     import settings
     settings.set(key, None)
     flash(f"Reset {key} to .env default", "ok")
@@ -1569,7 +2496,10 @@ def _library_import_and_resolve():
 
 
 @app.post("/ui/library-import")
+@auth.require_role("admin")
 def ui_library_import():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=_library_import_and_resolve,
                      name="lib-import", daemon=True).start()
     flash("Library import started  -  check Logs for progress", "ok")
@@ -1577,28 +2507,40 @@ def ui_library_import():
 
 
 @app.post("/ui/recovery")
+@auth.require_role("admin")
 def ui_recovery():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=recovery.run, name="recovery-wizard", daemon=True).start()
     flash("Recovery wizard started  -  runs integrity check + cleanup + import + strm scan", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/db-vacuum")
+@auth.require_role("admin")
 def ui_db_vacuum():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=db.vacuum, name="db-vacuum", daemon=True).start()
     flash("DB vacuum started", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/db-prune")
+@auth.require_role("admin")
 def ui_db_prune():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=lambda: db.prune_old(90), name="db-prune", daemon=True).start()
     flash("Pruning rows older than 90 days", "ok")
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
 @app.post("/ui/quota-check")
+@auth.require_role("admin")
 def ui_quota_check():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(
         target=lambda: torbox.check_quota_and_warn(QUOTA_WARN_TORRENT_COUNT, QUOTA_WARN_SIZE_GB),
         name="quota-manual", daemon=True,
@@ -1639,7 +2581,11 @@ def ui_api_failed_requests():
 
 @app.post("/ui/api/requests/<int:row_id>/retry")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_retry_request(row_id: int):
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     rows = [r for r in db.get_recent(1000) if r["id"] == row_id]
     if not rows:
         return jsonify(error="not found"), 404
@@ -1656,7 +2602,11 @@ def ui_api_retry_request(row_id: int):
 
 @app.post("/ui/api/requests/<int:row_id>/delete")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_delete_request(row_id: int):
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     with db._connect() as conn:
         cur = conn.execute("DELETE FROM requests WHERE id=?", (row_id,))
         conn.commit()
@@ -1688,7 +2638,10 @@ def ui_api_show_overrides():
 
 
 @app.post("/ui/show-override")
+@auth.require_role("admin")
 def ui_show_override():
+    if not auth.is_admin():
+        abort(403)
     imdb_id = (request.form.get("imdb_id") or "").strip()
     if not re.fullmatch(r"tt\d{6,10}", imdb_id):
         flash("Invalid IMDB ID", "err")
@@ -1705,7 +2658,10 @@ def ui_show_override():
 
 
 @app.post("/ui/show-override-delete/<imdb_id>")
+@auth.require_role("admin")
 def ui_show_override_delete(imdb_id: str):
+    if not auth.is_admin():
+        abort(403)
     db.delete_show_override(imdb_id)
     flash(f"Cleared override for {imdb_id}", "ok")
     return redirect(url_for("ui_dashboard") + "#overrides")
@@ -1727,6 +2683,7 @@ def ui_api_discover_search():
         return jsonify(results=[])
     page = int(request.args.get("page") or "1")
     results = tmdb.multi_search(q, page=page)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1787,6 +2744,33 @@ def _enrich_library_status(items: list[dict]) -> None:
             it["imdb_id"] = imdb_map.get(it.get("tmdb_id"))
 
 
+def _filter_by_language(items: list[dict]) -> list[dict]:
+    """Apply the logged-in user's Discover language include/exclude preference
+    to a list of normalized TMDB items (in place semantics via return value).
+    Include wins when both are set for the same language. Items with no
+    original_language (rare) are never filtered out."""
+    rec = auth.current_user_record()
+    if not rec:
+        return items
+    include = {l.strip().lower() for l in (rec.get("discover_language_include") or "").split(",") if l.strip()}
+    exclude = {l.strip().lower() for l in (rec.get("discover_language_exclude") or "").split(",") if l.strip()}
+    if not include and not exclude:
+        return items
+    out = []
+    for it in items:
+        lang = (it.get("original_language") or "").lower()
+        if not lang:
+            out.append(it)
+            continue
+        if include:
+            if lang in include:
+                out.append(it)
+            continue
+        if lang not in exclude:
+            out.append(it)
+    return out
+
+
 def _user_region() -> str:
     """Region from ?region= param, or from the logged-in user's profile, or system default."""
     r = request.args.get("region")
@@ -1803,6 +2787,7 @@ def ui_api_discover_trending():
     media = request.args.get("type", "all")  # all | movie | tv
     window = request.args.get("window", "week")  # day | week
     results = tmdb.trending(media, window)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1812,6 +2797,7 @@ def ui_api_discover_popular():
     media = request.args.get("type", "movie")
     region = _user_region()
     results = tmdb.popular(media, region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1820,6 +2806,7 @@ def ui_api_discover_popular():
 def ui_api_discover_top_rated():
     media = request.args.get("type", "movie")
     results = tmdb.top_rated(media)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1828,6 +2815,7 @@ def ui_api_discover_top_rated():
 def ui_api_discover_now_playing():
     region = _user_region()
     results = tmdb.now_playing(region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1836,6 +2824,7 @@ def ui_api_discover_now_playing():
 def ui_api_discover_upcoming():
     region = _user_region()
     results = tmdb.upcoming(region=region)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1843,6 +2832,7 @@ def ui_api_discover_upcoming():
 @app.get("/ui/api/discover/on-the-air")
 def ui_api_discover_on_the_air():
     results = tmdb.on_the_air()
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
 
@@ -1863,8 +2853,70 @@ def ui_api_discover_by_provider():
     if not pid:
         return jsonify(error="provider_id required"), 400
     results = tmdb.discover_by_provider(media, pid, region=region, sort_by=sort)
+    results = _filter_by_language(results)
     _enrich_library_status(results)
     return jsonify(results=results)
+
+
+@app.get("/ui/api/discover/by-genre")
+def ui_api_discover_by_genre():
+    media = request.args.get("type", "movie")
+    genre_id = int(request.args.get("genre_id") or "0")
+    if not genre_id:
+        return jsonify(error="genre_id required"), 400
+    year_from = request.args.get("year_from")
+    year_to = request.args.get("year_to")
+    results = tmdb.discover_by_genre(
+        media, genre_id,
+        year_from=int(year_from) if year_from else None,
+        year_to=int(year_to) if year_to else None,
+    )
+    results = _filter_by_language(results)
+    _enrich_library_status(results)
+    return jsonify(results=results)
+
+
+@app.get("/ui/api/discover/genre-tabs")
+def ui_api_discover_genre_tabs():
+    """Public: enabled genre-tab configs for the Discover page rows."""
+    import json
+    import settings as _s
+    raw = _s.get("DISCOVER_GENRE_TABS", "[]")
+    try:
+        tabs = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except (TypeError, ValueError):
+        tabs = []
+    return jsonify(tabs=[t for t in tabs if t.get("enabled")])
+
+
+@app.get("/ui/api/discover/genre-tabs/config")
+@auth.require_auth
+def ui_api_discover_genre_tabs_config_get():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import json
+    import settings as _s
+    raw = _s.get("DISCOVER_GENRE_TABS", "[]")
+    try:
+        tabs = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except (TypeError, ValueError):
+        tabs = []
+    return jsonify(tabs=tabs)
+
+
+@app.post("/ui/api/discover/genre-tabs/config")
+@auth.require_auth
+def ui_api_discover_genre_tabs_config_set():
+    if not auth.is_admin():
+        return jsonify(error="unauthorized"), 401
+    import json
+    import settings as _s
+    p = request.get_json(silent=True) or {}
+    tabs = p.get("tabs")
+    if not isinstance(tabs, list):
+        return jsonify(error="tabs must be a list"), 400
+    _s.set("DISCOVER_GENRE_TABS", json.dumps(tabs))
+    return jsonify(ok=True)
 
 
 @app.get("/ui/api/discover/details")
@@ -2051,6 +3103,7 @@ def ui_api_user_requests():
 
 
 @app.post("/ui/api/user-requests/<int:req_id>/approve")
+@auth.require_role("admin")
 def ui_api_user_request_approve(req_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2065,6 +3118,7 @@ def ui_api_user_request_approve(req_id: int):
 
 
 @app.post("/ui/api/user-requests/<int:req_id>/deny")
+@auth.require_role("admin")
 def ui_api_user_request_deny(req_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2085,7 +3139,11 @@ def ui_api_wanted_movies():
 
 @app.post("/ui/api/wanted-recheck")
 @_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
 def ui_api_wanted_recheck():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     def _run():
         try:
             upgrader.recheck_wanted()
@@ -2097,7 +3155,10 @@ def ui_api_wanted_recheck():
 
 
 @app.post("/ui/search-all-wanted")
+@auth.require_role("admin")
 def ui_search_all_wanted():
+    if not auth.is_admin():
+        abort(403)
     def _run():
         upgrader.recheck_wanted()
         monitor.run_series_check()
@@ -2283,6 +3344,8 @@ def ui_api_session():
         "auto_approve": bool(rec.get("auto_approve")),
         "region": rec.get("region", "NL"),
         "library_click_jellyfin": bool(rec.get("library_click_jellyfin")),
+        "discover_language_include": rec.get("discover_language_include") or "",
+        "discover_language_exclude": rec.get("discover_language_exclude") or "",
     }
     user.update(plugin_loader.session_fields(rec))
     jellyfin_url = (_settings.get("JELLYFIN_URL") or cfg.JELLYFIN_URL or "").rstrip("/")
@@ -2302,6 +3365,7 @@ def ui_api_users():
 
 
 @app.post("/ui/api/users/create")
+@auth.require_role("admin")
 def ui_api_users_create():
     import settings as _settings
     # Bootstrap: only allow unauthenticated first-admin creation when no users exist AND
@@ -2339,6 +3403,7 @@ def ui_api_users_create():
 
 
 @app.post("/ui/api/users/<int:user_id>/update")
+@auth.require_role("admin")
 def ui_api_users_update(user_id: int):
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2398,16 +3463,102 @@ def ui_api_me_preferences():
     if not rec:
         return jsonify(error="not authenticated"), 401
     p = request.get_json(silent=True) or {}
-    _ALLOWED = {"library_click_jellyfin"}
-    fields = {k: (1 if v else 0) for k, v in p.items() if k in _ALLOWED}
+    _BOOL_FIELDS = {"library_click_jellyfin"}
+    _TEXT_FIELDS = {"discover_language_include", "discover_language_exclude"}
+    fields = {}
+    for k, v in p.items():
+        if k in _BOOL_FIELDS:
+            fields[k] = 1 if v else 0
+        elif k in _TEXT_FIELDS:
+            fields[k] = ",".join(l.strip().lower() for l in str(v or "").split(",") if l.strip())
     if not fields:
         return jsonify(error="no valid fields"), 400
     db.update_user(rec["id"], **fields)
     return jsonify(ok=True)
 
 
-# Cache Jellyfin item IDs: imdb_id -> jellyfin_item_id (or None if not found)
-_jellyfin_item_cache: dict[str, str | None] = {}
+## Trakt OAuth/sync/watched/scrobble routes live in plugins/trakt/routes.py
+## (a pre-existing plugin - see PLUGIN_META in plugins/trakt/__init__.py).
+
+
+@app.get("/ui/api/mdblist/status")
+@auth.require_auth
+def ui_api_mdblist_status():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    import mdblist
+    return jsonify(
+        connected=mdblist.is_configured(rec),
+        list_ids=rec.get("mdblist_list_ids") or "",
+    )
+
+
+@app.post("/ui/api/mdblist/connect")
+@auth.require_auth
+def ui_api_mdblist_connect():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    api_key = (p.get("api_key") or "").strip()
+    if not api_key:
+        return jsonify(error="api_key required"), 400
+    db.update_user(rec["id"], mdblist_api_key=api_key)
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/mdblist/disconnect")
+@auth.require_auth
+def ui_api_mdblist_disconnect():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    db.update_user(rec["id"], mdblist_api_key="", mdblist_list_ids="")
+    return jsonify(ok=True)
+
+
+@app.get("/ui/api/mdblist/lists")
+@auth.require_auth
+def ui_api_mdblist_lists():
+    rec = auth.current_user_record()
+    if not rec or not rec.get("mdblist_api_key"):
+        return jsonify(error="MDBList not connected"), 400
+    import mdblist
+    return jsonify(lists=mdblist.get_user_lists(rec["mdblist_api_key"]))
+
+
+@app.post("/ui/api/mdblist/lists")
+@auth.require_auth
+def ui_api_mdblist_set_lists():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    p = request.get_json(silent=True) or {}
+    list_ids = p.get("list_ids")
+    if not isinstance(list_ids, list):
+        return jsonify(error="list_ids must be a list"), 400
+    db.update_user(rec["id"], mdblist_list_ids=",".join(str(i) for i in list_ids))
+    return jsonify(ok=True)
+
+
+@app.post("/ui/api/mdblist/sync")
+@auth.require_auth
+def ui_api_mdblist_sync():
+    rec = auth.current_user_record()
+    if not rec:
+        return jsonify(error="not authenticated"), 401
+    import mdblist
+    added = mdblist.sync_auto_request(rec)
+    return jsonify(ok=True, added=added)
+
+
+# Cache Jellyfin item IDs: imdb_id -> jellyfin_item_id (or None if not found).
+# TTL keeps the cache from going stale across library churn; cap keeps memory
+# bounded even if the dashboard is left open against a large library.
+_jellyfin_item_cache: "_cachetools.TTLCache[str, str | None]" = _cachetools.TTLCache(
+    maxsize=20000, ttl=3600,
+)
 
 
 @app.get("/ui/api/jellyfin/item")
@@ -2520,6 +3671,8 @@ def ui_api_backfill_nfo():
     Safe to run multiple times. Triggers a Plex library refresh afterward if
     PLEX_URL and PLEX_TOKEN are configured.
     """
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     result = strm_generator.backfill_nfo_streamdetails()
     return jsonify(result)
 
@@ -2563,6 +3716,7 @@ def ui_api_users_delete(user_id: int):
 # ── Auto-add now (trigger immediately) ───────────────────────────────────────
 
 @app.post("/ui/api/auto-add-now")
+@auth.require_role("admin")
 def ui_api_auto_add_now():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2574,11 +3728,14 @@ def ui_api_auto_add_now():
 
 @app.get("/ui/api/arr-import/status")
 def ui_api_arr_import_status():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
     import arr_import
     return jsonify(arr_import.get_status())
 
 
 @app.post("/ui/api/arr-import/radarr")
+@auth.require_role("admin")
 def ui_api_arr_import_radarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2591,6 +3748,7 @@ def ui_api_arr_import_radarr():
 
 
 @app.post("/ui/api/arr-import/sonarr")
+@auth.require_role("admin")
 def ui_api_arr_import_sonarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
@@ -2603,12 +3761,13 @@ def ui_api_arr_import_sonarr():
 
 
 @app.post("/ui/api/arr-import/test-radarr")
+@auth.require_role("admin")
 def ui_api_arr_import_test_radarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
     p = request.get_json(silent=True) or {}
-    url = p.get("url") or settings.get("RADARR_URL", cfg.RADARR_URL)
-    key = p.get("api_key") or settings.get("RADARR_API_KEY", cfg.RADARR_API_KEY)
+    url = p.get("url") or _settings_mod.get("RADARR_URL", cfg.RADARR_URL)
+    key = p.get("api_key") or _settings_mod.get("RADARR_API_KEY", cfg.RADARR_API_KEY)
     if not url or not key:
         return jsonify(ok=False, error="url + api_key required"), 400
     import radarr
@@ -2616,12 +3775,13 @@ def ui_api_arr_import_test_radarr():
 
 
 @app.post("/ui/api/arr-import/test-sonarr")
+@auth.require_role("admin")
 def ui_api_arr_import_test_sonarr():
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
     p = request.get_json(silent=True) or {}
-    url = p.get("url") or settings.get("SONARR_URL", cfg.SONARR_URL)
-    key = p.get("api_key") or settings.get("SONARR_API_KEY", cfg.SONARR_API_KEY)
+    url = p.get("url") or _settings_mod.get("SONARR_URL", cfg.SONARR_URL)
+    key = p.get("api_key") or _settings_mod.get("SONARR_API_KEY", cfg.SONARR_API_KEY)
     if not url or not key:
         return jsonify(ok=False, error="url + api_key required"), 400
     import sonarr

@@ -97,7 +97,7 @@ def set_password(pw: str) -> None:
 def _ip_in_trusted(remote: str | None) -> bool:
     if not remote:
         return False
-    networks_raw = settings.get("TRUSTED_PROXY_NETWORKS", "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16")
+    networks_raw = settings.get("TRUSTED_PROXY_NETWORKS", "127.0.0.1/32")
     if isinstance(networks_raw, list):
         nets = networks_raw
     else:
@@ -129,14 +129,17 @@ def _proxy_user() -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_enabled() -> bool:
-    if settings.get("AUTH_ENABLED", False):
-        return True
-    # OIDC implicitly enables auth-gating
-    try:
-        import oidc
-        return oidc.is_enabled()
-    except Exception:
+    """Whether auth-gating is active.
+
+    Returns False ONLY when INSECURE_ALLOW_ANON is explicitly true (legacy
+    single-user mode, every caller treated as admin). Otherwise returns True;
+    the startup gate in app.py guarantees at least one auth method
+    (AUTH_ENABLED, OIDC_ENABLED, or TRUSTED_PROXY_AUTH) is configured before
+    the process is allowed to start.
+    """
+    if settings.get("INSECURE_ALLOW_ANON", False):
         return False
+    return True
 
 
 def current_user() -> str | None:
@@ -147,7 +150,13 @@ def current_user() -> str | None:
 
 def current_user_record() -> dict | None:
     """Return the full users-table row for the active session, or None.
-    Falls back to a synthetic 'admin' record for the legacy single-user mode."""
+
+    The legacy single-user AUTH_USERNAME/AUTH_PASSWORD login explicitly sets
+    session['role'] on success ('admin') and is honoured as-is. OIDC and
+    trusted-proxy logins only set session['user'] with no role, so they are
+    resolved (or auto-provisioned) against the real users table instead of
+    being granted admin implicitly - the first user ever provisioned this way
+    becomes admin (bootstrap), every subsequent one defaults to 'user'."""
     uid = session.get("user_id")
     if uid:
         import db
@@ -155,11 +164,29 @@ def current_user_record() -> dict | None:
         if u:
             return u
     user = current_user()
-    if user:
-        # Legacy / proxy-auth path: synthesize an admin record
-        return {"id": 0, "username": user, "role": "admin", "auto_approve": 1,
+    if not user:
+        return None
+    legacy_role = session.get("role")
+    if legacy_role:
+        # Legacy single-user AUTH_USERNAME/AUTH_PASSWORD login.
+        return {"id": 0, "username": user, "role": legacy_role, "auto_approve": 1,
                 "quota_monthly": 0, "enabled": 1, "webplayer_enabled": 1}
-    return None
+    # OIDC / trusted-proxy login: resolve or auto-provision a real DB user.
+    import db
+    u = db.get_user_by_username(user)
+    if not u:
+        # Bootstrap admin only during initial setup - once SETUP_COMPLETE is
+        # set, deleting every user must not silently reopen an admin-grant
+        # window for the next OIDC/proxy login.
+        is_bootstrap = db.user_count() == 0 and not settings.get("SETUP_COMPLETE", False)
+        role = "admin" if is_bootstrap else "user"
+        new_id = db.create_user(user, "sso$disabled", role=role)
+        u = db.get_user(new_id)
+    if not u.get("enabled"):
+        return None
+    session["user_id"] = u["id"]
+    db.touch_user_login(u["id"])
+    return u
 
 
 def is_admin() -> bool:
@@ -282,10 +309,20 @@ def install_before_request(app) -> None:
         for prefix in _PUBLIC_PATHS:
             if path == prefix or path.startswith(prefix + "/") or path == prefix.rstrip("/"):
                 return None
-        if path.startswith("/stream/") or path.startswith("/spore-stream/"):
+        if path.startswith("/stream/") or path.startswith("/spore-stream/") or path.startswith("/spore-nfs/"):
             return None
         if path.startswith("/dav"):
             return _enforce_basic_auth()
+        # First-run setup wizard: when no users exist yet, allow /setup paths so
+        # an admin can be created. /setup/save and /setup/create-admin enforce
+        # their own checks once the first user exists.
+        if path.startswith("/setup"):
+            try:
+                import db as _db
+                if _db.user_count() == 0:
+                    return None
+            except Exception:
+                pass
         if session.get("user"):
             return None
         proxy_user = _proxy_user()

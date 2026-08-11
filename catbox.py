@@ -19,17 +19,25 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
+import cachetools
+
 import db
 import settings as _settings
 import torbox
-from config import CATBOX_HOST, CATBOX_IDLE_MINUTES
+from config import CATBOX_HOST, CATBOX_IDLE_MINUTES as _CATBOX_IDLE_MINUTES_DEFAULT
 
 log = logging.getLogger(__name__)
 
 
+# All module-level caches below are bounded with cachetools so a stuck or
+# adversarial caller cannot grow them indefinitely. TTLs match the existing
+# expiry semantics; maxsize caps are sized for ~10k concurrent tokens, well
+# above the household library sizes Mycelium targets.
 _URL_CACHE_TTL_SEC = 82800  # 23 hours  -  within TorBox CDN URL 24h validity
 ON_PLAY_READY_TIMEOUT_SEC = 45  # max wait on-play before giving up (cached = seconds)
-_url_cache: dict[str, tuple[str, float]] = {}
+_url_cache: "cachetools.TTLCache[str, tuple[str, float]]" = cachetools.TTLCache(
+    maxsize=10000, ttl=_URL_CACHE_TTL_SEC
+)
 _url_cache_lock = threading.Lock()
 
 # Failure cooldown: after a failed materialize (429, timeout, no file found),
@@ -37,7 +45,18 @@ _url_cache_lock = threading.Lock()
 # hammer TorBox with repeated createtorrent calls.
 _FAIL_COOLDOWN_SEC = 30        # standard failure (readd blocked, no file)
 _FAIL_COOLDOWN_429_SEC = 120   # TorBox 429  -  back off longer
-_fail_cache: dict[str, float] = {}  # token → expiry monotonic timestamp
+# A torrent that was added but is not "ready" yet is a transient cold-start state
+# that usually clears within seconds. A hard 30s wall here turns a normal first
+# play into a "transcoder crashed" for half a minute even though the CDN URL is
+# about to exist, so give it a short cooldown and let the next play pick it up as
+# soon as TorBox finishes readying the file.
+_FAIL_COOLDOWN_READYING_SEC = 8   # added, waiting for TorBox/RD "ready"
+# TTL on the cache equals the longest cooldown; per-entry expiries still
+# enforced explicitly via the monotonic-timestamp value (older entries with
+# shorter cooldowns get reported as expired sooner).
+_fail_cache: "cachetools.TTLCache[str, float]" = cachetools.TTLCache(
+    maxsize=10000, ttl=_FAIL_COOLDOWN_429_SEC
+)
 _fail_cache_lock = threading.Lock()
 
 # ── Reason codes (structured, for playability_state + admin UI) ───────────────
@@ -66,11 +85,17 @@ def _fail_put(token: str, ttl: int = _FAIL_COOLDOWN_SEC) -> None:
     with _fail_cache_lock:
         _fail_cache[token] = time.monotonic() + ttl
 
-_token_locks: dict[str, threading.Lock] = {}
+# LRU because a Lock has no useful TTL; cap protects against unbounded growth
+# when scan probes or malformed callers spray distinct tokens. Evicted locks
+# are discarded (any waiter dies with the lock owner, not a problem in practice
+# since the owner thread either finishes or holds a process-lifetime Python ref).
+_token_locks: "cachetools.LRUCache[str, threading.Lock]" = cachetools.LRUCache(maxsize=10000)
 
 # Per-content search cache so Zilean/Torrentio are called at most once per hour
 # for the same (imdb_id, season, episode) combo, regardless of how many tokens share it.
-_search_cache: dict[tuple, tuple[float, object]] = {}  # key → (expiry, result)
+# The (expiry, result) tuple keeps the historic explicit TTL behaviour; the
+# cachetools wrapper exists only to bound size.
+_search_cache: "cachetools.LRUCache[tuple, tuple[float, object]]" = cachetools.LRUCache(maxsize=10000)
 _search_cache_lock = threading.Lock()
 _SEARCH_HIT_TTL    = 300    # 5 min: re-check soon if a cached release was found
 _SEARCH_MISS_TTL   = 21600  # 6 h:  nothing cached  -  back off (matches _fail_put below)
@@ -84,14 +109,26 @@ _token_locks_lock = threading.Lock()
 # every scan is slow and churns TorBox's createtorrent quota. Items already live
 # in TorBox still resolve cheaply (mylist is cached), so they probe fine.
 _SCAN_WINDOW_SEC = 25
-_SCAN_DISTINCT_THRESHOLD = 4
+# Deliberately above this deployment's realistic concurrent-user count (a
+# handful of real users, see CLAUDE.md) so several people starting different
+# titles within the same 25s window isn't misread as a library scan and
+# denied re-add. A real scan opens far more than this many distinct items.
+_SCAN_DISTINCT_THRESHOLD = 8
 _recent_tokens: dict[str, float] = {}
 _recent_lock = threading.Lock()
 
 
 def _is_scan_burst(token: str) -> bool:
     """Record this token request and report whether we appear to be inside a
-    library-scan burst (many distinct tokens within the recent window)."""
+    library-scan burst (many distinct tokens within the recent window).
+
+    Only counts tokens that actually exist in the virtual_items table so an
+    attacker (or noisy probe) hitting /stream/<random> repeatedly cannot
+    trip the burst threshold and force legitimate playbacks to be treated
+    as scans.
+    """
+    if not db.get_virtual_item(token):
+        return False
     now = time.monotonic()
     with _recent_lock:
         for t, ts in list(_recent_tokens.items()):
@@ -118,6 +155,26 @@ def _content_key(item: dict) -> str | None:
     if season and episode:
         return f"{imdb_id}:S{season:02d}E{episode:02d}"
     return imdb_id
+
+
+_TOUCH_DEBOUNCE_SEC = 60  # the last_played/play_count precision we actually need
+_touch_cache: "cachetools.TTLCache[str, bool]" = cachetools.TTLCache(
+    maxsize=10000, ttl=_TOUCH_DEBOUNCE_SEC
+)
+_touch_cache_lock = threading.Lock()
+
+
+def _touch_debounced(token: str) -> None:
+    """db.touch_virtual_item() is a synchronous UPDATE + commit, and materialize's
+    cache-hit path runs on every byte-range request, so one viewer fires dozens a
+    minute. SQLite takes one writer at a time, so under concurrent playback those
+    writes serialize against every other session's. play_count/last_played do not
+    need per-chunk precision."""
+    with _touch_cache_lock:
+        if token in _touch_cache:
+            return
+        _touch_cache[token] = True
+    db.touch_virtual_item(token)
 
 
 def _cache_get(token: str) -> str | None:
@@ -163,12 +220,15 @@ def register(info_hash: str, magnet: str, title: str, media_type: str,
              file_id: int | None = None, imdb_id: str | None = None,
              quality: str | None = None, source: str | None = None,
              size_gb: float | None = None, season: int | None = None,
-             episode: int | None = None, year: int | None = None) -> str:
+             episode: int | None = None, year: int | None = None,
+             protocol: str = "torrent", nzb_url: str | None = None,
+             usenet_id: int | None = None) -> str:
     token = uuid.uuid4().hex[:16]
     db.insert_virtual_item(token, info_hash, magnet, title, media_type,
                             strm_path=strm_path, torbox_id=torbox_id, file_id=file_id,
                             imdb_id=imdb_id, quality=quality, source=source,
-                            size_gb=size_gb, season=season, episode=episode, year=year)
+                            size_gb=size_gb, season=season, episode=episode, year=year,
+                            protocol=protocol, nzb_url=nzb_url, usenet_id=usenet_id)
     return token
 
 
@@ -183,7 +243,7 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
     """
     cached = _cache_get(token)
     if cached:
-        db.touch_virtual_item(token)
+        _touch_debounced(token)
         return cached
 
     # Respect failure cooldown  -  don't spam TorBox after a recent failed attempt.
@@ -197,7 +257,7 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
         # Re-check inside the lock: another thread may have succeeded or set cooldown.
         cached = _cache_get(token)
         if cached:
-            db.touch_virtual_item(token)
+            _touch_debounced(token)
             return cached
         if _fail_get(token):
             return None
@@ -206,27 +266,133 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
             _cache_put(token, url)
             _schedule_next_episode_preload(token)
         else:
-            _fail_put(token)
+            # Do not clobber a more specific cooldown that _materialize_locked
+            # already set (the short readying window, or a long 429 / no-cached
+            # back-off)  -  only apply the default when none is active.
+            if not _fail_get(token):
+                _fail_put(token)
         return url
+
+
+def _pick_usenet_file_id(item: dict, virtual_item: dict) -> int | None:
+    """Pick the right file inside a completed TorBox usenet download.
+
+    Movies: largest non-trailer video file.
+    Episodes: the shared episode matcher, which only returns a confident match
+    (never a file tagged as a different episode, and never a blind largest-file
+    guess).  Returns None when it cannot match, so the caller can re-scrape.
+    """
+    import strm_generator
+    files = item.get("files") or []
+    if not files:
+        return None
+    # Some usenet entries expose only short_name; normalise to 'name'.
+    norm = [{**f, "name": (f.get("name") or f.get("short_name") or "")} for f in files]
+    if virtual_item.get("media_type") == "movie":
+        main = strm_generator._pick_main_movie_file(norm)
+        return main.get("id") if main else None
+    s_num = virtual_item.get("season")
+    e_num = virtual_item.get("episode")
+    if s_num and e_num:
+        absolute = None
+        try:
+            import numbering
+            absolute = numbering.to_absolute(virtual_item.get("imdb_id"), s_num, e_num)
+        except Exception:
+            absolute = None
+        main = strm_generator._pick_episode_file(norm, s_num, e_num, absolute=absolute)
+        return main.get("id") if main else None
+    vids = [f for f in norm if strm_generator._is_video(f["name"])]
+    return vids[0].get("id") if len(vids) == 1 else None
+
+
+def _materialize_usenet(token: str, item: dict) -> str | None:
+    """On-play materialize for a usenet virtual_item.
+
+    Path:
+      1. If stored usenet_id exists and download is ready, just refresh the CDN URL.
+      2. If usenet_id exists but item is still downloading, wait briefly.
+      3. If no usenet_id (rare: lost between submit and persist), resubmit the
+         stored NZB URL.
+    """
+    import strm_generator as _sg
+
+    usenet_id = item.get("usenet_id")
+    nzb_url = item.get("nzb_url") or item.get("magnet")  # magnet col was the fallback
+
+    if not usenet_id and nzb_url:
+        # Resubmit; happens only if we crashed between add_nzb returning and the
+        # row being persisted (very rare). Costs 1 quota slot.
+        try:
+            log.info("Catbox/usenet: no usenet_id stored for %s  -  resubmitting NZB",
+                     item.get("title"))
+            result = torbox.add_nzb(nzb_url, name=item.get("title"),
+                                     reason="catbox-usenet-resubmit")
+            usenet_id = (result or {}).get("id")
+            if usenet_id:
+                db.update_virtual_usenet_id(token, usenet_id)
+        except torbox.RateLimited:
+            _fail_put(token, _FAIL_COOLDOWN_429_SEC)
+            return None
+        except Exception as exc:
+            log.warning("Catbox/usenet: resubmit failed for %s: %s",
+                        item.get("title"), exc)
+            _fail_put(token, _FAIL_COOLDOWN_SEC)
+            return None
+
+    if not usenet_id:
+        log.warning("Catbox/usenet: no usenet_id and no nzb_url for %s", item.get("title"))
+        return None
+
+    live = torbox.find_usenet_by_id(usenet_id)
+    if not live or not torbox._is_ready(live):
+        # Wait up to ON_PLAY_READY_TIMEOUT_SEC. Usenet downloads of a typical
+        # movie complete in 30-120s; first playback may need this window.
+        log.info("Catbox/usenet: %s not ready (id=%s)  -  waiting up to %ds",
+                 item.get("title"), usenet_id, ON_PLAY_READY_TIMEOUT_SEC)
+        live = torbox.wait_until_ready_usenet(usenet_id, timeout=ON_PLAY_READY_TIMEOUT_SEC)
+        if not live or not torbox._is_ready(live):
+            _fail_put(token, _FAIL_COOLDOWN_SEC)
+            return None
+
+    file_id = _pick_usenet_file_id(live, item)
+    if file_id is None:
+        log.warning("Catbox/usenet: no video file in TorBox usenet id=%s", usenet_id)
+        _fail_put(token, _FAIL_COOLDOWN_SEC)
+        return None
+
+    url = _sg._get_usenet_stream_url(usenet_id, file_id)
+    if not url:
+        _fail_put(token, _FAIL_COOLDOWN_SEC)
+        return None
+    log.info("Catbox/usenet: served %s (usenet_id=%s, file=%s)",
+             item.get("title"), usenet_id, file_id)
+    return url
 
 
 def _rd_get_url(item: dict, rd_id: str) -> str | None:
     """Get a playable URL from RealDebrid for this virtual item."""
-    import re as _re
     import realdebrid as _rd
+    import strm_generator
     if item["media_type"] == "movie":
         return _rd.get_main_video_url(rd_id)
-    # Episode: match SxxExx in filename
+    # Episode: confident match only (SxxExx or NNxNN); never a blind largest-file
+    # guess and never a file tagged as a different episode.
     pairs = _rd.get_video_files_with_urls(rd_id)
     if not pairs:
         return None
     s_num, e_num = item.get("season"), item.get("episode")
+    name = lambda f: f.get("path") or f.get("name") or ""
     if s_num and e_num:
-        ep_re = _re.compile(rf'[Ss]0?{s_num}[Ee]0?{e_num}\b', _re.IGNORECASE)
-        matched = [(f, u) for f, u in pairs if ep_re.search(f.get("path") or f.get("name") or "")]
+        want = (int(s_num), int(e_num))
+        matched = [(f, u) for f, u in pairs if strm_generator._file_episode(name(f)) == want]
         if matched:
-            return matched[0][1]
-    return max(pairs, key=lambda fu: fu[0].get("bytes") or 0)[1]
+            return max(matched, key=lambda fu: fu[0].get("bytes") or 0)[1]
+        untagged = [(f, u) for f, u in pairs if strm_generator._file_episode(name(f)) is None]
+        if len(untagged) == 1:
+            return untagged[0][1]
+        return None
+    return pairs[0][1] if len(pairs) == 1 else None
 
 
 def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
@@ -238,7 +404,17 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
 
     ckey = _content_key(item)
     debrid_provider = (item.get("debrid_provider") or "torbox").lower()
+    protocol = (item.get("protocol") or "torrent").lower()
     rematerialized = False
+
+    # ── TorBox usenet path ────────────────────────────────────────────────────
+    if protocol == "usenet":
+        url = _materialize_usenet(token, item)
+        if url:
+            db.touch_virtual_item(token)
+            if ckey:
+                db.update_playability_ok(ckey, "torbox-usenet")
+        return url
 
     # ── RealDebrid path ───────────────────────────────────────────────────────
     if debrid_provider == "realdebrid":
@@ -297,7 +473,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 rd_info = _rd.wait_until_ready(rd_id)
                 if not rd_info:
                     log.error("Catbox/RD: wait_until_ready timed out for %s", item["title"])
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -394,7 +570,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                             _metrics_inc("rematerialized")
                             return url
                     log.error("Catbox: RD wait_until_ready timed out for %s", item["title"])
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -433,7 +609,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 rd_id = result["id"]
                 rd_info = _rd.wait_until_ready(rd_id)
                 if not rd_info:
-                    _fail_put(token, _FAIL_COOLDOWN_SEC)
+                    _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                     if ckey:
                         db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                     return None
@@ -474,7 +650,7 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
             if not live:
                 log.error("Catbox: fresh release not ready for %s  -  keeping .strm, retry soon",
                           item["title"])
-                _fail_put(token, _FAIL_COOLDOWN_SEC)
+                _fail_put(token, _FAIL_COOLDOWN_READYING_SEC)
                 if ckey:
                     db.update_playability_fail(ckey, REASON_WAIT_TIMEOUT)
                 return None
@@ -492,7 +668,27 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
     if not file_id:
         live = torbox.find_by_id(torbox_id)
         if live:
-            import re as _re
+            # Backstop for the mislabeled-pack bug: if this torrent's real files
+            # obviously aren't the requested item (a movie request resolving to a
+            # season/complete-series pack, an oversized collection, or no video at
+            # all), refuse rather than guessing a file and serving garbage. The
+            # durable fix is at grab time  -  this only catches items whose bad
+            # hash predates that guard.
+            import release_sanity
+            _kind = ("movie" if item["media_type"] == "movie"
+                     else "episode" if (item.get("season") and item.get("episode"))
+                     else "season_pack")
+            _bad = release_sanity.verify_live_torrent(
+                live, _kind, season=item.get("season"), episode=item.get("episode"),
+                imdb_id=item.get("imdb_id"))
+            if _bad:
+                log.error("Catbox: release sanity rejected torrent %s for %s (%s)  -  "
+                          "keeping .strm, not serving a mislabeled pack",
+                          torbox_id, item["title"], _bad)
+                _fail_put(token, _FAIL_COOLDOWN_SEC)
+                if ckey:
+                    db.update_playability_fail(ckey, REASON_NO_FILE)
+                return None
             import strm_generator
             if item["media_type"] == "movie":
                 main = strm_generator._pick_main_movie_file(live.get("files") or [])
@@ -506,22 +702,30 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                     log.info("Catbox: no files list for %s  -  using file_id=0 (auto)", item["title"])
                     file_id = 0
             else:
-                videos = [f for f in (live.get("files") or [])
-                          if strm_generator._is_video(f.get("name") or "")
-                          and not strm_generator._is_trailer(f)]
+                files = live.get("files") or []
                 s_num = item.get("season")
                 e_num = item.get("episode")
                 if s_num and e_num:
-                    ep_re = _re.compile(rf'[Ss]0?{s_num}[Ee]0?{e_num}\b', _re.IGNORECASE)
-                    matched = [f for f in videos if ep_re.search(f.get("name") or "")]
-                    main = matched[0] if matched else (
-                        max(videos, key=lambda f: f.get("size") or 0) if videos else None
-                    )
+                    absolute = None
+                    try:
+                        import numbering
+                        absolute = numbering.to_absolute(item.get("imdb_id"), s_num, e_num)
+                    except Exception:
+                        absolute = None
+                    main = strm_generator._pick_episode_file(files, s_num, e_num, absolute=absolute)
                 else:
-                    main = max(videos, key=lambda f: f.get("size") or 0) if videos else None
+                    vids = [f for f in files
+                            if strm_generator._is_video(f.get("name") or "")
+                            and not strm_generator._is_trailer(f)]
+                    main = vids[0] if len(vids) == 1 else None
                 if main:
                     file_id = main["id"]
                     db.update_virtual_file_id(token, file_id)
+                else:
+                    # No confident match.  Do NOT guess (the old largest-file guess
+                    # served the wrong episode).  Leave unresolved so it re-scrapes.
+                    log.warning("Catbox: no confident file match for %s S%sE%s in torrent %s; "
+                                "leaving unresolved", item["title"], s_num, e_num, torbox_id)
 
     if file_id is None or (not file_id and file_id != 0):
         log.error("Catbox: no playable file found for %s  -  keeping .strm, retry later", token)
@@ -629,6 +833,8 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
     try:
         import concurrent.futures
         import torrentio
+        import mediafusion as _mediafusion
+        import prowlarr as _prowlarr
         import debrid
         import blacklist
         media_type = item["media_type"]
@@ -636,7 +842,8 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
         episode = item.get("episode")
         import zilean as _zilean
 
-        # Run Zilean and Torrentio in parallel to halve search latency.
+        # Run all four scrapers in parallel so total latency caps at the
+        # slowest single scraper instead of summing them.
         def _fetch_zilean():
             if not _settings.get("ZILEAN_ENABLED", False):
                 return []
@@ -648,17 +855,42 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
                 imdb_id, season=season, episode=episode,
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        def _fetch_mediafusion():
+            return _mediafusion.fetch_streams(
+                "movie" if media_type == "movie" else "series",
+                imdb_id, season=season, episode=episode,
+            )
+
+        def _fetch_prowlarr():
+            return _prowlarr.fetch_streams(
+                "movie" if media_type == "movie" else "series",
+                imdb_id, season=season, episode=episode,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             f_zilean = ex.submit(_fetch_zilean)
             f_torrentio = ex.submit(_fetch_torrentio)
+            f_mediafusion = ex.submit(_fetch_mediafusion)
+            f_prowlarr = ex.submit(_fetch_prowlarr)
             zilean_streams = f_zilean.result()
             torrentio_streams = f_torrentio.result()
+            mediafusion_streams = f_mediafusion.result()
+            prowlarr_streams = f_prowlarr.result()
 
-        log.info("Catbox search: Zilean=%d Torrentio=%d stream(s) for %s (%s)",
-                 len(zilean_streams), len(torrentio_streams), item.get("title"), imdb_id)
-        # Merge: Zilean first, add Torrentio entries not already in Zilean (dedup by info_hash)
-        seen_hashes = {s.info_hash for s in zilean_streams}
-        streams = zilean_streams + [s for s in torrentio_streams if s.info_hash not in seen_hashes]
+        log.info("Catbox search: Zilean=%d Torrentio=%d MediaFusion=%d Prowlarr=%d stream(s) for %s (%s)",
+                 len(zilean_streams), len(torrentio_streams),
+                 len(mediafusion_streams), len(prowlarr_streams),
+                 item.get("title"), imdb_id)
+        # Merge: dedup by info_hash across all four sources, preserve order
+        # (Zilean → Torrentio → MediaFusion → Prowlarr) so the more-trusted
+        # DMM caches come first.
+        seen_hashes: set = set()
+        streams: list = []
+        for src in (zilean_streams, torrentio_streams, mediafusion_streams, prowlarr_streams):
+            for s in src:
+                if s.info_hash not in seen_hashes:
+                    seen_hashes.add(s.info_hash)
+                    streams.append(s)
         log.info("Catbox search: %d stream(s) total after merge for %s",
                  len(streams), item.get("title"))
         if not streams:
@@ -731,9 +963,41 @@ def _schedule_next_episode_preload(token: str) -> None:
         log.debug("Catbox: next-episode preload scheduling failed: %s", exc)
 
 
+def _sweep_caches() -> None:
+    """Prune expired entries from the in-memory caches that are only cleaned
+    on read (_url_cache, _fail_cache, _search_cache) or on next scan-burst
+    check (_recent_tokens). A token that's cached once and never queried
+    again would otherwise sit in memory forever on a long-running instance.
+
+    _token_locks is deliberately NOT swept here: a lock object can be handed
+    out to a caller and acquired moments after this check finds it free,
+    so deleting it here could let two callers end up serialized on two
+    different Lock objects for the same token instead of one - a real
+    correctness bug, not just a leak. Left as a known, harmless memory growth."""
+    now_mono = time.monotonic()
+
+    with _url_cache_lock:
+        for t in [t for t, (_, exp) in _url_cache.items() if exp <= now_mono]:
+            del _url_cache[t]
+
+    with _fail_cache_lock:
+        for t in [t for t, exp in _fail_cache.items() if exp <= now_mono]:
+            del _fail_cache[t]
+
+    with _search_cache_lock:
+        for k in [k for k, (exp, _) in _search_cache.items() if exp <= now_mono]:
+            del _search_cache[k]
+
+    with _recent_lock:
+        for t in [t for t, ts in _recent_tokens.items() if now_mono - ts > _SCAN_WINDOW_SEC]:
+            del _recent_tokens[t]
+
+
 def release_idle() -> int:
     """Remove TorBox items idle longer than CATBOX_IDLE_MINUTES. Returns count released."""
-    cutoff = datetime.utcnow() - timedelta(minutes=CATBOX_IDLE_MINUTES)
+    _sweep_caches()
+    idle_minutes = _settings.get("CATBOX_IDLE_MINUTES", _CATBOX_IDLE_MINUTES_DEFAULT)
+    cutoff = datetime.utcnow() - timedelta(minutes=idle_minutes)
     cutoff_iso = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     items = db.get_idle_virtual_items(cutoff_iso)
     released = 0

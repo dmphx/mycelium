@@ -1,0 +1,6 @@
+# Keep shell/script files LF-only. A CRLF shebang (e.g. "#!/bin/bash\r") makes a
+# script unexecutable ("cannot execute: required file not found") — this broke the
+# Spore Plex transcoder wrapper after a Windows-side (Ebony) deploy on 2026-06-21.
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.py    text eol=lf

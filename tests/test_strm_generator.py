@@ -9,25 +9,9 @@ Secties:
   - Plex Spore        (make_stub_mkv, _write_spore_stubs)
   - Jellyfin .strm    (_write_strm inclusief duplicate-skip)
 """
-import os
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
-# Verplichte env vars voor config.py (wordt NIET gemockt)
-os.environ.setdefault("TORBOX_API_KEY", "test")
-os.environ.setdefault("MEDIA_PATH", "/tmp/mycelium-test-media")
-os.environ.setdefault("SPORE_MEDIA_PATH", "/tmp/mycelium-test-spore")
-os.environ.setdefault("TORBOX_BASE_URL", "https://api.torbox.app/v1/api")
-os.environ.setdefault("SPORE_ENABLED", "true")
-
-# Mock zware imports zodat strm_generator importeerbaar is zonder DB/netwerk
-for _mod in ("db", "jellyfin", "settings", "torbox", "nfo_generator", "mp4_faststart"):
-    sys.modules.setdefault(_mod, MagicMock())
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-import strm_generator as sg  # noqa: E402  (imports na sys.path setup)
+import strm_generator as sg
 
 
 # =============================================================================
@@ -86,6 +70,95 @@ class TestStrmPath:
     def test_episode_path_double_digit(self):
         p = sg._strm_path({"type": "episode", "title": "The Bear", "season": 1, "episode": 10})
         assert "S01E10" in str(p)
+
+
+class TestScanTorboxLibrary:
+    """scan_torbox_library() backfills .strm files for torrents TorBox already
+    has cached that we have no virtual_item record of (e.g. after a DB reset)."""
+
+    def test_imports_unknown_ready_torrent_with_tmdb_title(self, tmp_path, monkeypatch):
+        import tmdb as real_tmdb
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)  # CATBOX_MODE off
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        monkeypatch.setattr(sg.db, "get_virtual_item_by_hash", lambda info_hash: None)
+        monkeypatch.setattr(real_tmdb, "search_movie", lambda title, year=None: "tt0110912")
+        monkeypatch.setattr(real_tmdb, "display_title", lambda imdb_id, media_type: "Pulp Fiction (1994)")
+
+        item = {
+            "id": 1, "name": "Pulp.Fiction.1994.1080p.WEB-DL", "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Pulp.Fiction.1994.1080p.WEB-DL.mkv"}],
+        }
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: True
+        sg.torbox_mod.find_by_id = lambda torrent_id: item
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 1, "imported": 1, "skipped": 0, "failed": 0}
+        path = Path(tmp_path) / "movies" / "Pulp Fiction (1994)" / "Pulp Fiction (1994).strm"
+        assert path.exists()
+
+    def test_skips_torrent_already_known(self, monkeypatch):
+        monkeypatch.setattr(sg.db, "get_virtual_item_by_hash", lambda info_hash: {"token": "existing"})
+        item = {"id": 2, "name": "Known.Movie.2020", "hash": "b" * 40, "files": []}
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: True
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 1, "imported": 0, "skipped": 1, "failed": 0}
+
+    def test_skips_not_ready_torrents(self, monkeypatch):
+        item = {"id": 3, "name": "Still.Downloading.2020", "hash": "c" * 40, "files": []}
+        sg.torbox_mod.list_torrents = lambda force_refresh=True: [item]
+        sg.torbox_mod._is_ready = lambda item: False
+
+        result = sg.scan_torbox_library()
+        assert result == {"scanned": 0, "imported": 0, "skipped": 0, "failed": 0}
+
+
+class TestProcessTorrentCanonicalTitle:
+    """A canonical_title/imdb_id lets a fresh torrent add land in the same
+    series folder every time instead of re-deriving a (possibly different)
+    folder name from each torrent's own raw release name  -  the cause of a
+    show ending up split across several duplicate library entries."""
+
+    def test_uses_canonical_title_and_writes_tvshow_nfo(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.torbox_mod, "_is_ready", lambda item: True)
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)  # CATBOX_MODE off
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        item = {
+            "id": 1,
+            "name": "Full.House.S02.1080p.WEB-DL",
+            "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Full.House.S02E01.mkv"}],
+        }
+        written = sg.process_torrent(item, canonical_title="Full House", imdb_id="tt0092359")
+        assert written == 1
+        folder = Path(tmp_path) / "series" / "Full House"
+        assert (folder / "Season 02" / "Full House S02E01.strm").exists()
+        nfo = folder / "tvshow.nfo"
+        assert nfo.exists()
+        assert "tt0092359" in nfo.read_text()
+
+    def test_two_differently_named_torrents_land_in_same_folder(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+        monkeypatch.setattr(sg.torbox_mod, "_is_ready", lambda item: True)
+        monkeypatch.setattr(sg.settings, "get", lambda key, default=None: False)
+        monkeypatch.setattr(sg, "_resolve_url", lambda *a, **kw: "http://cdn.example/x")
+        item1 = {
+            "id": 1, "name": "Full.House.S01.1080p.WEB-DL", "hash": "a" * 40,
+            "files": [{"id": 1, "name": "Full.House.S01E01.mkv"}],
+        }
+        item2 = {
+            "id": 2, "name": "[SITE] FULL HOUSE S02 COMPLETE", "hash": "b" * 40,
+            "files": [{"id": 2, "name": "Full House S02E01.mkv"}],
+        }
+        sg.process_torrent(item1, canonical_title="Full House", imdb_id="tt0092359")
+        sg.process_torrent(item2, canonical_title="Full House", imdb_id="tt0092359")
+        series_dir = Path(tmp_path) / "series"
+        show_folders = [p for p in series_dir.iterdir() if p.is_dir()]
+        assert [p.name for p in show_folders] == ["Full House"]
 
 
 class TestNormTitle:
@@ -172,6 +245,75 @@ class TestMakeStubMkv:
         assert b"A_EAC3" in data
         assert b"A_PCM/INT/LIT" not in data
 
+    def test_explicit_codec_id_overrides_quality_guess(self):
+        # A 1080p HEVC (x265) file must produce an HEVC stub, not the
+        # 1080p->H264 guess. Otherwise Plex feeds HEVC into an H264 pipeline
+        # and the transcode dies with invalid NAL units (web error s3014/s3015).
+        data = sg.make_stub_mkv("Test", quality="1080p",
+                                codec_id="V_MPEGH/ISO/HEVC")
+        assert b"V_MPEGH/ISO/HEVC" in data
+        assert b"V_MPEG4/ISO/AVC" not in data
+
+    def test_video_codec_private_embedded(self):
+        priv = bytes.fromhex("0123456789abcdef")
+        data = sg.make_stub_mkv("Test", quality="1080p",
+                                codec_id="V_MPEGH/ISO/HEVC",
+                                video_codec_private=priv)
+        assert priv in data
+
+
+class TestCodecIdForVideo:
+    def test_probed_codec_overrides_quality(self):
+        # The real probed codec wins over the resolution based guess.
+        assert sg._codec_id_for_video("hevc", "1080p") == "V_MPEGH/ISO/HEVC"
+        assert sg._codec_id_for_video("h264", "2160p") == "V_MPEG4/ISO/AVC"
+        assert sg._codec_id_for_video("av1", "1080p") == "V_AV1"
+
+    def test_falls_back_to_quality_when_unknown(self):
+        assert sg._codec_id_for_video(None, "1080p") == "V_MPEG4/ISO/AVC"
+        assert sg._codec_id_for_video(None, "2160p") == "V_MPEGH/ISO/HEVC"
+        assert sg._codec_id_for_video("weirdcodec", "1080p") == "V_MPEG4/ISO/AVC"
+
+
+class TestCodecFromReleaseName:
+    def test_hevc_tokens(self):
+        assert sg._codec_from_release_name("Haunted Hotel S01 1080p 10bit WEBRip 6CH x265 HEVC-PSA") == "hevc"
+        assert sg._codec_from_release_name("Movie.2024.2160p.WEB.H.265-GRP") == "hevc"
+        assert sg._codec_from_release_name("Show.S01.1080p.x 265-GRP") == "hevc"
+
+    def test_h264_tokens(self):
+        assert sg._codec_from_release_name("Civil.War.2024.1080p.WEB-DL.x264-GRP") == "h264"
+        assert sg._codec_from_release_name("Movie.2024.1080p.H.264-GRP") == "h264"
+        assert sg._codec_from_release_name("Movie.2024.1080p.AVC-GRP") == "h264"
+
+    def test_av1(self):
+        assert sg._codec_from_release_name("Show.S01.1080p.WEB.AV1-GRP") == "av1"
+
+    def test_ambiguous_returns_none(self):
+        assert sg._codec_from_release_name("Movie.2024.1080p.WEB-DL.DD5.1-GRP") is None
+        assert sg._codec_from_release_name("") is None
+        assert sg._codec_from_release_name(None) is None
+
+
+class TestDnFromMagnet:
+    def test_plus_encoded(self):
+        m = "magnet:?xt=urn:btih:abc123&dn=Some.Release.S01.1080p.x265-GRP&tr=udp://t"
+        assert sg._dn_from_magnet(m) == "Some.Release.S01.1080p.x265-GRP"
+
+    def test_percent_encoded(self):
+        m = "magnet:?xt=urn:btih:abc&dn=Some%20Release%20x265%20HEVC"
+        assert sg._dn_from_magnet(m) == "Some Release x265 HEVC"
+
+    def test_non_magnet_returns_none(self):
+        assert sg._dn_from_magnet("https://indexer/file.nzb") is None
+        assert sg._dn_from_magnet(None) is None
+
+    def test_end_to_end_codec_id(self):
+        # The dn -> codec -> CodecID chain must yield HEVC for an x265 release at 1080p.
+        dn = sg._dn_from_magnet("magnet:?xt=urn:btih:x&dn=Show.S01.1080p.x265-GRP")
+        codec = sg._codec_from_release_name(dn)
+        assert sg._codec_id_for_video(codec, "1080p") == "V_MPEGH/ISO/HEVC"
+
 
 class TestWriteSporeStubs:
     def test_creates_mkv_and_minfo(self, tmp_path, monkeypatch):
@@ -190,6 +332,28 @@ class TestWriteSporeStubs:
         minfo = (stub_dir / "Elevation (2024).minfo").read_text()
         assert "token=abc123" in minfo
         assert "size=" in minfo
+
+    def test_born_hevc_from_magnet_dn(self, tmp_path, monkeypatch):
+        # A 1080p x265 release must be born as an HEVC stub (from the magnet dn=),
+        # not the 1080p->AVC resolution default, so Plex never feeds HEVC into an
+        # H.264 pipeline. imdb_id=None keeps the TMDB duration lookup out of the way.
+        media_root = tmp_path / "media"
+        spore_root = tmp_path / "plex-media"
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(media_root))
+        monkeypatch.setattr(sg, "SPORE_MEDIA_PATH", str(spore_root))
+        sg.settings.get.return_value = True
+        monkeypatch.setattr(sg.db, "get_virtual_item", lambda token: {
+            "magnet": "magnet:?xt=urn:btih:x&dn=Show.S01.1080p.WEBRip.x265-HEVC-GRP",
+            "imdb_id": None, "season": None, "episode": None, "quality": "1080p",
+        })
+
+        strm_path = media_root / "series" / "Show" / "Season 01" / "Show S01E01.strm"
+        sg._write_spore_stubs(strm_path, token="tokH", title="Show S01E01",
+                              quality="1080p", size_gb=2.0)
+
+        mkv = (spore_root / "series" / "Show" / "Season 01" / "Show S01E01.mkv").read_bytes()
+        assert b"V_MPEGH/ISO/HEVC" in mkv
+        assert b"V_MPEG4/ISO/AVC" not in mkv
 
     def test_minfo_size_in_bytes(self, tmp_path, monkeypatch):
         media_root = tmp_path / "media"

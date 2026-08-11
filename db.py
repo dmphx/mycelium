@@ -33,17 +33,20 @@ def _thread_conn() -> sqlite3.Connection:
 
 @contextmanager
 def _connect():
-    """Yield a per-thread sqlite3 connection. We deliberately do NOT close it
-    on exit; the connection lives for the thread's lifetime."""
-    conn = _thread_conn()
-    try:
-        yield conn
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+    """Yield a per-thread sqlite3 connection.
+
+    The connection is configured with isolation_level=None (autocommit), so
+    every individual `execute` is its own implicit transaction. Wrapping a
+    block of these in `with _connect() as conn:` does NOT make them
+    atomic; an exception halfway through leaves earlier statements
+    committed and only the in-flight statement uncommitted. For genuinely
+    atomic multi-statement operations, open an explicit transaction with
+    `conn.execute("BEGIN")` / `COMMIT` and handle rollback locally.
+
+    The connection is deliberately not closed on exit; it lives for the
+    thread's lifetime (see _thread_conn).
+    """
+    yield _thread_conn()
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -308,7 +311,16 @@ def init() -> None:
 
 
 def _dedup_requests(conn) -> None:
-    """Remove duplicate imdb_id rows before the UNIQUE index is created."""
+    """Remove duplicate imdb_id rows before the UNIQUE index is created.
+
+    Skipped on a fresh DB where the table doesn't exist yet; the dedup pass
+    is only meaningful when migrating from a pre-UNIQUE schema.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='requests'"
+    ).fetchone()
+    if not has_table:
+        return
     dupes = conn.execute(
         "SELECT imdb_id, COUNT(*) AS cnt FROM requests "
         "GROUP BY imdb_id HAVING cnt > 1"
@@ -352,6 +364,12 @@ def _migrate() -> None:
             ("debrid_provider", "TEXT DEFAULT 'torbox'"),
             ("rd_id", "TEXT"),
             ("spore_tracks", "TEXT"),
+            # Usenet support: "torrent" (default) or "usenet". When usenet,
+            # the magnet slot holds the NZB download URL and torbox_id refers
+            # to a usenet download row (different TorBox endpoint).
+            ("protocol", "TEXT NOT NULL DEFAULT 'torrent'"),
+            ("nzb_url", "TEXT"),
+            ("usenet_id", "INTEGER"),
         ]:
             if col not in vi_cols:
                 try:
@@ -384,6 +402,41 @@ def _migrate() -> None:
         if "library_click_jellyfin" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN library_click_jellyfin INTEGER NOT NULL DEFAULT 0")
             log.info("Migration: added users.library_click_jellyfin")
+        for col in ("discover_language_include", "discover_language_exclude"):
+            if col not in user_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                log.info("Migration: added users.%s", col)
+        for col in ("mdblist_api_key", "mdblist_list_ids"):
+            if col not in user_cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                log.info("Migration: added users.%s", col)
+
+        # plugins/trakt owns trakt_watched (created by its own run_migrations(),
+        # which runs after this function via plugin_loader.load_all()). An earlier
+        # version of this migration also created a trakt_watched table with an
+        # incompatible schema (extra tmdb_id NOT NULL/season/episode columns, no
+        # UNIQUE(user_id, imdb_id)); since db.init() runs before plugin loading,
+        # that wrong-shaped table would win the CREATE TABLE IF NOT EXISTS race and
+        # the plugin's own inserts (ON CONFLICT(user_id, imdb_id)) would then fail.
+        # Drop it here if it's still in that shape so the plugin can recreate it
+        # correctly on next startup.
+        _cols = {r["name"] for r in conn.execute("PRAGMA table_info(trakt_watched)")}
+        if _cols and "season" in _cols:
+            conn.execute("DROP TABLE trakt_watched")
+            log.info("Migration: dropped trakt_watched (wrong schema from a removed "
+                     "duplicate integration); plugins/trakt will recreate it correctly")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorite_actors (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                person_id   INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                profile_path TEXT,
+                added_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+                UNIQUE(user_id, person_id)
+            )
+        """)
 
         conn.commit()
 
@@ -453,7 +506,12 @@ def insert_request(title: str, imdb_id: str, media_type: str, seasons: list[int]
                     tmdb_id: int | None = None) -> int:
     seasons_str = ",".join(str(s) for s in (seasons or []))
     with _connect() as conn:
-        cur = conn.execute(
+        # cursor.lastrowid is unreliable here: on the ON CONFLICT/UPDATE path
+        # (i.e. every retry of an existing imdb_id) SQLite does NOT update
+        # last_insert_rowid(), so it can return a stale id left over from some
+        # unrelated row's last real INSERT on this connection. Look the row up
+        # explicitly instead of trusting lastrowid.
+        conn.execute(
             "INSERT INTO requests (title, imdb_id, media_type, seasons, tmdb_id) VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(imdb_id) DO UPDATE SET "
             "title=excluded.title, seasons=COALESCE(excluded.seasons, seasons), "
@@ -461,8 +519,9 @@ def insert_request(title: str, imdb_id: str, media_type: str, seasons: list[int]
             "updated_at=strftime('%Y-%m-%d %H:%M:%S', 'now')",
             (title, imdb_id, media_type, seasons_str or None, tmdb_id),
         )
+        row = conn.execute("SELECT id FROM requests WHERE imdb_id=?", (imdb_id,)).fetchone()
         conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        return row["id"]
 
 
 def update_request(row_id: int, status: str, quality: str | None = None,
@@ -555,11 +614,15 @@ def upsert_monitored_series(imdb_id: str, tmdb_id: int | None, title: str,
         conn.commit()
 
 
-def get_monitored_series(status: str = "active") -> list[dict]:
+def get_monitored_series(status: str = "active", limit: int | None = None) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM monitored_series WHERE status=? ORDER BY title", (status,)
-        ).fetchall()
+        sql = ("SELECT * FROM monitored_series WHERE status=? "
+               "ORDER BY COALESCE(last_checked, '') ASC, title")
+        params: list = [status]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -598,20 +661,27 @@ def upsert_wanted_episode(imdb_id: str, tmdb_id: int | None, title: str,
         conn.commit()
 
 
-def get_wanted_episodes(max_attempts: int = 10) -> list[dict]:
+def get_wanted_episodes(max_attempts: int = 10, limit: int | None = None) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute(
-            """SELECT * FROM wanted_episodes
-               WHERE status='wanted' AND attempt_count < ?
-               ORDER BY title, season, episode""",
-            (max_attempts,),
-        ).fetchall()
+        # Order by fewest attempts then newest air date so the monitor grab loop
+        # reaches never-tried and recently-aired episodes first. A title/season
+        # ordering buried every ongoing show's newest episode at the back of a
+        # ~290k-row queue that a single pass never finishes, so new episodes were
+        # never grabbed. Un-gettable back-catalog (high attempt_count) sinks to
+        # the back instead of starving the front every cycle.
+        sql = ("SELECT * FROM wanted_episodes "
+               "WHERE status='wanted' AND attempt_count < ? "
+               "ORDER BY attempt_count ASC, air_date DESC")
+        params: list = [max_attempts]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
 def get_series_folder_imdb_map() -> dict[str, str]:
     """Map series folder names to imdb_id via virtual_items strm_path."""
-    import re
     with _connect() as conn:
         rows = conn.execute(
             "SELECT DISTINCT imdb_id, strm_path FROM virtual_items "
@@ -721,10 +791,14 @@ def rekey_media_item(old_id: str, new_id: str, media_type: str) -> bool:
             )
             conn.commit()
             return cur.rowcount > 0
-        except Exception:
+        except sqlite3.IntegrityError:
             conn.rollback()
             # new_id already exists (UNIQUE conflict)  -  the unknown_ row is a duplicate;
-            # just delete it so the canonical entry remains.
+            # just delete it so the canonical entry remains. Only a real
+            # UNIQUE-constraint violation means this - any other exception
+            # (disk I/O, lock timeout) must not be treated the same way, or
+            # a transient error would silently delete data instead of
+            # surfacing the real problem.
             try:
                 conn.execute(
                     "DELETE FROM media_items WHERE imdb_id=? AND media_type=?",
@@ -841,15 +915,31 @@ def insert_virtual_item(token: str, info_hash: str, magnet: str, title: str,
                          imdb_id: str | None = None, quality: str | None = None,
                          source: str | None = None, size_gb: float | None = None,
                          season: int | None = None, episode: int | None = None,
-                         year: int | None = None) -> int:
+                         year: int | None = None, protocol: str = "torrent",
+                         nzb_url: str | None = None,
+                         usenet_id: int | None = None) -> int:
+    """Insert a virtual item.
+
+    For torrents (protocol='torrent'): `magnet` holds the magnet URI and
+    `info_hash` is the bittorrent infohash. catbox.materialize re-adds via
+    torbox.add_magnet on first playback.
+
+    For usenet (protocol='usenet'): `magnet` holds the NZB download URL
+    (also mirrored to nzb_url for clarity), and `info_hash` is the synthetic
+    sha1 used as a dedup/lookup key. catbox.materialize re-adds via
+    torbox.add_nzb. `usenet_id` is the TorBox usenet download row id, set
+    once the download completes.
+    """
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO virtual_items
                (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
-                imdb_id, quality, source, size_gb, season, episode, year)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                imdb_id, quality, source, size_gb, season, episode, year,
+                protocol, nzb_url, usenet_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
-             imdb_id, quality, source, size_gb, season, episode, year),
+             imdb_id, quality, source, size_gb, season, episode, year,
+             protocol, nzb_url, usenet_id),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
@@ -905,12 +995,17 @@ def get_virtual_items_by_hash(info_hash: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_unprobed_spore_items() -> list[dict]:
+def get_unprobed_spore_items(limit: int | None = None) -> list[dict]:
     """Return virtual_items that have a strm_path but no spore_tracks yet."""
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM virtual_items WHERE strm_path IS NOT NULL AND spore_tracks IS NULL"
-        ).fetchall()
+        sql = ("SELECT * FROM virtual_items WHERE strm_path IS NOT NULL "
+               "AND spore_tracks IS NULL "
+               "ORDER BY COALESCE(last_played, '') DESC, created_at DESC")
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -918,6 +1013,15 @@ def get_all_virtual_items() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM virtual_items ORDER BY last_played DESC, created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_virtual_item_spore_index() -> list[dict]:
+    """Return only fields needed by the spore status sweep."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT token, info_hash FROM virtual_items"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -977,12 +1081,29 @@ def update_virtual_rd_id(token: str, rd_id: str | None) -> None:
         conn.commit()
 
 
+def update_virtual_usenet_id(token: str, usenet_id: int | None) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE virtual_items SET usenet_id=? WHERE token=?",
+                      (usenet_id, token))
+        conn.commit()
+
+
+def _escape_like(s: str) -> str:
+    """Escape SQLite LIKE metacharacters so a literal prefix match doesn't
+    accidentally also match unrelated paths (e.g. a folder name containing
+    an underscore, which LIKE treats as "any single character")."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def update_virtual_strm_path_prefix(old_prefix: str, new_prefix: str) -> int:
-    """Update strm_path for all virtual_items whose path starts with old_prefix."""
+    """Update strm_path for all virtual_items whose path starts with old_prefix.
+
+    Escapes LIKE metacharacters in the prefix (upstream's _escape_like fix) so a
+    folder name containing '_' or '%' can't match unrelated paths."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT token, strm_path FROM virtual_items WHERE strm_path LIKE ?",
-            (old_prefix + "%",),
+            "SELECT token, strm_path FROM virtual_items WHERE strm_path LIKE ? ESCAPE '\\'",
+            (_escape_like(old_prefix) + "%",),
         ).fetchall()
         count = 0
         for row in rows:
@@ -992,6 +1113,19 @@ def update_virtual_strm_path_prefix(old_prefix: str, new_prefix: str) -> int:
             count += 1
         conn.commit()
         return count
+
+
+def update_virtual_item_strm_path(old_path: str, new_path: str) -> int:
+    """Point virtual_items.strm_path at a new path after a single file move/rename
+    (as opposed to rename_virtual_item_paths, which rewrites a whole directory
+    prefix - anchored to a "/" boundary - and assumes filenames are unchanged)."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE virtual_items SET strm_path=? WHERE strm_path=?",
+            (new_path, old_path),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def save_spore_tracks(token: str, tracks: dict) -> None:
@@ -1052,6 +1186,12 @@ def delete_virtual_item(token: str) -> None:
         conn.commit()
 
 
+def delete_virtual_item_by_strm_path(strm_path: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM virtual_items WHERE strm_path=?", (strm_path,))
+        conn.commit()
+
+
 def rename_virtual_item_paths(old_dir: str, new_dir: str) -> int:
     """Bulk-update strm_path in virtual_items when a folder is renamed.
     Replaces the old directory prefix with the new one. Returns rows updated."""
@@ -1061,8 +1201,8 @@ def rename_virtual_item_paths(old_dir: str, new_dir: str) -> int:
         cur = conn.execute(
             """UPDATE virtual_items
                SET strm_path = ? || SUBSTR(strm_path, ?)
-               WHERE strm_path LIKE ?""",
-            (new_prefix, len(old_prefix) + 1, old_prefix + "%"),
+               WHERE strm_path LIKE ? ESCAPE '\\'""",
+            (new_prefix, len(old_prefix) + 1, _escape_like(old_prefix) + "%"),
         )
         conn.commit()
         return cur.rowcount
@@ -1116,13 +1256,17 @@ def clear_failed_hash(info_hash: str) -> None:
 # ── webhook idempotency ───────────────────────────────────────────────────────
 
 def webhook_seen(dedup_key: str) -> bool:
-    """Record a webhook event; return True if already seen (within DB)."""
+    """Record a webhook event; return True if already seen (within DB).
+
+    Only a UNIQUE-constraint violation on dedup_key means "already seen" -
+    any other DB error (lock timeout, disk full, ...) must not be treated as
+    a silent duplicate, or the webhook event would just vanish."""
     try:
         with _connect() as conn:
             conn.execute("INSERT INTO webhook_events (dedup_key) VALUES (?)", (dedup_key,))
             conn.commit()
             return False
-    except Exception:
+    except sqlite3.IntegrityError:
         return True
 
 
@@ -1344,6 +1488,43 @@ def update_user(user_id: int, **fields) -> None:
         conn.execute(sql, vals)
 
 
+def upsert_oidc_user(username: str, role: str = "user") -> int:
+    """Provision (or refresh) an OIDC-authenticated user.
+
+    Creates the row on first sign-in with a sentinel password hash that
+    cannot pass the scrypt verifier (so the local password fallback can't
+    impersonate them), and updates the role on subsequent sign-ins so
+    changes to the upstream groups claim take effect immediately.
+    """
+    with _connect() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE users SET role=?, enabled=1, auth_source='oidc' "
+                "WHERE id=? AND COALESCE(role, '') <> ?",
+                (role, row["id"], role),
+            )
+            return int(row["id"])
+        # Sentinel hash: not a valid scrypt$ prefix, so _verify_hashed always
+        # returns False. The OIDC flow never touches password_hash again.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "auth_source" in cols:
+            cur = conn.execute(
+                """INSERT INTO users (username, password_hash, role,
+                                       quota_monthly, auto_approve, enabled, auth_source)
+                   VALUES (?, ?, ?, 0, 1, 1, 'oidc')""",
+                (username, "oidc$" + "x" * 16, role),
+            )
+        else:
+            cur = conn.execute(
+                """INSERT INTO users (username, password_hash, role,
+                                       quota_monthly, auto_approve, enabled)
+                   VALUES (?, ?, ?, 0, 1, 1)""",
+                (username, "oidc$" + "x" * 16, role),
+            )
+        return int(cur.lastrowid)
+
+
 def touch_user_login(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("UPDATE users SET last_login=strftime('%Y-%m-%d %H:%M:%S','now') WHERE id=?",
@@ -1353,6 +1534,36 @@ def touch_user_login(user_id: int) -> None:
 def delete_user(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+
+def add_favorite_actor(user_id: int, person_id: int, name: str, profile_path: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO favorite_actors (user_id, person_id, name, profile_path) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, person_id, name, profile_path),
+        )
+        conn.commit()
+
+
+def remove_favorite_actor(user_id: int, person_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM favorite_actors WHERE user_id=? AND person_id=?", (user_id, person_id))
+        conn.commit()
+
+
+def get_favorite_actors(user_id: int) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM favorite_actors WHERE user_id=? ORDER BY added_at DESC", (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_favorite_actors() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT DISTINCT person_id, name FROM favorite_actors").fetchall()
+        return [dict(r) for r in rows]
 
 
 def user_count() -> int:
@@ -1468,11 +1679,15 @@ def upsert_wanted_movie(imdb_id: str, tmdb_id: int | None, title: str,
         )
 
 
-def get_wanted_movies() -> list[dict]:
+def get_wanted_movies(limit: int | None = None) -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM wanted_movies ORDER BY added_at"
-        ).fetchall()
+        sql = ("SELECT * FROM wanted_movies "
+               "ORDER BY COALESCE(last_checked, '') ASC, added_at ASC")
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -1558,7 +1773,9 @@ def get_degraded_items(min_failures: int = 3) -> list[dict]:
                FROM playability_state ps
                LEFT JOIN virtual_items vi ON (
                    vi.imdb_id = ps.content_key
-                   OR ps.content_key LIKE vi.imdb_id || ':%'
+                   OR ps.content_key LIKE
+                      REPLACE(REPLACE(REPLACE(vi.imdb_id, '\\', '\\\\'), '%', '\\%'), '_', '\\_')
+                      || ':%' ESCAPE '\\'
                )
                WHERE ps.status='degraded' AND ps.consecutive_failures >= ?
                ORDER BY ps.consecutive_failures DESC, ps.updated_at DESC

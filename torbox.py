@@ -6,12 +6,17 @@ from collections import deque
 import requests
 
 from config import (
-    TORBOX_BASE_URL,
+    TORBOX_BASE_URL as _TORBOX_BASE_URL_DEFAULT,
     TORBOX_POLL_INTERVAL_SEC,
     TORBOX_POLL_TIMEOUT_SEC,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _base_url() -> str:
+    import settings
+    return settings.get("TORBOX_BASE_URL", _TORBOX_BASE_URL_DEFAULT)
 
 
 def _headers() -> dict[str, str]:
@@ -39,15 +44,53 @@ def _load_createtorrent_from_db() -> None:
         log.debug("Could not load createtorrent log from DB: %s", exc)
 
 
-def _record_createtorrent(reason: str) -> None:
-    now = time.time()
-    with _CREATETORRENT_LOCK:
-        _CREATETORRENT_LOG.append((now, reason))
+def _persist_createtorrent(ts: float, reason: str) -> None:
     try:
         import db as _db
-        _db.log_createtorrent(now, reason)
+        _db.log_createtorrent(ts, reason)
     except Exception as exc:
         log.debug("Could not persist createtorrent log: %s", exc)
+
+
+def _reserve_createtorrent_slot(reason: str) -> tuple[float, str]:
+    """Atomically check both the hourly and per-minute budgets and reserve a
+    slot in the same locked section, so two concurrent callers can't both
+    pass the check before either recorded a call (the old check-then-record
+    was two separate locked sections with the actual HTTP call in between,
+    letting concurrent cold-starts collectively overshoot TorBox's real
+    quota). Raises RateLimited if no budget remains; otherwise returns the
+    log entry so the caller can roll it back if the API call itself fails."""
+    global _CREATETORRENT_LOADED
+    if not _CREATETORRENT_LOADED:
+        _CREATETORRENT_LOADED = True
+        _load_createtorrent_from_db()
+    now = time.time()
+    with _CREATETORRENT_LOCK:
+        hour_count = sum(1 for ts, _ in _CREATETORRENT_LOG if ts >= now - 3600)
+        min_count  = sum(1 for ts, _ in _CREATETORRENT_LOG if ts >= now - 60)
+        if hour_count >= _CREATETORRENT_LIMIT_HOUR - 2:
+            log.warning("createtorrent [%s] SKIPPED  -  hourly quota %d/%d reached",
+                        reason, hour_count, _CREATETORRENT_LIMIT_HOUR)
+            raise RateLimited()
+        if min_count >= _CREATETORRENT_LIMIT_MIN - 1:
+            log.warning("createtorrent [%s] SKIPPED  -  per-minute burst %d/%d reached",
+                        reason, min_count, _CREATETORRENT_LIMIT_MIN)
+            raise RateLimited()
+        entry = (now, reason)
+        _CREATETORRENT_LOG.append(entry)
+        log.info("createtorrent [%s] (%d/60h, %d/10m): reserving slot",
+                  reason, hour_count + 1, min_count + 1)
+        return entry
+
+
+def _release_createtorrent_slot(entry: tuple[float, str]) -> None:
+    """Undo a reservation when the API call never actually reached/was
+    accepted by TorBox (network error, explicit 429, or non-2xx response)."""
+    with _CREATETORRENT_LOCK:
+        try:
+            _CREATETORRENT_LOG.remove(entry)
+        except ValueError:
+            pass
 
 
 def createtorrent_usage(window_sec: int = 3600) -> dict:
@@ -84,29 +127,24 @@ class RateLimited(Exception):
 
 
 def add_magnet(magnet: str, timeout: int = 30, reason: str = "unknown") -> dict:
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/createtorrent"
-    # Client-side guard: check both the 60/hour and the 10/minute edge limits.
-    usage_hour = createtorrent_usage(window_sec=3600)
-    usage_min  = createtorrent_usage(window_sec=60)
-    if usage_hour["count"] >= _CREATETORRENT_LIMIT_HOUR - 2:
-        log.warning("createtorrent [%s] SKIPPED  -  hourly quota %d/%d reached (resets ~%ds)",
-                    reason, usage_hour["count"], _CREATETORRENT_LIMIT_HOUR,
-                    usage_hour["resets_in_sec"])
-        raise RateLimited()
-    if usage_min["count"] >= _CREATETORRENT_LIMIT_MIN - 1:
-        log.warning("createtorrent [%s] SKIPPED  -  per-minute burst %d/%d reached",
-                    reason, usage_min["count"], _CREATETORRENT_LIMIT_MIN)
-        raise RateLimited()
-    log.info("createtorrent [%s] (%d/60h, %d/10m): %s",
-             reason, usage_hour["count"] + 1, usage_min["count"] + 1, magnet[:80])
-    resp = requests.post(url, headers=_headers(), data={"magnet": magnet}, timeout=timeout)
-    if resp.status_code == 429:
-        retry_after = int(resp.headers.get("Retry-After", 60))
-        log.warning("createtorrent [%s] got 429 from TorBox (Retry-After=%ds)  -  raising RateLimited",
-                    reason, retry_after)
-        raise RateLimited()
-    resp.raise_for_status()
-    _record_createtorrent(reason)
+    url = f"{_base_url().rstrip('/')}/torrents/createtorrent"
+    # Client-side guard: check both the 60/hour and the 10/minute edge limits,
+    # and reserve the slot in the same locked step (see _reserve_createtorrent_slot).
+    entry = _reserve_createtorrent_slot(reason)
+    log.info("createtorrent [%s]: %s", reason, magnet[:80])
+    try:
+        resp = requests.post(url, headers=_headers(), data={"magnet": magnet}, timeout=timeout)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            log.warning("createtorrent [%s] got 429 from TorBox (Retry-After=%ds)  -  raising RateLimited",
+                        reason, retry_after)
+            raise RateLimited()
+        resp.raise_for_status()
+    except Exception:
+        # TorBox never actually accepted this call - give the slot back.
+        _release_createtorrent_slot(entry)
+        raise
+    _persist_createtorrent(*entry)
     payload = resp.json() or {}
     if not payload.get("success", False):
         # DUPLICATE_ITEM means the torrent is already in TorBox  -  treat as success
@@ -124,44 +162,132 @@ def add_magnet(magnet: str, timeout: int = 30, reason: str = "unknown") -> dict:
     return data
 
 
+def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
+            reason: str = "unknown") -> dict:
+    """POST /usenet/createusenetdownload, uploading the NZB file content.
+
+    TorBox usenet API mirrors createtorrent: same 60/hour + 10/minute rate
+    limits, returns the same payload shape. We reuse the createtorrent
+    counter because TorBox enforces these limits jointly on the account.
+
+    We fetch the NZB from `nzb_url` ourselves and upload it as a multipart
+    file. Passing `link=<nzb_url>` does NOT work when the indexer URL is
+    internal (e.g. http://prowlarr:9696/...) because TorBox's cloud cannot
+    reach it (it 500s). The link form is kept only as a fallback for when the
+    NZB cannot be fetched locally.
+    """
+    url = f"{_base_url().rstrip('/')}/usenet/createusenetdownload"
+    usage_hour = createtorrent_usage(window_sec=3600)
+    usage_min  = createtorrent_usage(window_sec=60)
+    if usage_hour["count"] >= _CREATETORRENT_LIMIT_HOUR - 2:
+        log.warning("createusenetdownload [%s] SKIPPED  -  hourly quota %d/%d reached (resets ~%ds)",
+                    reason, usage_hour["count"], _CREATETORRENT_LIMIT_HOUR,
+                    usage_hour["resets_in_sec"])
+        raise RateLimited()
+    if usage_min["count"] >= _CREATETORRENT_LIMIT_MIN - 1:
+        log.warning("createusenetdownload [%s] SKIPPED  -  per-minute burst %d/%d reached",
+                    reason, usage_min["count"], _CREATETORRENT_LIMIT_MIN)
+        raise RateLimited()
+    _record_createtorrent(reason)
+    log.info("createusenetdownload [%s] (%d/60h, %d/10m): %s",
+             reason, usage_hour["count"] + 1, usage_min["count"] + 1, nzb_url[:80])
+    # Prefer uploading the NZB *content* over passing a link. Indexer download
+    # URLs are frequently internal (e.g. http://prowlarr:9696/...) and therefore
+    # unreachable from TorBox's cloud, which makes the link-based add fail with a
+    # 500. We are on the same network as the indexer, so fetch the NZB ourselves
+    # and upload the file; fall back to the link only if the fetch fails.
+    data = {"name": name} if name else {}
+    nzb_bytes = None
+    try:
+        nzb_resp = requests.get(nzb_url, timeout=timeout)
+        nzb_resp.raise_for_status()
+        nzb_bytes = nzb_resp.content or None
+    except requests.RequestException as exc:
+        log.warning("createusenetdownload [%s] could not fetch NZB (%s)  -  falling back to link",
+                    reason, exc)
+    if nzb_bytes:
+        fname = (name or "download").replace("/", "_")[:80] + ".nzb"
+        resp = requests.post(url, headers=_headers(),
+                             files={"file": (fname, nzb_bytes, "application/x-nzb")},
+                             data=data, timeout=timeout)
+    else:
+        data["link"] = nzb_url
+        resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", 60))
+        log.warning("createusenetdownload [%s] got 429 from TorBox (Retry-After=%ds)",
+                    reason, retry_after)
+        raise RateLimited()
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    if not payload.get("success", False):
+        if payload.get("error") == "DUPLICATE_ITEM":
+            log.info("Torbox: usenet item already exists (DUPLICATE_ITEM), treating as success")
+            return payload.get("data", {}) or {}
+        raise RuntimeError(f"Torbox usenet add failed: {payload}")
+    result = payload.get("data", {}) or {}
+    # Normalize: surface the new id under both "id" and "usenet_id" so callers
+    # don't have to care about the exact response key.
+    if isinstance(result, dict):
+        uid = result.get("usenet_download_id") or result.get("id")
+        if uid is not None:
+            result.setdefault("id", uid)
+            result.setdefault("usenet_id", uid)
+    invalidate_usenet_mylist_cache()
+    log.info("Torbox createusenetdownload response: %s (id=%s)",
+             payload.get("detail") or result,
+             result.get("id") if isinstance(result, dict) else None)
+    return result
+
+
 _MYLIST_TTL_SECONDS = 45
 _mylist_cache: dict = {"items": None, "ts": 0.0}
 _mylist_lock = __import__("threading").Lock()
 
 
-def list_torrents(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
-    """Return TorBox mylist (all pages), cached for ~45s."""
-    import time as _t
-    if not force_refresh:
-        cached = _mylist_cache["items"]
-        if cached is not None and (_t.monotonic() - _mylist_cache["ts"]) < _MYLIST_TTL_SECONDS:
-            return cached
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/mylist"
-    all_items: list[dict] = []
+def iter_torrents(timeout: int = 30, max_pages: int = 20):
+    """Yield TorBox torrents a page at a time without retaining the full account."""
+    url = f"{_base_url().rstrip('/')}/torrents/mylist"
     seen_ids: set[int] = set()
     offset = 0
     limit = 1000
-    for _ in range(20):  # max 20 pages = 20 000 items; guards against infinite loop
+    for _ in range(max_pages):
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"limit": limit, "offset": offset})
         if resp.status_code == 403:
             log.warning("TorBox mylist returned 403 - API key invalid or plan restriction")
-            # Cache the empty result for 5 minutes to avoid hammering TorBox
-            with _mylist_lock:
-                _mylist_cache["items"] = all_items
-                _mylist_cache["ts"] = _t.monotonic() + (5 * 60 - _MYLIST_TTL_SECONDS)
-            return all_items
+            return
         resp.raise_for_status()
         payload = resp.json() or {}
         page = payload.get("data", []) or []
         new = [t for t in page if t.get("id") not in seen_ids]
         if not new:
             break
-        all_items.extend(new)
+        for item in new:
+            yield item
         seen_ids.update(t["id"] for t in new)
         if len(page) < limit:
             break
         offset += limit
+
+
+def list_torrents(timeout: int = 30, force_refresh: bool = False,
+                  max_pages: int = 20) -> list[dict]:
+    """Return TorBox mylist (paged), cached for ~45s.
+
+    max_pages caps how many 1000-item pages are fetched. The default 20 (20k
+    items) keeps the hot-path callers (find_by_hash during materialize, usage
+    summary) fast. Accounts larger than 20k must pass a higher value to see the
+    whole list -- the spore-nfs cache-status sweep does, so cached titles beyond
+    the recent 20k window are not wrongly served as stubs. The loop still stops
+    early at the real end of the list, so a high cap costs nothing on small
+    accounts; it only raises the anti-infinite-loop ceiling."""
+    import time as _t
+    if not force_refresh:
+        cached = _mylist_cache["items"]
+        if cached is not None and (_t.monotonic() - _mylist_cache["ts"]) < _MYLIST_TTL_SECONDS:
+            return cached
+    all_items = list(iter_torrents(timeout=timeout, max_pages=max_pages))
     with _mylist_lock:
         _mylist_cache["items"] = all_items
         _mylist_cache["ts"] = _t.monotonic()
@@ -189,7 +315,7 @@ def find_by_hash(info_hash: str, force_refresh: bool = False) -> dict | None:
 
 def find_by_id(torrent_id: int, timeout: int = 15) -> dict | None:
     """Fetch a single torrent by ID directly from TorBox  -  not limited to mylist top-1000."""
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/mylist"
+    url = f"{_base_url().rstrip('/')}/torrents/mylist"
     try:
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"id": torrent_id})
@@ -206,9 +332,99 @@ def find_by_id(torrent_id: int, timeout: int = 15) -> dict | None:
     return None
 
 
+# ── Usenet helpers ───────────────────────────────────────────────────────────
+# TorBox's /usenet/* endpoints mirror /torrents/* 1:1 (same field names,
+# same readiness flags). We keep a separate list cache because usenet items
+# and torrents are tracked in different mylists.
+
+_USENET_MYLIST_TTL_SECONDS = 45
+_usenet_cache: dict = {"items": None, "ts": 0.0}
+_usenet_lock = __import__("threading").Lock()
+
+
+def list_usenet(timeout: int = 30, force_refresh: bool = False) -> list[dict]:
+    """Return TorBox usenet mylist (all pages), cached ~45s."""
+    import time as _t
+    if not force_refresh:
+        cached = _usenet_cache["items"]
+        if cached is not None and (_t.monotonic() - _usenet_cache["ts"]) < _USENET_MYLIST_TTL_SECONDS:
+            return cached
+    url = f"{_base_url().rstrip('/')}/usenet/mylist"
+    all_items: list[dict] = []
+    seen_ids: set[int] = set()
+    offset = 0
+    limit = 1000
+    for _ in range(20):
+        try:
+            resp = requests.get(url, headers=_headers(), timeout=timeout,
+                                params={"limit": limit, "offset": offset})
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("TorBox usenet mylist failed: %s", exc)
+            break
+        payload = resp.json() or {}
+        page = payload.get("data") or []
+        if not page:
+            break
+        added = False
+        for item in page:
+            iid = item.get("id")
+            if iid not in seen_ids:
+                seen_ids.add(iid)
+                all_items.append(item)
+                added = True
+        if not added or len(page) < limit:
+            break
+        offset += limit
+    with _usenet_lock:
+        _usenet_cache["items"] = all_items
+        _usenet_cache["ts"] = _t.monotonic()
+    return all_items
+
+
+def invalidate_usenet_mylist_cache() -> None:
+    with _usenet_lock:
+        _usenet_cache["items"] = None
+        _usenet_cache["ts"] = 0.0
+
+
+def find_usenet_by_id(usenet_id: int, timeout: int = 15) -> dict | None:
+    url = f"{_base_url().rstrip('/')}/usenet/mylist"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=timeout,
+                            params={"id": usenet_id})
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        if isinstance(data, dict) and data.get("id") == usenet_id:
+            return data
+        if isinstance(data, list):
+            for item in data:
+                if item.get("id") == usenet_id:
+                    return item
+    except requests.RequestException as exc:
+        log.warning("TorBox find_usenet_by_id(%s) failed: %s", usenet_id, exc)
+    return None
+
+
+def find_usenet_by_nzb_url(nzb_url: str, force_refresh: bool = False) -> dict | None:
+    """Locate a usenet item by source URL or its sha1-keyed dedup hash.
+
+    TorBox doesn't echo back the original nzb link, so we match on the
+    item name produced at submit time (we pass `name=stream.title` from
+    processor) plus catch-all hash-suffix matching when stricter."""
+    if not nzb_url:
+        return None
+    import hashlib as _hl
+    key = _hl.sha1(nzb_url.encode()).hexdigest()
+    for item in list_usenet(force_refresh=force_refresh):
+        if key in str(item.get("magnet") or "") or key in str(item.get("source") or ""):
+            return item
+    return None
+
+
 def get_user_info(timeout: int = 10) -> dict | None:
     """Return TorBox user info (subscription, plan, etc) or None on failure."""
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/user/me"
+    url = f"{_base_url().rstrip('/')}/user/me"
     try:
         resp = requests.get(url, headers=_headers(), timeout=timeout)
         resp.raise_for_status()
@@ -262,7 +478,7 @@ def check_quota_and_warn(threshold_count: int = 200, threshold_gb: int = 4000) -
 
 
 def delete_torrent(torrent_id: int, timeout: int = 15) -> bool:
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/controltorrent"
+    url = f"{_base_url().rstrip('/')}/torrents/controltorrent"
     try:
         resp = requests.post(
             url, headers=_headers(),
@@ -289,7 +505,7 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
             cached |= check_cached(hashes[i:i + _BATCH], timeout=timeout)
         log.info("TorBox cache check: %d/%d hashes cached (batched)", len(cached), len(hashes))
         return cached
-    url = f"{TORBOX_BASE_URL.rstrip('/')}/torrents/checkcached"
+    url = f"{_base_url().rstrip('/')}/torrents/checkcached"
     params = {"hash": ",".join(hashes), "format": "object"}
     try:
         resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
@@ -310,6 +526,36 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
     return cached
 
 
+def check_cached_files(hashes: list[str], timeout: int = 15) -> dict[str, dict]:
+    """Like check_cached(), but keeps the per-hash size/name info that
+    TorBox's checkcached response already includes for free. Used to answer
+    "how big is this" without add_magnet/materialize -- no torrent is added
+    to the account, this is a pure cache-status lookup.
+
+    Single-file torrents report size/name at the top level; multi-file
+    torrents (season packs) additionally carry a "files" list -- callers
+    that need one specific episode should look there first and fall back
+    to the top-level entry otherwise."""
+    if not hashes:
+        return {}
+    _BATCH = 100
+    if len(hashes) > _BATCH:
+        out: dict[str, dict] = {}
+        for i in range(0, len(hashes), _BATCH):
+            out.update(check_cached_files(hashes[i:i + _BATCH], timeout=timeout))
+        return out
+    url = f"{_base_url().rstrip('/')}/torrents/checkcached"
+    params = {"hash": ",".join(hashes), "format": "object"}
+    try:
+        resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.warning("TorBox checkcached (files) failed: %s", exc)
+        return {}
+    data = (resp.json() or {}).get("data") or {}
+    return {h.lower(): v for h, v in data.items()}
+
+
 def title_exists(title: str) -> bool:
     """Return True if any torrent in mylist appears to match the given title."""
     needle = title.lower()
@@ -321,10 +567,47 @@ def title_exists(title: str) -> bool:
 
 
 def _is_ready(item: dict) -> bool:
+    state = (item.get("download_state") or "").lower()
+    # A torrent TorBox has purged (expired) or lost (reported missing) still
+    # reports download_finished=True, but its files are gone so requestdl returns
+    # HTTP 500. Treat these terminal-dead states as not ready BEFORE the
+    # download_finished short-circuit: the probe then skips the item instead of
+    # poisoning the whole pass, and a live play re-adds it via catbox.
+    if state in ("expired", "reported missing"):
+        return False
     if item.get("download_finished"):
         return True
-    state = (item.get("download_state") or "").lower()
     return state in ("cached", "completed", "uploading", "metadl_done")
+
+
+def wait_until_ready_usenet(usenet_id: int, timeout: int | None = None) -> dict | None:
+    """Poll TorBox until the usenet download reports completion.
+
+    Same semantics as wait_until_ready but against /usenet/mylist. Usenet
+    downloads typically take several minutes from submit to completion
+    (vs torrent cached-add which is instant), so callers should pass a
+    generous timeout for first-play materialization.
+    """
+    limit = TORBOX_POLL_TIMEOUT_SEC if timeout is None else timeout
+    deadline = time.monotonic() + limit
+    last_state: str | None = None
+    while time.monotonic() < deadline:
+        item = find_usenet_by_id(usenet_id)
+        if item is None:
+            log.debug("Usenet %s not in mylist yet", usenet_id)
+        else:
+            state = item.get("download_state") or ""
+            progress = item.get("progress") or 0
+            if state != last_state:
+                log.info("TorBox usenet state: %s (progress=%.2f%%)",
+                         state, float(progress) * 100)
+                last_state = state
+            if _is_ready(item):
+                log.info("TorBox usenet reports ready: id=%s", usenet_id)
+                return item
+        time.sleep(TORBOX_POLL_INTERVAL_SEC)
+    log.warning("Timed out waiting for TorBox usenet id=%s to finish", usenet_id)
+    return find_usenet_by_id(usenet_id)
 
 
 def wait_until_ready(info_hash: str, timeout: int | None = None,
@@ -352,4 +635,4 @@ def wait_until_ready(info_hash: str, timeout: int | None = None,
                 return item
         time.sleep(TORBOX_POLL_INTERVAL_SEC)
     log.warning("Timed out waiting for Torbox to make %s available", info_hash)
-    return find_by_hash(info_hash)
+    return find_by_id(torrent_id) if torrent_id else find_by_hash(info_hash)

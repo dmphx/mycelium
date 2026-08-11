@@ -13,6 +13,7 @@ import torrentio
 import zilean
 import settings as _settings
 from config import MEDIA_PATH
+from io_utils import atomic_write_text
 from torrentio import TorrentioStream
 
 log = logging.getLogger(__name__)
@@ -115,22 +116,42 @@ def _resolve_imdb(title: str, year: int | None, media_type: str) -> str | None:
 
 
 def _fetch_candidates(imdb_id: str, title: str, media_type: str) -> list:
+    import mediafusion as _mf
+    import prowlarr as _pa
     if media_type == "movie":
+        all_streams: list = []
+        seen: set = set()
         if _settings.get("ZILEAN_ENABLED", False):
-            streams = zilean.fetch_streams(imdb_id)
-            candidates = torrentio.rank_streams(streams)
-            if candidates:
-                return candidates
-        streams = torrentio.fetch_streams("movie", imdb_id)
-        return torrentio.rank_streams(streams)
+            for s in zilean.fetch_streams(imdb_id):
+                if s.info_hash not in seen:
+                    seen.add(s.info_hash); all_streams.append(s)
+        for s in torrentio.fetch_streams("movie", imdb_id):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        for s in _mf.fetch_streams("movie", imdb_id):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        for s in _pa.fetch_streams("movie", imdb_id):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        return torrentio.rank_streams(all_streams)
     else:
+        all_streams = []
+        seen = set()
         if _settings.get("ZILEAN_ENABLED", False):
-            streams = zilean.fetch_streams(imdb_id, season=1, episode=1)
-            candidates = torrentio.rank_streams(streams, prefer_season_pack=True)
-            if candidates:
-                return candidates
-        streams = torrentio.fetch_streams("series", imdb_id, season=1, episode=1)
-        return torrentio.rank_streams(streams, prefer_season_pack=True)
+            for s in zilean.fetch_streams(imdb_id, season=1, episode=1):
+                if s.info_hash not in seen:
+                    seen.add(s.info_hash); all_streams.append(s)
+        for s in torrentio.fetch_streams("series", imdb_id, season=1, episode=1):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        for s in _mf.fetch_streams("series", imdb_id, season=1, episode=1):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        for s in _pa.fetch_streams("series", imdb_id, season=1, episode=1):
+            if s.info_hash not in seen:
+                seen.add(s.info_hash); all_streams.append(s)
+        return torrentio.rank_streams(all_streams, prefer_season_pack=True)
 
 
 def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
@@ -174,8 +195,9 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
         try:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s: %s", path, exc)
+        db.delete_virtual_item_by_strm_path(str(path))
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                               "unfixable", "IMDB ID not found")
         return "unfixable"
@@ -186,8 +208,9 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
         try:
             path.unlink()
             path.with_suffix(".nfo").unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s: %s", path, exc)
+        db.delete_virtual_item_by_strm_path(str(path))
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                               "unfixable", "no candidates found")
         return "unfixable"
@@ -225,8 +248,12 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
             path.unlink(missing_ok=True)
             path.with_suffix(".nfo").unlink(missing_ok=True)
             strm_generator._delete_spore_stubs(path)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("unlink failed for %s after repair: %s", path, exc)
+        # process_torrent() already registered a fresh virtual_item for the
+        # replacement above; the old row for this now-deleted path must go
+        # too, or it lingers forever and pollutes integrity/upgrade scans.
+        db.delete_virtual_item_by_strm_path(str(path))
         log.info("Repaired '%s': wrote %d new strm(s), replaced torrent %s", title, new_count, winner.info_hash)
         db.insert_repair_item(run_id, str(path), title, media_type, torrent_id,
                               winner.info_hash, "repaired", None)
@@ -236,8 +263,9 @@ def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:
     try:
         path.unlink()
         strm_generator._delete_spore_stubs(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("unlink failed for %s after all-candidates-failed: %s", path, exc)
+    db.delete_virtual_item_by_strm_path(str(path))
     db.insert_repair_item(run_id, str(path), title, media_type, torrent_id, None,
                           "unfixable", "all replacement candidates failed")
     return "unfixable"
@@ -307,6 +335,7 @@ def _remove_duplicates(strm_files: list[Path], run_id: int) -> tuple[int, list[P
                 # alive and Jellyfin may retain a ghost entry for it.
                 dup.with_suffix(".nfo").unlink(missing_ok=True)
                 strm_generator._delete_spore_stubs(dup)
+                db.delete_virtual_item_by_strm_path(str(dup))
                 log.info("Duplicate removed: %s (kept %s)", dup, keeper_names)
                 try:
                     dup.parent.rmdir()
@@ -357,7 +386,7 @@ def _regenerate_wrong_files(strm_files: list[Path], mylist: list[dict], run_id: 
         if not new_url:
             continue
         try:
-            path.write_text(new_url, encoding="utf-8")
+            atomic_write_text(path, new_url)
             db.insert_repair_item(
                 run_id, str(path), path.parent.name, "movie", file_id,
                 str(main.get("id")), "repaired", "regenerated wrong file (was trailer/sample)",
@@ -507,7 +536,10 @@ def merge_series_duplicates() -> int:
         for dup in folders:
             if dup == canonical:
                 continue
-            # Move .strm files into canonical season folders
+            # Move .strm files into canonical season folders. Only remove the
+            # duplicate folder afterward if every file was actually migrated -
+            # otherwise a failed copy would silently delete that episode.
+            fully_merged = True
             for item in list(dup.iterdir()):
                 if item.is_dir() and _SEASON_DIR_RE.match(item.name):
                     dest_season = canonical / item.name
@@ -520,13 +552,35 @@ def merge_series_duplicates() -> int:
                         else:
                             dest_name = strm.name
                         dest = dest_season / dest_name
-                        if not dest.exists():
+                        try:
+                            content = strm.read_text(encoding="utf-8")
+                        except Exception as exc:
+                            log.warning("Could not read strm %s, leaving in place: %s", strm, exc)
+                            fully_merged = False
+                            continue
+                        if dest.exists():
+                            if dest.read_text(encoding="utf-8") != content:
+                                log.warning(
+                                    "Duplicate strm %s differs from existing %s - keeping source, skipping folder removal",
+                                    strm, dest,
+                                )
+                                fully_merged = False
+                                continue
+                        else:
                             try:
-                                dest.write_text(strm.read_text(encoding="utf-8"), encoding="utf-8")
+                                atomic_write_text(dest, content)
                             except Exception as exc:
                                 log.warning("Could not copy strm %s: %s", strm, exc)
+                                fully_merged = False
                                 continue
+                        db.update_virtual_item_strm_path(str(strm), str(dest))
                         strm.unlink(missing_ok=True)
+                elif item.is_dir():
+                    # Non-season subfolder (extras, etc.) - leave it, don't delete the parent.
+                    fully_merged = False
+            if not fully_merged:
+                log.warning("Not all files could be merged out of %s - leaving folder in place", dup)
+                continue
             # Remove entire duplicate folder (including leftover .nfo, posters, etc.)
             try:
                 import shutil as _shutil
@@ -547,7 +601,6 @@ def rename_messy_series_folders() -> int:
     the folder and updates virtual_items.strm_path so catbox proxy URLs keep
     working.  Returns number of folders renamed."""
     import xml.etree.ElementTree as ET
-    import shutil as _shutil
 
     series_base = Path(MEDIA_PATH) / "series"
     if not series_base.is_dir():
@@ -659,8 +712,6 @@ def merge_movie_duplicates() -> int:
             continue
         title, year, imdb_id = _movie_nfo_info(folder)
         if not imdb_id:
-            # Try virtual_items strm_path lookup
-            vi = db.get_virtual_item_by_hash("")  # won't help; skip for now
             continue
         groups.setdefault(imdb_id, []).append(folder)
 
@@ -678,14 +729,23 @@ def merge_movie_duplicates() -> int:
         for dup in folders:
             if dup == canonical:
                 continue
-            # Move .strm to canonical folder if not already there
+            # Move .strm to canonical folder if not already there. Only remove
+            # the duplicate folder afterward if every file actually made it
+            # across - a failed copy used to be silently swallowed and the
+            # folder deleted anyway, losing the strm entirely.
+            fully_merged = True
             for strm in dup.glob("*.strm"):
                 dest = canonical / strm.name
-                if not dest.exists():
-                    try:
-                        dest.write_text(strm.read_text(encoding="utf-8"), encoding="utf-8")
-                    except Exception:
-                        pass
+                if dest.exists():
+                    continue
+                try:
+                    atomic_write_text(dest, strm.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    log.warning("Could not copy strm %s to %s: %s", strm, dest, exc)
+                    fully_merged = False
+            if not fully_merged:
+                log.warning("Not all files could be merged out of %s - leaving folder in place", dup)
+                continue
             db.rename_virtual_item_paths(str(dup), str(canonical))
             try:
                 _shutil.rmtree(dup)
@@ -701,8 +761,6 @@ def merge_movie_duplicates() -> int:
 def rename_messy_movie_folders() -> int:
     """Rename movie folders with torrent-site prefixes / Cyrillic junk to their
     canonical 'Title (Year)' name from the .nfo file. Returns count renamed."""
-    import shutil as _shutil
-
     movies_base = Path(MEDIA_PATH) / "movies"
     if not movies_base.is_dir():
         return 0
@@ -742,6 +800,21 @@ def rename_messy_movie_folders() -> int:
 
 
 def run_cleanup() -> None:
+    """Entry point for scheduled + manually-triggered cleanup runs.
+
+    Acquires strm_generator._maintenance_lock (the same lock used by
+    migrate/repair/dedup) so a scheduled run and an admin-triggered one can't
+    walk/rename/delete the same media tree at the same time."""
+    if not strm_generator._maintenance_lock.acquire(blocking=False):
+        log.warning("run_cleanup: maintenance already running  -  skipping this run")
+        return
+    try:
+        _run_cleanup_locked()
+    finally:
+        strm_generator._maintenance_lock.release()
+
+
+def _run_cleanup_locked() -> None:
     log.info("Cleanup: starting strm scan in %s", MEDIA_PATH)
     run_id = db.insert_cleanup_run()
     scanned = repaired = deleted = unfixable = 0
@@ -811,6 +884,12 @@ def run_cleanup() -> None:
             changed = True
         elif result == "unfixable":
             unfixable += 1
+        elif result == "failed":
+            # process_torrent wrote 0 strms; old strm was kept as-is (not
+            # repaired, not deleted, not unfixable) - doesn't fit the other
+            # three buckets, but log it so it's not silently invisible in
+            # the run's activity trail.
+            log.info("Cleanup: repair attempt failed (kept old strm): %s", path.name)
 
     if dup_removed or fixed_files or orphan_removed:
         changed = True

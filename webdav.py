@@ -16,6 +16,7 @@ Supported methods: OPTIONS, PROPFIND, HEAD, GET (with Range).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -25,10 +26,13 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
+import cachetools
 import requests
 from flask import Response, request
 
+import mp4_faststart
 import settings
+from config import WEBDAV_URL_CACHE_TTL_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -43,11 +47,25 @@ _VIDEO_MIME = {
     ".m2ts": "video/mp2t",
 }
 
-# (resolved_url, expires_at) keyed by absolute on-disk .strm path
-_url_cache: dict[Path, tuple[str, datetime]] = {}
+# (resolved_url, expires_at) keyed by absolute on-disk .strm path. Bounded so
+# a Plex / Emby scanner walking a large library cannot grow it indefinitely.
+# Per-entry expires_at still drives the WebDAV freshness check; the cachetools
+# TTL just guarantees inactive entries get evicted.
+_url_cache: "cachetools.TTLCache[Path, tuple[str, datetime]]" = cachetools.TTLCache(
+    maxsize=20000, ttl=max(WEBDAV_URL_CACHE_TTL_SECONDS, 3600) + 600,
+)
 # upstream content-length, keyed by .strm path
-_size_cache: dict[Path, tuple[int, datetime]] = {}
+_size_cache: "cachetools.TTLCache[Path, tuple[int, datetime]]" = cachetools.TTLCache(
+    maxsize=20000, ttl=86400,
+)
 _cache_lock = threading.Lock()
+
+# Tokens whose moov-first .fsh is being built in a background thread, so a Plex
+# scanner hammering the same file with overlapping Range requests spawns one
+# builder, not dozens. The build itself is idempotent (build_and_cache checks
+# path.exists()); this set just avoids redundant threads.
+_fsh_building: set[str] = set()
+_fsh_lock = threading.Lock()
 
 _CATBOX_TOKEN_RE = re.compile(r"/stream/([a-fA-F0-9]{8,})$")
 
@@ -138,8 +156,61 @@ def _resolve_upstream(strm_path: Path) -> str | None:
     return upstream
 
 
+def _faststart_token(strm_path: Path) -> str:
+    """Stable key for this .strm's moov-first .fsh cache.
+
+    When the .strm is a Catbox proxy (/stream/<hex>) we reuse that hex token so
+    the .fsh is shared with the Plex spore-stream path: one movie probed by both
+    Plex and Jellyfin builds the cache once. For fixed-mode .strm files (a direct
+    CDN URL, no token) we derive a stable key from the on-disk path instead.
+    """
+    try:
+        raw = strm_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        raw = ""
+    m = _CATBOX_TOKEN_RE.search(raw)
+    if m:
+        return m.group(1)
+    digest = hashlib.sha1(str(strm_path.resolve()).encode("utf-8")).hexdigest()
+    return "wd" + digest[:24]
+
+
+def _ensure_fsh_build(token: str, cdn_url: str) -> None:
+    """Kick a one-shot background build of the moov-first .fsh for this token.
+
+    Returns immediately; the GET that triggered it keeps serving cold passthrough
+    until the .fsh lands, after which subsequent reads take the fast path.
+    """
+    with _fsh_lock:
+        if token in _fsh_building:
+            return
+        _fsh_building.add(token)
+
+    def _build() -> None:
+        try:
+            mp4_faststart.build_and_cache(cdn_url, token)
+        except Exception as exc:
+            log.warning("WebDAV: fast-start build failed token=%s: %s", token, exc)
+        finally:
+            with _fsh_lock:
+                _fsh_building.discard(token)
+
+    threading.Thread(target=_build, daemon=True, name=f"wd-fsh-{token[:8]}").start()
+
+
 def _content_length(strm_path: Path) -> int:
-    """HEAD the upstream URL to learn the file size. Cached aggressively."""
+    """File size for HEAD/PROPFIND.
+
+    Once the moov-first .fsh exists, report its authoritative size: the virtual
+    fast-start layout relocates moov (it does not duplicate it), so the virtual
+    size equals cdn_size, and a GET will serve exactly that many bytes. Reading
+    it from the .fsh (a 32-byte header read via load_meta) is both stable and
+    cheaper than a fresh upstream HEAD per directory entry.
+    """
+    info = mp4_faststart.load_meta(_faststart_token(strm_path))
+    if info is not None and info["cdn_size"]:
+        return info["cdn_size"]
+
     ttl = settings.get("WEBDAV_URL_CACHE_TTL_SECONDS", 3600)
     now = datetime.now(timezone.utc)
     with _cache_lock:
@@ -291,6 +362,34 @@ def _get(disk: Path) -> Response:
     if not upstream:
         return Response("Upstream unavailable", status=502)
 
+    # Moov-first fast-start so a scanning ffprobe finds the codec info at the
+    # front of the file instead of seeking ~15 GB to the tail of a CDN MP4.
+    # load_meta is a 32-byte read, so the cold/MKV branches never pull the full
+    # moov into memory; only the warm rewrite path (below) does.
+    token = _faststart_token(disk)
+    meta = mp4_faststart.load_meta(token)
+
+    if meta is None:
+        # Cold: build the .fsh in the background, serve raw passthrough meanwhile.
+        _ensure_fsh_build(token, upstream)
+        return _serve_passthrough(disk, upstream)
+
+    if meta["already_fast"]:
+        # MKV (read from byte 0, no seeking) or an MP4 already moov-first: the
+        # raw bytes are fine, no virtual rewrite needed.
+        return _serve_passthrough(disk, upstream)
+
+    # Warm: moov-at-end MP4 we have already rewritten. Pull the full ftyp+moov
+    # header and serve the virtual moov-first layout.
+    info = mp4_faststart.load(token)
+    if info is None:
+        return _serve_passthrough(disk, upstream)
+    return _serve_faststart(disk, upstream, info, token)
+
+
+def _serve_passthrough(disk: Path, upstream: str) -> Response:
+    """Raw passthrough: forward the client Range to the CDN and stream the
+    response unchanged. Used for cold cache, MKV, and already-fast MP4."""
     range_header = request.headers.get("Range")
     fwd_headers = {"Range": range_header} if range_header else {}
     try:
@@ -326,6 +425,60 @@ def _get(disk: Path) -> Response:
     if r.headers.get("Content-Range"):
         resp_headers["Content-Range"] = r.headers["Content-Range"]
     return Response(stream(), status=r.status_code, headers=resp_headers)
+
+
+def _serve_faststart(disk: Path, cdn_url: str, info: dict, token: str) -> Response:
+    """Serve the virtual moov-first layout via mp4_faststart.serve_bytes().
+
+    The virtual file is [ftyp][moov][mdat...]; its size equals cdn_size because
+    moov is relocated, not duplicated. Range offsets are virtual and resolved to
+    CDN reads inside serve_bytes()."""
+    file_size = info["cdn_size"]
+    range_hdr = request.headers.get("Range")
+    if range_hdr:
+        try:
+            _, ranges_str = range_hdr.split("=", 1)
+            r_start_s, r_end_s = ranges_str.split("-", 1)
+            v_start = int(r_start_s) if r_start_s else 0
+            v_end   = int(r_end_s)   if r_end_s   else file_size - 1
+        except Exception:
+            return Response("Range Not Satisfiable", status=416)
+        v_end  = min(v_end, file_size - 1)
+        status = 206
+    else:
+        v_start, v_end, status = 0, file_size - 1, 200
+
+    if v_start > v_end or v_start >= file_size:
+        return Response("Range Not Satisfiable", status=416,
+                         headers={"Content-Range": f"bytes */{file_size}"})
+
+    length = v_end - v_start + 1
+
+    def _generate():
+        CHUNK = 2 << 20
+        pos = v_start
+        while pos <= v_end:
+            end = min(pos + CHUNK - 1, v_end)
+            try:
+                data = mp4_faststart.serve_bytes(info, cdn_url, pos, end)
+            except Exception as exc:
+                log.warning("WebDAV: faststart serve error v=%d token=%s: %s",
+                            pos, token, exc)
+                break
+            if not data:
+                break
+            yield data
+            pos += len(data)
+
+    resp_headers = {
+        "Content-Type": _VIDEO_MIME[".mkv"],
+        "Accept-Ranges": "bytes",
+        "Last-Modified": _http_date(disk.stat().st_mtime),
+        "Content-Length": str(length),
+    }
+    if status == 206:
+        resp_headers["Content-Range"] = f"bytes {v_start}-{v_end}/{file_size}"
+    return Response(_generate(), status=status, headers=resp_headers)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

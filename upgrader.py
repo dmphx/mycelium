@@ -7,6 +7,8 @@ run_pack_consolidation(): for series with N per-episode torrents of the
 same season, looks for a cached season pack and atomically replaces them.
 """
 import logging
+import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,24 +32,44 @@ def _quality_score(q: str | None) -> int:
     return _QUALITY_RANK.get((q or "?").lower(), 0)
 
 
+def _movie_runtime_override(imdb_id: str) -> dict:
+    import tmdb
+    try:
+        sec = tmdb.get_movie_runtime_sec(imdb_id)
+        return {"runtime_minutes": sec / 60.0 if sec else None}
+    except Exception:
+        return {}
+
+
+def _episode_runtime_override(imdb_id: str, season: int, episode: int = 1) -> dict:
+    import tmdb
+    try:
+        sec = tmdb.get_episode_runtime_sec(imdb_id, season, episode)
+        return {"runtime_minutes": sec / 60.0 if sec else None}
+    except Exception:
+        return {}
+
+
 def _fetch_movie_candidates(imdb_id: str) -> list:
+    override = _movie_runtime_override(imdb_id)
     if _settings.get("ZILEAN_ENABLED", False):
         streams = zilean.fetch_streams(imdb_id)
-        candidates = torrentio.rank_streams(streams)
+        candidates = torrentio.rank_streams(streams, override=override)
         if candidates:
             return candidates
     streams = torrentio.fetch_streams("movie", imdb_id)
-    return torrentio.rank_streams(streams)
+    return torrentio.rank_streams(streams, override=override)
 
 
 def _fetch_season_candidates(imdb_id: str, season: int) -> list:
+    override = _episode_runtime_override(imdb_id, season)
     if _settings.get("ZILEAN_ENABLED", False):
         streams = zilean.fetch_streams(imdb_id, season=season, episode=1)
-        candidates = torrentio.rank_streams(streams, prefer_season_pack=True)
+        candidates = torrentio.rank_streams(streams, prefer_season_pack=True, override=override)
         if candidates:
             return candidates
     streams = torrentio.fetch_streams("series", imdb_id, season=season, episode=1)
-    return torrentio.rank_streams(streams, prefer_season_pack=True)
+    return torrentio.rank_streams(streams, prefer_season_pack=True, override=override)
 
 
 def _better_cached(candidates: list, current_quality: str, current_hash: str) -> object | None:
@@ -223,12 +245,19 @@ def recheck_wanted() -> int:
     release becomes available. Quota-aware: stops once the TorBox createtorrent
     budget is low (RealDebrid fallback inside processor still applies)."""
     import processor
-    wanted = db.get_wanted_movies()
+    batch = max(1, int(os.environ.get("WANTED_MOVIE_BATCH", "50") or "50"))
+    delay = max(0.0, float(os.environ.get("WANTED_MOVIE_DELAY_SEC", "2") or "2"))
+    wanted = db.get_wanted_movies(limit=batch)
     if not wanted:
         return 0
     log.info("Wanted: rechecking %d movie(s) for an acceptable release", len(wanted))
     added = 0
     for w in wanted:
+        import indexer_backoff
+        cooldown = indexer_backoff.remaining()
+        if cooldown > 0:
+            log.info("Wanted: scraper pool in 429 backoff, sleeping %.0fs", cooldown)
+            time.sleep(cooldown)
         usage = torbox.createtorrent_usage()
         if usage["count"] >= torbox._CREATETORRENT_LIMIT_HOUR - 2:
             log.info("Wanted: createtorrent budget low (%d/%d)  -  pausing recheck",
@@ -257,6 +286,8 @@ def recheck_wanted() -> int:
             # _process_movie so it doesn't leak, and bump the attempt counter.
             processor._WANTED.pop(w["imdb_id"], None)
             db.touch_wanted_movie(w["imdb_id"])
+        if delay > 0:
+            time.sleep(delay)
     if added:
         jellyfin.refresh_library()
         log.info("Wanted: %d movie(s) became available and were added", added)

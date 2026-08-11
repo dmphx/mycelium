@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import requests
 
+import indexer_backoff
+
 from config import (
     ALLOW_4K,
     AUDIO_LANGUAGE_PREFERENCE,
@@ -12,6 +14,7 @@ from config import (
     EXCLUDE_DV_P5,
     EXCLUDE_LANGUAGES,
     EXCLUDE_REMUX,
+    EXCLUDE_UNDERSIZED_RELEASES,
     MAX_SIZE_GB,
     MIN_SEEDERS,
     PREFER_HEVC,
@@ -49,6 +52,26 @@ _HDR10_RE = re.compile(r"\bhdr10(?!\+)\b", re.IGNORECASE)
 _SEEDERS_RE = re.compile(r"👤\s*(\d+)")
 _SIZE_RE = re.compile(r"💾\s*([\d.]+)\s*(GB|MB)", re.IGNORECASE)
 
+# Some release groups mislabel a cam/trailer/junk file as a much higher
+# quality than it really is (title says "2160p" or doesn't mention "CAM" at
+# all), so no title regex catches it. A real recording at a given resolution
+# has a physical minimum size for its runtime; below this it's not actually
+# that quality (or not actually the full movie at all). Expressed as GB per
+# 90 minutes of runtime, scaled by the title's real (TMDB) runtime.
+_MIN_GB_PER_90MIN = {
+    "2160p": 3.0,
+    "1080p": 1.1,
+    "720p": 0.7,
+    "480p": 0.4,
+}
+
+
+def _min_plausible_size_gb(quality: str, runtime_minutes: float | None) -> float:
+    floor = _MIN_GB_PER_90MIN.get(quality)
+    if not floor or not runtime_minutes or runtime_minutes <= 0:
+        return 0.0
+    return floor * (runtime_minutes / 90.0)
+
 # Language / audio markers in release titles
 _LANG_PATTERNS = {
     "nl":     re.compile(r"\b(dutch|nederlands?|nl[. -]?(?:nlt?[. -]?)?(?:dubbed|sub|audio|subs)|nl(?:nlt)?\b|nlsubs?)\b", re.IGNORECASE),
@@ -69,10 +92,20 @@ class TorrentioStream:
     is_season_pack: bool
     languages: tuple[str, ...] = ()
     source: str = "torrentio"
+    # Usenet support: when protocol == "usenet", `info_hash` is a synthetic
+    # dedup key (sha1 of the NZB URL) and `nzb_url` is the HTTP(S) URL TorBox
+    # will fetch via /usenet/createusenetdownload. For torrents these stay
+    # at default and the existing magnet flow is used.
+    protocol: str = "torrent"
+    nzb_url: str | None = None
 
     @property
     def magnet(self) -> str:
         return f"magnet:?xt=urn:btih:{self.info_hash}"
+
+    @property
+    def is_usenet(self) -> bool:
+        return self.protocol == "usenet"
 
     @property
     def size(self) -> str:
@@ -164,11 +197,32 @@ def fetch_streams(
     episode: int | None = None,
     timeout: int = 30,
 ) -> list[TorrentioStream]:
+    """Return parsed Torrentio streams or [] on any failure.
+
+    Failure modes that map to []: network errors, 429 rate limits, 5xx
+    upstream errors, malformed JSON. We never raise here so a Torrentio
+    outage / throttle never blocks the rest of the scraper pool (Zilean,
+    MediaFusion, Prowlarr) from running.
+    """
     url = _build_url(media_type, imdb_id, season, episode)
     log.info("Querying Torrentio: %s", url)
-    resp = requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
-    resp.raise_for_status()
-    payload = resp.json() or {}
+    try:
+        resp = requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+    except requests.RequestException as exc:
+        resp = getattr(exc, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            # Public Torrentio is throttling us. Arm the shared cooldown so the
+            # series monitor backs off instead of hammering the next episode
+            # (which would just 429 again and burn Torrentio's rate budget).
+            indexer_backoff.note_rate_limit(
+                "torrentio", (resp.headers or {}).get("Retry-After"))
+        log.warning("Torrentio unavailable for %s: %s", imdb_id, exc)
+        return []
+    except ValueError as exc:
+        log.warning("Torrentio bad JSON for %s: %s", imdb_id, exc)
+        return []
     raw_streams = payload.get("streams", []) or []
     parsed = [s for s in (_to_stream(r, season) for r in raw_streams) if s is not None]
     log.info("Torrentio returned %d streams (%d parsed)", len(raw_streams), len(parsed))
@@ -186,10 +240,17 @@ def rank_streams(
     streams: list[TorrentioStream],
     prefer_season_pack: bool = False,
     override: dict | None = None,
+    media_kind: str | None = None,
 ) -> list[TorrentioStream]:
     """Return streams sorted by preference. Per-show override (dict from DB) can replace
     quality_preference, allow_4k, prefer_hevc on a case-by-case basis. Global filters
-    are pulled live from the settings overlay so the UI can toggle them at runtime."""
+    are pulled live from the settings overlay so the UI can toggle them at runtime.
+
+    media_kind='movie' additionally hard-drops candidates whose name/size obviously
+    cannot be a single film (season/series packs, oversized collections)  -  see
+    release_sanity. Unlike the heuristic filters below this one does NOT fall back
+    to allowing rejected candidates: an empty result sends the movie to 'wanted'
+    rather than latching onto a mislabeled pack that shares the imdb_id."""
     if not streams:
         return []
 
@@ -250,6 +311,23 @@ def rank_streams(
         else:
             log.warning("Only cam/telesync candidates available; allowing them")
 
+    exclude_undersized = _settings.get("EXCLUDE_UNDERSIZED_RELEASES", EXCLUDE_UNDERSIZED_RELEASES)
+    runtime_minutes = override.get("runtime_minutes")
+    if exclude_undersized and runtime_minutes:
+        def _is_undersized(s: TorrentioStream) -> bool:
+            if s.size_gb <= 0:
+                return False  # unknown size  -  don't penalize, nothing to check
+            return s.size_gb < _min_plausible_size_gb(s.quality, runtime_minutes)
+        filtered = [s for s in candidates if not _is_undersized(s)]
+        if filtered:
+            candidates = filtered
+        elif strict_cam:
+            log.warning("Only implausibly small (likely fake/cam/trailer) candidates available "
+                        "and STRICT_NO_CAM is on  -  rejecting all")
+            return []
+        else:
+            log.warning("Only implausibly small (likely fake/cam/trailer) candidates available; allowing them")
+
     if min_seeders > 0:
         filtered = [s for s in candidates if s.seeders == 0 or s.seeders >= min_seeders]
         if filtered:
@@ -278,6 +356,25 @@ def rank_streams(
             candidates = filtered
         else:
             log.warning("All candidates match EXCLUDE_LANGUAGES; allowing all")
+
+    if media_kind == "movie":
+        # Mislabeled-pack guard: a single-movie request must never keep a
+        # season/series pack or an oversized collection, even when it shares the
+        # imdb_id. No fallback  -  dropping to [] parks the movie in 'wanted'.
+        import release_sanity
+        kept = []
+        for s in candidates:
+            reason = release_sanity.movie_name_size_reject(f"{s.name} {s.title}", s.size_gb)
+            if reason:
+                log.info("Release sanity: dropping movie candidate %s (%s)", s.info_hash, reason)
+            else:
+                kept.append(s)
+        if len(kept) != len(candidates):
+            log.info("Release sanity: kept %d/%d movie candidate(s) after pack/size filter",
+                     len(kept), len(candidates))
+        candidates = kept
+        if not candidates:
+            return []
 
     def _lang_score(s: TorrentioStream) -> int:
         if not audio_pref:

@@ -53,7 +53,11 @@ def _extract_imdb(payload: dict) -> str | None:
             return str(value).strip()
     blob = str(payload)
     m = _IMDB_RE.search(blob)
-    return m.group(0) if m else None
+    if m:
+        log.warning("Extracted imdb_id %s via last-resort payload scan  -  "
+                    "no imdbId/imdb_id/imdb field or 'imdb' extra found", m.group(0))
+        return m.group(0)
+    return None
 
 
 def _extract_request_id(payload: dict) -> str | None:
@@ -154,6 +158,8 @@ def parse(payload: dict) -> MediaRequest:
         raise WebhookError("No IMDB id found in webhook payload or Seerr API")
 
     title = payload.get("subject") or media.get("title") or imdb_id
+    if not title or title == imdb_id or _IMDB_RE.fullmatch(title.strip()):
+        title = tmdb.display_title(imdb_id, media_type) or title
 
     if media_type == "series":
         seasons = _extract_seasons(payload) or seerr_seasons

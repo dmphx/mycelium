@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import type { MediaType, TmdbItem } from '../types';
@@ -6,14 +7,35 @@ import PosterCard from '../components/PosterCard';
 import DetailModal from '../components/DetailModal';
 
 export default function Search() {
-  const [q, setQ] = useState('');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [q, setQ] = useState(searchParams.get('q') || '');
   const [typeFilter, setTypeFilter] = useState<'all' | MediaType>('all');
+
+  // Pick up ?q= changes from the topbar search bar (or a shared link) after mount.
+  useEffect(() => {
+    const urlQ = searchParams.get('q') || '';
+    if (urlQ !== q) setQ(urlQ);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const updateQuery = (value: string) => {
+    setQ(value);
+    setSearchParams(value ? { q: value } : {}, { replace: true });
+  };
   const [detail, setDetail] = useState<{ id: number; type: MediaType } | null>(null);
 
+  // Debounce the value that actually triggers a search request so fast typing
+  // doesn't fire one TMDB call per keystroke - the input itself stays instant.
+  const [debouncedQ, setDebouncedQ] = useState(q);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQ(q), 300);
+    return () => clearTimeout(timer);
+  }, [q]);
+
   const { data, isLoading } = useQuery({
-    queryKey: ['search', q],
-    queryFn: () => api.search(q).then((r) => r.results),
-    enabled: q.trim().length > 0,
+    queryKey: ['search', debouncedQ],
+    queryFn: () => api.search(debouncedQ).then((r) => r.results),
+    enabled: debouncedQ.trim().length > 0,
   });
 
   const filtered = (data || []).filter((i) =>
@@ -28,7 +50,7 @@ export default function Search() {
         type="text"
         autoFocus
         value={q}
-        onChange={(e) => setQ(e.target.value)}
+        onChange={(e) => updateQuery(e.target.value)}
         placeholder="Search movies and series..."
         className="w-full max-w-xl bg-bg border border-border rounded-lg px-4 py-3 text-sm
                    focus:outline-none focus:border-accent text-white placeholder-muted/60"
