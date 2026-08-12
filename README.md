@@ -15,7 +15,7 @@
 <p>
   One container that turns watchlist clicks into Jellyfin-ready streams via
   <a href="https://torbox.app">TorBox</a> or <a href="https://real-debrid.com">RealDebrid</a> -
-  typically under 30 seconds for cached releases, with zero local storage.<br>
+  typically under 30 seconds for cached releases, with no permanent media library stored locally.<br>
   Inspired by <a href="https://docs.elfhosted.com/app/catbox/">elfhosted CatBox</a>:
   torrents are added on-demand at playback, released after idle time.
   Your library can be as large as you want.<br>
@@ -240,7 +240,7 @@ Stream directly in the browser - no Jellyfin client needed.
 
 ## 🍄 Mycelium Spore *(experimental  -  work in progress)*
 
-**Mycelium Spore** is a custom-built Plex integration developed specifically for Mycelium. Unlike solutions that require rclone, FUSE mounts, or virtual filesystems, Spore works entirely through a lightweight transcoder wrapper  -  no kernel modules, no extra daemons, no local storage.
+**Mycelium Spore** is a custom-built Plex integration developed specifically for Mycelium. Unlike solutions that require rclone, FUSE mounts, or virtual filesystems, Spore works through a lightweight transcoder wrapper with no kernel modules or permanent local media library. An optional bounded SSD block cache can protect concurrent playback.
 
 Plex streams directly from TorBox CDN on demand.
 
@@ -255,7 +255,8 @@ Plex scans stub .mkv files  →  user presses Play
 **How it works:**
 - Mycelium writes a small stub `.mkv` per item into a Plex-scanned folder  -  no real video data, just enough metadata for Plex to display the library
 - A transcoder wrapper intercepts every playback request and replaces the stub path with a live CDN stream URL
-- On first play, Mycelium builds a fast-start cache in the background so subsequent seeks are instant
+- On first play, Mycelium builds a fast-start header and can retain bounded demand-only SSD blocks
+- Concurrent viewers of the same title share one TorBox fetch per block, reducing Watch Together rate limits
 - Audio and subtitle tracks are automatically updated in the stub after first play
 
 **Setup** (Docker Compose):
@@ -264,9 +265,12 @@ Plex scans stub .mkv files  →  user presses Play
 environment:
   - SPORE_ENABLED=true
   - SPORE_MEDIA_PATH=/data/plex-media   # path Plex scans
+  - SPORE_READ_CACHE_ENABLED=true       # optional shared playback blocks
+  - SPORE_READ_CACHE_BUDGET_GB=100
 volumes:
   - ./data/plex-media:/plex-media:ro    # mount into Plex container (read-only)
   - ./spore:/spore                       # wrapper script
+  - ./spore-cache:/mnt/spore-cache       # optional bounded playback cache
 ```
 
 In your Plex container, add an entrypoint that installs the wrapper once:

@@ -8,6 +8,11 @@ def test_probe_pending_stubs_reads_bounded_batch_from_environment(monkeypatch):
     seen = []
     monkeypatch.setattr(sg.settings, "get", lambda key, default=None: True)
     monkeypatch.setitem(sys.modules, "catbox", types.SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "playback_guard",
+        types.SimpleNamespace(defer=lambda job: False),
+    )
     monkeypatch.setattr(
         sg.db,
         "get_unprobed_spore_items",

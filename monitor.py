@@ -7,6 +7,7 @@ from datetime import date
 
 import blacklist
 import db
+import playback_guard
 import seerr
 import tmdb
 import torbox
@@ -144,6 +145,8 @@ def _check_one_series(series: dict) -> None:
 
 def run_series_check() -> None:
     """Periodic: refresh episode lists, detect new seasons, retry wanted."""
+    if playback_guard.defer("series_check"):
+        return
     log.info("Monitor: starting series check")
     today = _TODAY()
 
@@ -166,6 +169,8 @@ def run_series_check() -> None:
     catbox_mode = _settings.get("CATBOX_MODE", False)
     wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
     for ep in wanted:
+        if playback_guard.defer("series_check"):
+            break
         # Respect Torrentio's 429 backoff: when the scraper pool is throttled,
         # sleep it off before searching the next episode instead of hammering a
         # provider that has already told us we're too fast. Only the monitor

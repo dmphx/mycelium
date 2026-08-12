@@ -98,6 +98,11 @@ def harness(monkeypatch):
     monkeypatch.setattr(catbox, "materialize", fake_materialize)
     monkeypatch.setattr(catbox, "invalidate_url_cache", fake_invalidate)
     monkeypatch.setattr(app_mod, "_enqueue_flip", lambda token: None)
+    monkeypatch.setattr(
+        app_mod.spore_readthrough,
+        "read_range",
+        lambda source, start, end, size, fetcher: fetcher(start, end),
+    )
     yield calls, urls
     app_mod._spore_cold_sizes.clear()
 
@@ -111,7 +116,7 @@ def test_warm_path_dead_url_invalidates_then_retries_fresh(client, harness, monk
     calls, _ = harness
     monkeypatch.setattr(mp4_faststart, "load", lambda token: _warm_info())
 
-    def fake_serve(info, url, start, end):
+    def fake_serve(info, url, start, end, raw_fetch=None):
         if url == STALE:
             raise SporeFetchError("CDN HTTP 400", status=400)
         return b"F" * (end - start + 1)
@@ -130,15 +135,16 @@ def test_warm_path_429_does_not_reresolve(client, harness, monkeypatch):
     calls, _ = harness
     monkeypatch.setattr(mp4_faststart, "load", lambda token: _warm_info())
 
-    def fake_serve(info, url, start, end):
-        raise SporeFetchError("CDN rate-limited (429)", status=429)
+    def fake_serve(info, url, start, end, raw_fetch=None):
+        raise SporeFetchError("CDN rate-limited (429)", status=429, retry_after=7)
 
     monkeypatch.setattr(mp4_faststart, "serve_bytes", fake_serve)
 
     resp = client.get("/spore-stream/warmtok429",
                       headers={"Range": f"bytes=0-{SIZE - 1}"})
-    assert resp.status_code == 206
-    assert resp.data == b""  # stream ends; the client's next attempt retries
+    assert resp.status_code == 429
+    assert resp.headers["Retry-After"] == "7"
+    assert b"temporarily busy" in resp.data
     # Only the route-top materialize: no invalidate, no re-resolve.
     assert calls == ["materialize"]
 
@@ -148,7 +154,7 @@ def test_cold_path_dead_url_invalidates_then_retries_fresh(client, harness, monk
     monkeypatch.setattr(mp4_faststart, "load", lambda token: None)
     app_mod._spore_cold_sizes["coldtok400"] = SIZE
 
-    def fake_fetch(url, start, end, tries=4):
+    def fake_fetch(url, start, end, **kwargs):
         if url == STALE:
             raise SporeFetchError("CDN HTTP 400", status=400)
         return b"F" * (end - start + 1)
@@ -167,13 +173,37 @@ def test_cold_path_429_does_not_reresolve(client, harness, monkeypatch):
     monkeypatch.setattr(mp4_faststart, "load", lambda token: None)
     app_mod._spore_cold_sizes["coldtok429"] = SIZE
 
-    def fake_fetch(url, start, end, tries=4):
-        raise SporeFetchError("CDN rate-limited (429)", status=429)
+    def fake_fetch(url, start, end, **kwargs):
+        raise SporeFetchError("CDN rate-limited (429)", status=429, retry_after=6)
 
     monkeypatch.setattr(mp4_faststart, "fetch_range", fake_fetch)
 
     resp = client.get("/spore-stream/coldtok429",
                       headers={"Range": f"bytes=0-{SIZE - 1}"})
-    assert resp.status_code == 206
-    assert resp.data == b""
+    assert resp.status_code == 429
+    assert resp.headers["Retry-After"] == "6"
     assert calls == ["materialize"]
+
+
+def test_non_mp4_uses_shared_proxy_instead_of_cdn_redirect(client, harness, monkeypatch):
+    monkeypatch.setattr(
+        mp4_faststart,
+        "load",
+        lambda token: {
+            "already_fast": True,
+            "ftyp_size": 0,
+            "moov_size": 0,
+            "cdn_size": SIZE,
+            "header": b"",
+        },
+    )
+    monkeypatch.setattr(
+        mp4_faststart,
+        "fetch_range",
+        lambda url, start, end, **kwargs: b"M" * (end - start + 1),
+    )
+    resp = client.get("/spore-stream/mkvtok",
+                      headers={"Range": f"bytes=0-{SIZE - 1}"})
+    assert resp.status_code == 206
+    assert resp.data == b"M" * SIZE
+    assert "Location" not in resp.headers

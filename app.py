@@ -24,8 +24,10 @@ import log_buffer
 import monitor
 import notify
 import processor
+import playback_guard
 import recovery
 import retry_queue
+import spore_readthrough
 import stats
 import strm_generator
 import tmdb
@@ -451,9 +453,12 @@ def _enqueue_flip(token: str) -> None:
 
 
 def _spore_flip_worker() -> None:
+    import time as _t
     while True:
         token = _spore_flip_q.get()
         try:
+            while playback_guard.defer("spore_flip"):
+                _t.sleep(30)
             _spore_mark_cached(token)
         except Exception as exc:
             log.debug("spore flip worker: %s", exc)
@@ -714,7 +719,9 @@ _fsh_cache_dir = cfg.SPORE_MEDIA_PATH + "/.fsh"
 try:
     import mp4_faststart
     mp4_faststart.init(_fsh_cache_dir)
+    spore_readthrough.init()
     log.info("MP4 fast-start cache dir: %s", _fsh_cache_dir)
+    log.info("Spore read-through cache: %s", spore_readthrough.status())
 except Exception as _fsh_exc:
     log.warning("MP4 fast-start init failed: %s", _fsh_exc)
 
@@ -839,7 +846,9 @@ def health_simple():
                            memory=memory), 503
     except (OSError, ValueError):
         pass
-    return jsonify(status="ok", memory=memory)
+    cache_state = spore_readthrough.status()
+    cache_state.pop("path", None)
+    return jsonify(status="ok", memory=memory, spore_read_cache=cache_state)
 
 
 @app.get("/metrics")
@@ -1751,6 +1760,15 @@ import cachetools as _cachetools
 _spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=86400)
 _spore_probing: set  = set()  # tokens currently running a background probe
 
+
+def _spore_source_key(token: str) -> str:
+    """Stable cache identity that changes when a virtual item changes release."""
+    try:
+        item = db.get_virtual_item(token) or {}
+        return f"{token}:{item.get('info_hash') or ''}"
+    except Exception:
+        return token
+
 # One playback session reopens the source several times a minute (seek, transcode
 # restart, client reconnect), so an unconditional liveness check would spend a CDN
 # round trip re-confirming a link it confirmed moments ago.
@@ -1924,7 +1942,8 @@ def spore_stream_proxy(token: str):
         import json as _json, subprocess as _sp
         import strm_generator as _sg, db as _db, mp4_faststart as _fs
         try:
-            ok = mp4_faststart.build_and_cache(cdn_url_, tok)
+            ok = mp4_faststart.build_and_cache(
+                cdn_url_, tok, source_key=_spore_source_key(tok))
             if not ok:
                 return
 
@@ -1981,7 +2000,8 @@ def spore_stream_proxy(token: str):
 
         def _warm_build() -> None:
             try:
-                if mp4_faststart.build_and_cache(cdn_url, token):
+                if mp4_faststart.build_and_cache(
+                        cdn_url, token, source_key=_spore_source_key(token)):
                     _warm["info"] = mp4_faststart.load(token)
             except Exception as exc:
                 log.warning("spore-stream: sync warm failed token=%s: %s", token, exc)
@@ -1999,6 +2019,45 @@ def spore_stream_proxy(token: str):
                 _spore_probing.add(token)
                 threading.Thread(target=_build_then_probe, args=(cdn_url, token),
                                  daemon=True, name=f"probe-{token[:8]}").start()
+
+    source_identity = _spore_source_key(token)
+
+    def _raw_fetch(url_ref: str, start: int, end: int, file_size: int) -> bytes:
+        cache_key = f"{source_identity}:{file_size}"
+        return spore_readthrough.read_range(
+            cache_key,
+            start,
+            end,
+            file_size,
+            lambda s, e: mp4_faststart.fetch_range(
+                url_ref,
+                s,
+                e,
+                rate_waits_max=40,
+                bounded_waits=False,
+            ),
+        )
+
+    def _busy_response(exc: Exception):
+        status_code = int(getattr(exc, "status", 503) or 503)
+        if status_code not in (429, 503):
+            status_code = 503
+        retry_after = max(1, int(getattr(exc, "retry_after", 5) or 5))
+        log.warning(
+            "spore-stream: upstream busy token=%s status=%d retry_after=%d: %s",
+            token, status_code, retry_after, exc,
+        )
+        try:
+            import metrics_prom
+            metrics_prom.spore_http_backpressure_total.labels(
+                status=str(status_code)).inc()
+        except Exception:
+            pass
+        resp = Response("TorBox stream temporarily busy\n", status=status_code,
+                        mimetype="text/plain")
+        resp.headers["Retry-After"] = str(retry_after)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     def _cold_proxy_response(file_size: int):
         """Range-passthrough straight to the CDN. Used both while the .fsh
@@ -2021,41 +2080,44 @@ def spore_stream_proxy(token: str):
 
         length = r_end - r_start + 1
 
+        url_box = {"value": cdn_url}
+
+        def _fetch_chunk(pos: int, end: int) -> bytes:
+            try:
+                return _raw_fetch(url_box["value"], pos, end, file_size)
+            except Exception as exc:
+                if getattr(exc, "status", None) in (429, 503):
+                    raise
+                catbox.invalidate_url_cache(token)
+                fresh = catbox.materialize(token)
+                if not fresh or fresh == url_box["value"]:
+                    raise
+                url_box["value"] = fresh
+                return _raw_fetch(url_box["value"], pos, end, file_size)
+
+        # Fetch before committing HTTP 200/206 headers. If TorBox is throttled,
+        # Plex receives a real retryable response instead of a successful-looking
+        # zero-byte body that causes a transcoder reopen loop.
+        first_end = min(r_start + _SPORE_CHUNK - 1, r_end)
+        try:
+            first_data = _fetch_chunk(r_start, first_end)
+        except Exception as exc:
+            if getattr(exc, "status", None) in (429, 503):
+                return _busy_response(exc)
+            log.warning("spore-stream cold proxy: preflight failed token=%s: %s", token, exc)
+            abort(502)
+
         def _gen_passthrough():
-            CHUNK = _SPORE_CHUNK
-            pos = r_start
-            url_ref = cdn_url
+            yield first_data
+            pos = r_start + len(first_data)
             while pos <= r_end:
-                end = min(pos + CHUNK - 1, r_end)
+                end = min(pos + _SPORE_CHUNK - 1, r_end)
                 try:
-                    data = mp4_faststart.fetch_range(url_ref, pos, end)
+                    data = _fetch_chunk(pos, end)
                 except Exception as exc:
-                    # A stale/expired CDN URL or a TorBox hiccup: re-materialize a
-                    # fresh URL once and retry this chunk before giving up, so a
-                    # transient failure doesn't truncate the stream mid-playback.
-                    # A 429 is the exception: the URL is alive but throttled, and
-                    # re-resolving returns the same URL while doubling the request
-                    # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
-                    if getattr(exc, "status", None) == 429:
-                        log.warning("spore-stream cold proxy: throttled pos=%d token=%s: %s",
-                                    pos, token, exc)
-                        break
-                    # materialize() consults the same URL cache the stale URL came
-                    # from; drop the entry first or it hands the dead URL back.
-                    catbox.invalidate_url_cache(token)
-                    fresh = catbox.materialize(token)
-                    if fresh and fresh != url_ref:
-                        url_ref = fresh
-                        try:
-                            data = mp4_faststart.fetch_range(url_ref, pos, end)
-                        except Exception as exc2:
-                            log.warning("spore-stream cold proxy: giving up pos=%d token=%s: %s",
-                                        pos, token, exc2)
-                            break
-                    else:
-                        log.warning("spore-stream cold proxy: error pos=%d token=%s: %s",
-                                    pos, token, exc)
-                        break
+                    log.warning("spore-stream cold proxy: stream failed pos=%d token=%s: %s",
+                                pos, token, exc)
+                    break
                 if not data:
                     break
                 yield data
@@ -2101,9 +2163,9 @@ def spore_stream_proxy(token: str):
 
         return _cold_proxy_response(_spore_cold_sizes.get(token, 0))
 
-    # CDN file is already moov-first (or MKV redirect sentinel).
-    # MKV files (ftyp_size == 0): redirect to CDN — FFmpeg reads MKV from byte 0,
-    #   no seeking needed, and CDN redirect avoids unnecessary proxy bandwidth.
+    # CDN file is already moov-first (or a non-MP4 sentinel).
+    # Non-MP4 files are proxied through the same shared read cache. A direct CDN
+    # redirect would make each Watch Together viewer download duplicate bytes.
     # Already fast-start MP4 (ftyp_size > 0): proxy bytes through our server so
     #   Plex Server cannot cache the raw CDN URL. Plex stores our /spore-stream/
     #   URL instead; when any client (MiTV, Shield, etc.) plays, they always hit
@@ -2120,22 +2182,9 @@ def spore_stream_proxy(token: str):
             ).start()
             log.info("spore-stream: token=%s triggering background probe", token)
         if info["ftyp_size"] == 0:
-            # Non-MP4 sentinel (MKV/other): 302 to CDN, no moov seeking required.
-            # The URL cache holds a link for up to 23h but TorBox retires them
-            # sooner, and a 302 hands the client a link we never get to revalidate:
-            # the MP4 path proxies through mp4_faststart and recovers, this one
-            # leaves ffmpeg following a redirect into an error page. Confirm the
-            # link resolves before pointing a client at it.
-            if not _cdn_url_alive(cdn_url):
-                log.warning("spore-stream: cached CDN url dead for token=%s, re-resolving", token)
-                catbox.invalidate_url_cache(token)
-                fresh = catbox.materialize(token)
-                if not fresh:
-                    abort(502)
-                cdn_url = fresh
-            _spore_cold_sizes.pop(token, None)
-            log.info("spore-stream: token=%s non-MP4 sentinel, 302 to CDN", token)
-            return redirect(cdn_url, code=302)
+            log.info("spore-stream: token=%s non-MP4 sentinel, shared proxy", token)
+            _spore_cold_sizes[token] = info["cdn_size"]
+            return _cold_proxy_response(info["cdn_size"])
         # Already fast-start MP4: proxy bytes; Plex stores our URL not the CDN URL.
         log.info("spore-stream: token=%s already fast-start MP4, proxying bytes", token)
         _spore_cold_sizes[token] = info["cdn_size"]
@@ -2156,40 +2205,46 @@ def spore_stream_proxy(token: str):
 
     length = v_end - v_start + 1
 
+    url_box = {"value": cdn_url}
+
+    def _serve_chunk(pos: int, end: int) -> bytes:
+        def raw_fetch(start: int, raw_end: int) -> bytes:
+            return _raw_fetch(url_box["value"], start, raw_end, file_size)
+
+        try:
+            return mp4_faststart.serve_bytes(
+                info, url_box["value"], pos, end, raw_fetch=raw_fetch)
+        except Exception as exc:
+            if getattr(exc, "status", None) in (429, 503):
+                raise
+            catbox.invalidate_url_cache(token)
+            fresh = catbox.materialize(token)
+            if not fresh or fresh == url_box["value"]:
+                raise
+            url_box["value"] = fresh
+            return mp4_faststart.serve_bytes(
+                info, url_box["value"], pos, end, raw_fetch=raw_fetch)
+
+    first_end = min(v_start + _SPORE_CHUNK - 1, v_end)
+    try:
+        first_data = _serve_chunk(v_start, first_end)
+    except Exception as exc:
+        if getattr(exc, "status", None) in (429, 503):
+            return _busy_response(exc)
+        log.warning("spore-stream proxy: preflight failed token=%s: %s", token, exc)
+        abort(502)
+
     def _generate():
-        CHUNK = _SPORE_CHUNK
-        pos = v_start
-        url_ref = cdn_url
+        yield first_data
+        pos = v_start + len(first_data)
         while pos <= v_end:
-            end = min(pos + CHUNK - 1, v_end)
+            end = min(pos + _SPORE_CHUNK - 1, v_end)
             try:
-                data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
+                data = _serve_chunk(pos, end)
             except Exception as exc:
-                # Re-materialize a fresh CDN URL once (handles mid-stream URL
-                # expiry / transient TorBox errors) and retry before giving up,
-                # rather than truncating the response or serving garbage.
-                # A 429 is the exception: the URL is alive but throttled, and
-                # re-resolving returns the same URL while doubling the request
-                # rate feeding the throttle (same rule as _CDN_DEAD_STATUSES).
-                if getattr(exc, "status", None) == 429:
-                    log.warning("spore-stream proxy: throttled v=%d token=%s: %s",
-                                pos, token, exc)
-                    break
-                # materialize() consults the same URL cache the stale URL came
-                # from; drop the entry first or it hands the dead URL back.
-                catbox.invalidate_url_cache(token)
-                fresh = catbox.materialize(token)
-                if fresh and fresh != url_ref:
-                    url_ref = fresh
-                    try:
-                        data = mp4_faststart.serve_bytes(info, url_ref, pos, end)
-                    except Exception as exc2:
-                        log.warning("spore-stream proxy: giving up v=%d token=%s: %s",
-                                    pos, token, exc2)
-                        break
-                else:
-                    log.warning("spore-stream proxy: error v=%d token=%s: %s", pos, token, exc)
-                    break
+                log.warning("spore-stream proxy: stream failed v=%d token=%s: %s",
+                            pos, token, exc)
+                break
             if not data:
                 break
             yield data

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import db
 import jellyfin
+import playback_guard
 import settings as _settings
 import strm_generator
 import torbox
@@ -97,6 +98,8 @@ def _run_auto_upgrade_catbox() -> int:
     items = db.get_upgradeable_virtual_items()
     log.info("Auto-upgrade (catbox): checking %d upgradeable virtual item(s)", len(items))
     for item in items:
+        if playback_guard.defer("auto_upgrade"):
+            break
         try:
             candidates = _fetch_movie_candidates(item["imdb_id"])
             if not candidates:
@@ -130,6 +133,8 @@ def _run_auto_upgrade_catbox() -> int:
 
 def run_auto_upgrade() -> int:
     """Scan recent successful requests for better cached releases."""
+    if playback_guard.defer("auto_upgrade"):
+        return 0
     if not _settings.get("AUTO_UPGRADE_ENABLED", True):
         return 0
     if _settings.get("CATBOX_MODE", False):
@@ -138,6 +143,8 @@ def run_auto_upgrade() -> int:
     upgraded = 0
     successes = [r for r in db.get_recent(500) if r["status"] == "success" and r.get("info_hash")]
     for row in successes:
+        if playback_guard.defer("auto_upgrade"):
+            break
         if row["media_type"] != "movie":
             continue
         if _quality_score(row.get("quality")) >= _QUALITY_RANK["2160p"]:
@@ -191,6 +198,8 @@ def _group_episode_strms_by_season() -> dict[tuple[str, int], list[Path]]:
 
 def run_pack_consolidation() -> int:
     """For each series-season with >=3 per-episode strms, try to swap in a cached pack."""
+    if playback_guard.defer("pack_consolidation"):
+        return 0
     if not _settings.get("SEASON_PACK_CONSOLIDATION_ENABLED", True):
         return 0
     log.info("Season-pack consolidation: scanning")
@@ -198,6 +207,8 @@ def run_pack_consolidation() -> int:
     consolidated = 0
     monitored = {s["title"]: s["imdb_id"] for s in db.get_all_monitored_series()}
     for (title, season), strms in groups.items():
+        if playback_guard.defer("pack_consolidation"):
+            break
         if len(strms) < 3:
             continue
         imdb_id = monitored.get(title)
@@ -245,6 +256,8 @@ def recheck_wanted() -> int:
     release becomes available. Quota-aware: stops once the TorBox createtorrent
     budget is low (RealDebrid fallback inside processor still applies)."""
     import processor
+    if playback_guard.defer("wanted_recheck"):
+        return 0
     batch = max(1, int(os.environ.get("WANTED_MOVIE_BATCH", "50") or "50"))
     delay = max(0.0, float(os.environ.get("WANTED_MOVIE_DELAY_SEC", "2") or "2"))
     wanted = db.get_wanted_movies(limit=batch)
@@ -253,6 +266,8 @@ def recheck_wanted() -> int:
     log.info("Wanted: rechecking %d movie(s) for an acceptable release", len(wanted))
     added = 0
     for w in wanted:
+        if playback_guard.defer("wanted_recheck"):
+            break
         import indexer_backoff
         cooldown = indexer_backoff.remaining()
         if cooldown > 0:

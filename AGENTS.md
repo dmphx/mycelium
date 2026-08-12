@@ -1,6 +1,6 @@
 # Mycelium
 
-Self-hosted media-request-and-stream pipeline. Watchlist clicks → `.strm` files in Jellyfin via TorBox, zero local storage.
+Self-hosted media-request-and-stream pipeline. Watchlist clicks → `.strm` files in Jellyfin via TorBox, with an optional bounded SSD block cache for active playback.
 
 ## Kritieke regels
 
@@ -91,6 +91,8 @@ Plex scant /data/plex-media/**/*.mkv  (stub MKVs)
 | `spore/plex_transcoder_wrapper.sh` | Vervangt Plex Transcoder binary, herschrijft `-i stub.mkv` naar `/spore-stream/TOKEN` |
 | `spore_server.py` | TCP server poort 8089 (voor spore_server; momenteel minder relevant) |
 | `mp4_faststart.py` | Bouwt moov-first MP4 cache (.fsh bestanden), serveert virtuele byte ranges |
+| `spore_readthrough.py` | Demand-only SSD blokcache; deelt TorBox reads tussen gelijktijdige kijkers |
+| `playback_guard.py` | Centrale Plex-sessiegate voor probes, upgrades en scans |
 | `strm_generator.py` | `make_stub_mkv()`, `_write_spore_stubs()`, `update_stub_from_probe()` |
 
 ### Stub MKV opbouw
@@ -122,6 +124,18 @@ TorBox CDN MP4 bestanden hebben moov aan het EINDE (mdat-before-moov). FFmpeg mo
 4. Cache als `.fsh`: `[8B ftyp_size][8B moov_size][8B cdn_size][ftyp+moov bytes]`
 
 Virtueel layout: `[ftyp][moov_rewritten][mdat via CDN met offset -moov_size]`
+
+### Gedeelde playback blokcache
+
+`spore_readthrough.py` bewaart alleen 16 MiB blokken die een viewer werkelijk
+opvraagt. Per titel loopt maximaal één TorBox fetch tegelijk. Watch Together
+kijkers, reconnects en seeks delen hetzelfde in-flight resultaat en daarna het
+SSD-blok. De oude whole-file prefetcher blijft uitgeschakeld omdat die met live
+playback om dezelfde TorBox byte-rate bucket concurreerde.
+
+De cache staat op `/mnt/spore-cache/readthrough`, gebruikt standaard maximaal
+400 GiB en wordt alleen automatisch actief wanneer `/mnt/spore-cache` een echte
+mount is. `SPORE_READ_CACHE_ENABLED=true|false` kan dit expliciet overrulen.
 
 ### Plex docker-compose
 
@@ -161,6 +175,8 @@ ssh unraid "cd /mnt/user/appdata/onyx/compose && docker compose -f 15-media-serv
 | `catbox.py` | Lazy materialization engine |
 | `strm_generator.py` | Batch strm herstel/aanmaak, stub MKV generatie |
 | `mp4_faststart.py` | MP4 moov-first cache voor Plex spore-stream |
+| `spore_readthrough.py` | Gedeelde demand-only byteblokcache voor playback |
+| `playback_guard.py` | Plex playback gate voor achtergrondwerk |
 | `spore_server.py` | TCP Range server poort 8089 |
 | `cleanup.py` | Opruimen dode/dubbele strm bestanden |
 | `monitor.py` | Achtergrondtaken: series sync, Seerr sync |
@@ -267,6 +283,10 @@ Tests zijn schaars; focus op integratiecorrectheid.
 | `AUTH_SESSION_SECRET` | `mycelium-please-change-me` | Wijzigen in productie |
 | `SPORE_ENABLED` | `false` | Plex stub MKV + spore-stream proxy |
 | `SPORE_MEDIA_PATH` | `/data/plex-media` | Pad voor stub MKVs en .fsh cache |
+| `SPORE_READ_CACHE_ENABLED` | `auto` | Aan als `/mnt/spore-cache` een mount is; expliciet true/false mogelijk |
+| `SPORE_READ_CACHE_BUDGET_GB` | `400` | LRU-budget voor demand-only playback blokken |
+| `SPORE_READ_CACHE_BLOCK_MB` | `16` | Gedeelde TorBox fetch- en cacheblokgrootte |
+| `SPORE_READ_CACHE_MAX_BLOCKING` | `6` | Maximaal aantal wachtende playback requests; houdt health threads vrij |
 
 ## URL-structuur
 

@@ -26,6 +26,10 @@ retiring removes the collision risk permanently rather than gating it.
 Old override backups (app_cache.py.bak-*) retain the full cache implementation
 if it is ever needed for a different (higher-concurrency) deployment.
 
+The core application now has a separate demand-only block cache in
+spore_readthrough.py. It fetches no bytes until a viewer asks for them, shares
+same-title reads, and is not the retired whole-file prefetcher described here.
+
 Deploy: gunicorn ... app_cache:app   (instead of app:app)
 """
 import logging

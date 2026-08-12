@@ -1835,6 +1835,10 @@ def probe_pending_stubs() -> dict:
     if not settings.get("SPORE_ENABLED", cfg.SPORE_ENABLED):
         return {"skipped": "SPORE_ENABLED=false"}
 
+    import playback_guard
+    if playback_guard.defer("probe_pending_stubs"):
+        return {"skipped": "plex_playback_active"}
+
     import catbox as _catbox
 
     probe_batch = max(1, int(os.environ.get("SPORE_PROBE_BATCH", "250") or "250"))
@@ -1855,6 +1859,8 @@ def probe_pending_stubs() -> dict:
     probed = skipped = errors = 0
 
     for info_hash, hash_items in by_hash.items():
+        if playback_guard.defer("probe_pending_stubs"):
+            break
         try:
             ready = torbox_mod.find_by_hash(info_hash)
             if not ready or not torbox_mod._is_ready(ready):

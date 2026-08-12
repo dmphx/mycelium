@@ -42,6 +42,26 @@ retry_attempts_total = Counter(
     "mycelium_retry_attempts_total",
     "Requests picked up from the retry queue",
 )
+spore_block_cache_total = Counter(
+    "mycelium_spore_block_cache_total",
+    "Spore read-through block cache outcomes",
+    ["result"],
+)
+spore_cdn_fetch_total = Counter(
+    "mycelium_spore_cdn_fetch_total",
+    "Coordinated TorBox CDN block fetch outcomes",
+    ["result"],
+)
+spore_background_deferred_total = Counter(
+    "mycelium_spore_background_deferred_total",
+    "Background media jobs deferred for active Plex playback",
+    ["job"],
+)
+spore_http_backpressure_total = Counter(
+    "mycelium_spore_http_backpressure_total",
+    "Retryable HTTP responses returned before a Spore stream body",
+    ["status"],
+)
 
 # ── Histograms ────────────────────────────────────────────────────────────────
 request_duration_seconds = Histogram(

@@ -45,9 +45,11 @@ class SporeFetchError(Exception):
     throttled one (429: the same URL is fine, re-resolving amplifies load).
     """
 
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None,
+                 retry_after: int | None = None):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT    = 60
@@ -244,16 +246,17 @@ def _get(url: str, start: int, end: int, tries: int = 4,
             )
             sc = resp.status_code
             if sc == 429:
+                try:
+                    import metrics_prom
+                    metrics_prom.spore_cdn_fetch_total.labels(
+                        result="rate_limited_response").inc()
+                except Exception:
+                    pass
                 # Per-file CDN rate limit. Honor the server's hint and wait
                 # rather than hammering (fast retries keep the bucket empty).
                 hint = resp.headers.get("X-Ratelimit-After") \
                     or resp.headers.get("Retry-After")
                 resp.close()
-                rate_waits += 1
-                if rate_waits > rw_max:
-                    raise SporeFetchError(
-                        "CDN rate-limited (429), gave up after waiting", status=429
-                    )
                 wait = _RATE_LIMIT_WAIT_DEFAULT
                 if hint:
                     try:
@@ -261,6 +264,13 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                     except (TypeError, ValueError):
                         pass
                 wait = min(max(wait, 0.5), _RATE_LIMIT_WAIT_CAP)
+                rate_waits += 1
+                if rate_waits > rw_max:
+                    raise SporeFetchError(
+                        "CDN rate-limited (429), gave up after waiting",
+                        status=429,
+                        retry_after=max(1, int(wait)),
+                    )
                 if bounded_waits:
                     # Live request thread: only park on the wait if a permit is
                     # free, else give up now so we never pin the last few
@@ -268,7 +278,9 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                     # the range; a stalled read is worse app-wide than one retry.
                     if not _live_429_wait_sem.acquire(blocking=False):
                         raise SporeFetchError(
-                            "CDN rate-limited (429), no wait permit", status=429
+                            "CDN rate-limited (429), no wait permit",
+                            status=429,
+                            retry_after=max(1, int(wait)),
                         )
                     try:
                         time.sleep(wait)
@@ -318,15 +330,16 @@ def _get(url: str, start: int, end: int, tries: int = 4,
 fetch_range = _get
 
 
-def _locate_moov(cdn_url: str, cdn_size: int) -> tuple[int, int] | None:
+def _locate_moov(cdn_url: str, cdn_size: int, raw_fetch=None) -> tuple[int, int] | None:
     """
     Scan top-level box headers to find moov offset and size.
     Reads only 16 bytes per box header, so it's cheap even for 17 GB files.
     Returns (moov_offset, moov_size) or None.
     """
+    get_raw = raw_fetch or (lambda start, end: _get(cdn_url, start, end))
     pos = 0
     while pos < cdn_size - 8:
-        raw = _get(cdn_url, pos, pos + 15)
+        raw = get_raw(pos, pos + 15)
         if len(raw) < 8:
             break
         try:
@@ -344,7 +357,7 @@ def _locate_moov(cdn_url: str, cdn_size: int) -> tuple[int, int] | None:
     return None
 
 
-def build_and_cache(cdn_url: str, token: str) -> bool:
+def build_and_cache(cdn_url: str, token: str, source_key: str | None = None) -> bool:
     """
     Fetch ftyp + moov from CDN, build fast-start header, write to .fsh cache.
     Scans box headers sequentially so moov is found regardless of its position.
@@ -358,6 +371,27 @@ def build_and_cache(cdn_url: str, token: str) -> bool:
         try:
             head = req_lib.head(cdn_url, timeout=_CONNECT_TIMEOUT, allow_redirects=True)
             cdn_size = int(head.headers["Content-Length"])
+
+            if source_key:
+                import spore_readthrough
+                cache_key = f"{source_key}:{cdn_size}"
+
+                def get_raw(start: int, end: int) -> bytes:
+                    return spore_readthrough.read_range(
+                        cache_key,
+                        start,
+                        end,
+                        cdn_size,
+                        lambda s, e: _get(
+                            cdn_url,
+                            s,
+                            e,
+                            rate_waits_max=40,
+                            bounded_waits=False,
+                        ),
+                    )
+            else:
+                get_raw = lambda start, end: _get(cdn_url, start, end)
 
             def _atomic_write(dest: Path, data: bytes) -> None:
                 tmp = dest.with_suffix(".tmp")
@@ -373,7 +407,7 @@ def build_and_cache(cdn_url: str, token: str) -> bool:
             # not bail out -- bailing out here left build_and_cache() failing
             # forever for these tokens (no .fsh ever written -> every request
             # stuck on the slow cold-proxy path indefinitely).
-            ftyp_hdr = _get(cdn_url, 0, 15)
+            ftyp_hdr = get_raw(0, 15)
             _, ftyp_size, _ = _box_header(ftyp_hdr, 0)
             if ftyp_size > _MAX_FTYP_BYTES:
                 log.info(
@@ -384,11 +418,11 @@ def build_and_cache(cdn_url: str, token: str) -> bool:
                 meta = struct.pack(">QQQQ", 0, 0, cdn_size, 0)
                 _atomic_write(path, meta)
                 return True
-            ftyp_raw = _get(cdn_url, 0, ftyp_size - 1)
+            ftyp_raw = get_raw(0, ftyp_size - 1)
             ftyp = ftyp_raw[:ftyp_size]
 
             # Locate moov by scanning box headers
-            result = _locate_moov(cdn_url, cdn_size)
+            result = _locate_moov(cdn_url, cdn_size, raw_fetch=get_raw)
 
             if result is None:
                 # Not an MP4 (likely MKV): write redirect sentinel so spore-stream
@@ -416,7 +450,7 @@ def build_and_cache(cdn_url: str, token: str) -> bool:
                 return True
 
             # Fetch and rewrite moov
-            moov = bytearray(_get(cdn_url, moov_offset, moov_offset + moov_size - 1))
+            moov = bytearray(get_raw(moov_offset, moov_offset + moov_size - 1))
 
             # Chunk offsets delta = moov_size: mdat1 shifts right by moov_size in virtual layout
             _rewrite_offsets(moov, moov_size, moov_offset)
@@ -533,7 +567,8 @@ def virtual_to_cdn(virtual_offset: int, info: dict) -> int | None:
     return virtual_offset - info["moov_size"]
 
 
-def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int) -> bytes:
+def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int,
+                raw_fetch=None) -> bytes:
     """
     Return bytes [v_start, v_end] from the virtual fast-start file.
 
@@ -552,6 +587,18 @@ def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int) -> bytes:
     moov_offset = info["moov_offset"]
     mdat2_start = moov_offset + moov_size  # virtual == CDN for mdat2
 
+    # The application supplies a shared read-through fetcher for live playback.
+    # Tests and offline callers can omit it and retain the direct CDN behavior.
+    get_raw = raw_fetch or (
+        lambda start, end: _get(
+            cdn_url,
+            start,
+            end,
+            rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS,
+            bounded_waits=True,
+        )
+    )
+
     out = bytearray()
     pos = v_start
 
@@ -566,13 +613,11 @@ def serve_bytes(info: dict, cdn_url: str, v_start: int, v_end: int) -> bytes:
     # budget (see _LIVE_REQUEST_MAX_RATE_WAITS) instead of holding the thread.
     if pos <= v_end and pos < mdat2_start:
         chunk_end = min(v_end, mdat2_start - 1)
-        out += _get(cdn_url, pos - moov_size, chunk_end - moov_size,
-                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS, bounded_waits=True)
+        out += get_raw(pos - moov_size, chunk_end - moov_size)
         pos = chunk_end + 1
 
     # Region 3: mdat2 (after moov in CDN), cdn = virtual
     if pos <= v_end:
-        out += _get(cdn_url, pos, v_end,
-                    rate_waits_max=_LIVE_REQUEST_MAX_RATE_WAITS, bounded_waits=True)
+        out += get_raw(pos, v_end)
 
     return bytes(out)
