@@ -176,6 +176,56 @@ def _pick_episode_file(files: list[dict], season: int, episode: int,
     return None
 
 
+def spore_item_size(entry: dict, item: dict) -> int:
+    """Return the byte size of the file represented by one Spore token.
+
+    TorBox cache results describe a whole torrent.  For season packs, using the
+    largest file (or the torrent's aggregate size) advertises the wrong NFS file
+    length for nearly every episode.  Plex then reads beyond the selected
+    episode's real CDN object and receives EIO/HTTP 416 near playback start.
+
+    Prefer the materialized ``file_id`` when available, then use the strict
+    episode-name matcher.  If an episode cannot be identified, fail closed with
+    size zero so Spore keeps serving the small stub instead of publishing a
+    confidently wrong length.
+    """
+    files = entry.get("files") or []
+    is_episode = (item.get("media_type") == "series"
+                  or item.get("season") is not None
+                  or item.get("episode") is not None)
+
+    selected = None
+    file_id = item.get("file_id")
+    if files and file_id is not None:
+        selected = next(
+            (candidate for candidate in files
+             if str(candidate.get("id")) == str(file_id)),
+            None,
+        )
+
+    if selected is None and files and is_episode:
+        season = item.get("season")
+        episode = item.get("episode")
+        if season is not None and episode is not None:
+            selected = _pick_episode_file(files, int(season), int(episode))
+
+    if selected is None and files and not is_episode:
+        selected = _pick_main_movie_file(files)
+
+    if selected is not None:
+        try:
+            return max(0, int(selected.get("size") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    if is_episode:
+        return 0
+    try:
+        return max(0, int(entry.get("size") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _clean_torrent_name(name: str) -> str:
     """Strip site prefixes and Cyrillic blocks from a raw torrent name."""
     s = _SITE_PREFIX_RE.sub('', name).strip()
@@ -851,7 +901,7 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
             episode = vi.get("episode")
             if not token:
                 continue
-            if season and episode:
+            if season is not None and episode is not None:
                 # Episode in a season pack: find the specific file by SxxExx
                 f = _pick_episode_file(files, season, episode)
                 if not f:
@@ -1897,7 +1947,7 @@ def probe_pending_stubs() -> dict:
                     skipped += 1
                     continue
 
-                if season and episode:
+                if season is not None and episode is not None:
                     f = _pick_episode_file(files, season, episode)
                     if not f:
                         log.debug("Probe pending: no file for S%02dE%02d token=%s",

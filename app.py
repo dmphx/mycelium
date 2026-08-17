@@ -321,14 +321,14 @@ def _refresh_spore_status() -> None:
     except Exception as exc:
         log.warning("spore-nfs status: db error: %s", exc)
         return
-    by_hash: "dict[str, list[str]]" = {}
+    by_hash: "dict[str, list[dict]]" = {}
     newmap: "dict[str, tuple[bool, int]]" = {}
     for it in items:
         h = (it.get("info_hash") or "").lower()
         token = it["token"]
         newmap[token] = (False, 0)
         if h:
-            by_hash.setdefault(h, []).append(token)
+            by_hash.setdefault(h, []).append(it)
     try:
         # Page the whole account so cached titles beyond the recent hot-path
         # window are seen, while discarding each response page after projection.
@@ -336,14 +336,13 @@ def _refresh_spore_status() -> None:
             max_pages=int(_os.environ.get("SPORE_MYLIST_MAX_PAGES", "500") or "500"))
         for torrent in torrents:
             h = (torrent.get("hash") or "").lower()
-            tokens = by_hash.get(h)
-            if not tokens or (torrent.get("download_state") or "").lower() not in _SPORE_READY_STATES:
+            hash_items = by_hash.get(h)
+            if not hash_items or (torrent.get("download_state") or "").lower() not in _SPORE_READY_STATES:
                 continue
-            files = torrent.get("files") or []
-            main = strm_generator._pick_main_movie_file(files) if files else None
-            size = int((main.get("size") if main else torrent.get("size")) or 0)
-            if size > 0:
-                for token in tokens:
+            for item in hash_items:
+                size = strm_generator.spore_item_size(torrent, item)
+                if size > 0:
+                    token = item["token"]
                     newmap[token] = (True, size)
     except Exception as exc:
         log.warning("spore-nfs status: mylist error: %s", exc)
@@ -378,9 +377,7 @@ def _spore_mark_cached(token: str) -> None:
         entry = torbox.check_cached_files([h]).get(h)
         if not entry:
             return
-        files = entry.get("files") or []
-        main = strm_generator._pick_main_movie_file(files) if files else None
-        size = int((main.get("size") if main else entry.get("size")) or 0)
+        size = strm_generator.spore_item_size(entry, item)
         if size <= 0:
             return
         with _spore_status_lock:
@@ -401,7 +398,9 @@ def _spore_plex_rescan(item: dict) -> None:
     missing this is skipped and Plex's own scheduled scan is the backstop."""
     plex_url = _os.environ.get("PLEX_URL", "").rstrip("/")
     plex_token = _os.environ.get("PLEX_TOKEN", "")
-    is_series = bool(item.get("season") and item.get("episode"))
+    is_series = (item.get("media_type") == "series"
+                 or item.get("season") is not None
+                 or item.get("episode") is not None)
     section = _os.environ.get(
         "PLEX_SERIES_SECTION" if is_series else "PLEX_MOVIE_SECTION", "")
     if not (plex_url and plex_token and section):
@@ -1932,11 +1931,7 @@ def spore_nfs_size(token: str):
         # Not cached (or a torrent Mycelium has never checked yet): no size
         # to report without materializing, which a bulk scan must not do.
         return jsonify({"size": 0, "cached": False})
-    files = entry.get("files") or []
-    main = strm_generator._pick_main_movie_file(files) if files else None
-    # Single-file torrents (the common case for movies) have no "files"
-    # list at all -- size/name live directly on the entry.
-    size = int((main.get("size") if main else entry.get("size")) or 0)
+    size = strm_generator.spore_item_size(entry, item)
     return jsonify({"size": size, "cached": size > 0})
 
 

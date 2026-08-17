@@ -1269,7 +1269,8 @@ def get_virtual_item_spore_index() -> list[dict]:
     """Return only fields needed by the spore status sweep."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT token, info_hash FROM virtual_items"
+            "SELECT token, info_hash, media_type, season, episode, file_id "
+            "FROM virtual_items"
         ).fetchall()
         return [dict(r) for r in rows]
 

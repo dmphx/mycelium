@@ -31,6 +31,9 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Plex Spore season-pack entries now advertise the selected episode file's
+  exact byte size instead of the pack's largest file or aggregate size,
+  preventing NFS read errors and HTTP 416 loops when Plex reads past EOF
 - Catbox now rejects a bad release for only the affected movie or episode and
   tries a prevalidated cached alternate before returning a playback failure
 - Transient search-source errors remain retryable after 30 seconds instead of

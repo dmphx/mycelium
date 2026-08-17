@@ -48,6 +48,53 @@ class TestParseInfo:
         assert info.get("year") == 2023
 
 
+class TestSporeItemSize:
+    files = [
+        {"id": 11, "name": "Show S06E10.mkv", "size": 1_950_621_122},
+        {"id": 16, "name": "Show S06E11.mkv", "size": 366_605_706},
+        {"id": 17, "name": "Show S06E12.mkv", "size": 410_000_000},
+    ]
+
+    def test_episode_prefers_materialized_file_id(self):
+        entry = {"size": 7_540_000_000, "files": self.files}
+        item = {"media_type": "series", "season": 6, "episode": 11,
+                "file_id": 16}
+        assert sg.spore_item_size(entry, item) == 366_605_706
+
+    def test_episode_falls_back_to_strict_episode_match(self):
+        entry = {"size": 7_540_000_000, "files": self.files}
+        item = {"media_type": "series", "season": 6, "episode": 12,
+                "file_id": None}
+        assert sg.spore_item_size(entry, item) == 410_000_000
+
+    def test_season_zero_special_is_still_an_episode(self):
+        entry = {
+            "size": 1_000_000_000,
+            "files": [{"id": 2, "name": "Show S00E01.mkv", "size": 123_000_000}],
+        }
+        item = {"media_type": "series", "season": 0, "episode": 1,
+                "file_id": None}
+        assert sg.spore_item_size(entry, item) == 123_000_000
+
+    def test_unmatched_episode_never_uses_pack_or_largest_size(self):
+        entry = {"size": 7_540_000_000, "files": self.files}
+        item = {"media_type": "series", "season": 6, "episode": 99,
+                "file_id": None}
+        assert sg.spore_item_size(entry, item) == 0
+
+    def test_movie_still_uses_largest_video(self):
+        entry = {"size": 7_540_000_000, "files": self.files}
+        item = {"media_type": "movie", "season": None, "episode": None,
+                "file_id": None}
+        assert sg.spore_item_size(entry, item) == 1_950_621_122
+
+    def test_single_file_movie_uses_entry_size(self):
+        assert sg.spore_item_size(
+            {"size": 900_000_000, "files": []},
+            {"media_type": "movie", "season": None, "episode": None},
+        ) == 900_000_000
+
+
 class TestStrmPath:
     def test_movie_path(self):
         p = sg._strm_path({"type": "movie", "title": "Civil War", "year": 2024})
