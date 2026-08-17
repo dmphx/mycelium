@@ -71,13 +71,14 @@ def _target_identity_conflict(target: Path, imdb_id: str) -> bool:
 
 
 def discover() -> list[dict]:
-    """Return confirmed placeholder folders and any migration conflicts."""
+    """Return confirmed placeholder folders or titles and any conflicts."""
     series_root = Path(MEDIA_PATH) / "series"
     spore_root = Path(SPORE_MEDIA_PATH) / "series"
     if not series_root.is_dir():
         return []
 
     plans = []
+    planned_imdb_ids: set[str] = set()
     for source in sorted(series_root.iterdir()):
         if not source.is_dir() or source.is_symlink() or not _PLACEHOLDER_RE.match(source.name):
             continue
@@ -138,6 +139,50 @@ def discover() -> list[dict]:
             "source_files": source_files,
             "stub_files": stub_files,
             "conflicts": sorted(set(conflict_reasons)),
+            "title_only": False,
+        })
+        if imdb_id:
+            planned_imdb_ids.add(imdb_id)
+
+    # Some older rows were given a canonical folder later while their database
+    # title remained ``tmdb:NNN``. Those rows do not need a path migration, but
+    # leaving the placeholder poisons future wanted-episode search queries and
+    # can leak into media-server episode metadata.
+    for series in db.get_all_monitored_series():
+        current_title = str(series.get("title") or "").strip()
+        imdb_id = str(series.get("imdb_id") or "").strip()
+        if not _PLACEHOLDER_RE.match(current_title) or imdb_id in planned_imdb_ids:
+            continue
+
+        conflict_reasons = []
+        if not re.fullmatch(r"tt\d+", imdb_id, re.IGNORECASE):
+            conflict_reasons.append("IMDb identity unavailable")
+        canonical = strm_generator._canonical_series_folder(imdb_id) if not conflict_reasons else ""
+        if not canonical or _PLACEHOLDER_RE.match(canonical):
+            conflict_reasons.append("canonical title unavailable")
+        canonical = strm_generator._safe(canonical) if canonical else ""
+        target = series_root / canonical if canonical else series_root / current_title
+        if canonical and (not target.is_dir() or target.is_symlink()):
+            conflict_reasons.append("canonical folder unavailable")
+        elif canonical:
+            target_imdb = _nfo_imdb(target)
+            virtual_ids = db.get_virtual_item_imdb_ids_under_path(str(target))
+            if target_imdb and target_imdb != imdb_id:
+                conflict_reasons.append("canonical folder has a different identity")
+            if virtual_ids and virtual_ids != {imdb_id}:
+                conflict_reasons.append("canonical folder has mixed virtual identities")
+
+        plans.append({
+            "source": target,
+            "target": target,
+            "stub_source": spore_root / canonical if canonical else spore_root / current_title,
+            "stub_target": spore_root / canonical if canonical else spore_root / current_title,
+            "imdb_id": imdb_id or None,
+            "title": canonical,
+            "source_files": [],
+            "stub_files": [],
+            "conflicts": sorted(set(conflict_reasons)),
+            "title_only": True,
         })
     return plans
 
@@ -164,12 +209,14 @@ def cleanup(dry_run: bool = True) -> dict:
         "found": len(plans),
         "eligible": sum(not plan["conflicts"] for plan in plans),
         "migrated": 0,
+        "titles_repaired": 0,
         "held": sum(bool(plan["conflicts"]) for plan in plans),
         "details": [
             {
                 "source": plan["source"].name,
                 "target": plan["target"].name,
                 "imdb_id": plan["imdb_id"],
+                "title_only": plan["title_only"],
                 "conflicts": plan["conflicts"],
             }
             for plan in plans
@@ -195,6 +242,19 @@ def cleanup(dry_run: bool = True) -> dict:
             source = plan["source"]
             target = plan["target"]
             target.mkdir(parents=True, exist_ok=True)
+
+            if plan["title_only"]:
+                atomic_write_text(
+                    target / "tvshow.nfo",
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                    "<tvshow>\n"
+                    f"  <title>{_xml_escape(plan['title'])}</title>\n"
+                    f'  <uniqueid type="imdb" default="true">{_xml_escape(plan["imdb_id"])}</uniqueid>\n'
+                    "</tvshow>\n",
+                )
+                _update_identity_titles(plan["imdb_id"], plan["title"])
+                result["titles_repaired"] += 1
+                continue
 
             for old_path, new_path in plan["source_files"]:
                 new_path.parent.mkdir(parents=True, exist_ok=True)
