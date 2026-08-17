@@ -812,7 +812,10 @@ _delayed(
     lambda: nfo_generator.generate_all(lookup_missing=False),
     "nfo-init",
 )
-_delayed(150.0, nfo_generator.fetch_local_images, "images-init")
+# New media fetches its own artwork and episode metadata during creation. Keep
+# the all-library image/backfill pass behind the explicit admin repair action;
+# running it after every restart walks thousands of folders and competes with
+# playback/search for several minutes.
 _delayed(180.0, nfo_generator.repair_tvshow_titles, "nfo-repair")
 _delayed(45.0, _backfill_tmdb_ids, "tmdb-id-backfill")
 
