@@ -3,21 +3,19 @@
 Torrentio's public instance returns HTTP 429 when we query it too fast.
 Previously fetch_streams swallowed the 429 as an empty result set, so the series
 monitor never slowed down: it burned through the whole ~290k wanted-episode queue
-at full speed, every call bouncing off a 429 wall — pinning CPU and, worse,
+at full speed, every call bouncing off a 429 wall, pinning CPU and, worse,
 exhausting Torrentio's rate budget so genuinely available content also failed to
 resolve.
 
 This module records a global "cooldown until" timestamp whenever a provider
-reports a 429 (honoring Retry-After when it is a plain seconds value). The series
-monitor loop consults ``remaining()`` and sleeps it off between episodes, so it
-backs off to the provider's tolerance instead of hammering. The interactive /
-webhook search path records 429s too but never sleeps on them, so user-facing
-requests stay responsive.
+reports a 429 (honoring Retry-After when it is a plain seconds value). The wanted
+episode loop skips Torrentio during that window but continues with Zilean,
+MediaFusion, and Prowlarr. Interactive searches remain responsive and other
+providers are not blocked by a shared Torrentio cooldown.
 
 Only Torrentio (the shared public aggregator we are clearly rate-limiting) arms
 the cooldown. Individual Prowlarr indexers 429 on their own schedule and must not
-be able to pause the whole pool; Torrentio-paced backoff already slows every
-per-episode cycle, prowlarr fan-out included.
+pause the whole pool.
 """
 import logging
 import time

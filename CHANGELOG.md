@@ -2,6 +2,27 @@
 
 All notable changes to Mycelium are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Missing episodes no longer remain behind the never-tried back-catalog queue:
+  searches run independently every hour, follow bounded retry delays, prioritize
+  the last 90 days, and reserve 20 percent of each batch for older misses
+- Wanted rows already backed by a virtual episode are reconciled in one indexed
+  SQL update instead of being searched again
+- Single-digit season folders are detected with their canonical zero padding
+- Torrentio automatically retries its plain discovery endpoint when a configured
+  endpoint returns URL-only streams, and configured path options are no longer
+  written to logs
+- Catbox episode retries now use Prowlarr Usenet results when no cached torrent is
+  available, and Prowlarr receives a title alongside IMDb and episode identifiers
+
+### Changed
+
+- Fast cache sources are queried in parallel; the expensive Prowlarr fan-out is
+  deferred until those sources miss
+
 ## [0.6.1] - 2026-07-05
 
 A security- and correctness-focused release from a full multi-pass code review. No new features.

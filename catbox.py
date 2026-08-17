@@ -865,6 +865,7 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
             return _prowlarr.fetch_streams(
                 "movie" if media_type == "movie" else "series",
                 imdb_id, season=season, episode=episode,
+                title=item.get("title"),
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:

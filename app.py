@@ -63,6 +63,7 @@ from config import (
     TORBOX_WEBHOOK_SECRET,
     TRENDING_CHECK_INTERVAL_HOURS,
     TRENDING_PRECACHE_COUNT,
+    WANTED_EPISODE_INTERVAL_MINUTES,
     WEBHOOK_SECRET,
     configure_logging,
 )
@@ -476,11 +477,20 @@ def _start_scheduler() -> BackgroundScheduler:
 
     if MONITOR_INTERVAL_HOURS > 0:
         scheduler.add_job(
-            monitor.run_series_check,
+            monitor.refresh_monitored_series,
             trigger="interval", hours=MONITOR_INTERVAL_HOURS,
             id="series_monitor", next_run_time=None,
         )
-        log.info("Scheduled series monitor every %dh", MONITOR_INTERVAL_HOURS)
+        log.info("Scheduled series metadata refresh every %dh", MONITOR_INTERVAL_HOURS)
+
+    if WANTED_EPISODE_INTERVAL_MINUTES > 0:
+        scheduler.add_job(
+            monitor.search_wanted_episodes,
+            trigger="interval", minutes=WANTED_EPISODE_INTERVAL_MINUTES,
+            id="wanted_episode_search", next_run_time=None,
+        )
+        log.info("Scheduled wanted episode search every %dm",
+                 WANTED_EPISODE_INTERVAL_MINUTES)
 
     import seerr as _seerr
     if MOVIE_SYNC_INTERVAL_MINUTES > 0 and _seerr.is_configured():
@@ -677,7 +687,8 @@ def _start_scheduler() -> BackgroundScheduler:
     log.info("Scheduled watchdogs: deadman/2h, disk/1h, prune/24h, vacuum/weekly")
 
     # Apply max_instances=1 to all overlap-sensitive jobs already added
-    for jid in ("strm_generator", "strm_cleanup", "series_monitor", "movie_sync",
+    for jid in ("strm_generator", "strm_cleanup", "series_monitor",
+                 "wanted_episode_search", "movie_sync",
                  "retry_queue", "auto_upgrade", "pack_consolidation",
                  "trending_precache", "continue_watching", "db_backup",
                  "catbox_gc", "merge_versions", "quota_warn"):

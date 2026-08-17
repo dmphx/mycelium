@@ -179,9 +179,10 @@ def _to_stream(raw: dict, season: int | None) -> TorrentioStream | None:
     )
 
 
-def _build_url(media_type: str, imdb_id: str, season: int | None, episode: int | None) -> str:
+def _build_url(media_type: str, imdb_id: str, season: int | None,
+               episode: int | None, configured: bool = True) -> str:
     prefix = f"{TORRENTIO_BASE_URL.rstrip('/')}"
-    if TORRENTIO_OPTS:
+    if configured and TORRENTIO_OPTS:
         prefix = f"{prefix}/{TORRENTIO_OPTS.strip('/')}"
     if media_type == "movie":
         return f"{prefix}/stream/movie/{imdb_id}.json"
@@ -204,8 +205,10 @@ def fetch_streams(
     outage / throttle never blocks the rest of the scraper pool (Zilean,
     MediaFusion, Prowlarr) from running.
     """
-    url = _build_url(media_type, imdb_id, season, episode)
-    log.info("Querying Torrentio: %s", url)
+    configured = bool(TORRENTIO_OPTS)
+    url = _build_url(media_type, imdb_id, season, episode, configured=configured)
+    log.info("Querying Torrentio (%s endpoint) for %s",
+             "configured" if configured else "plain", imdb_id)
     try:
         resp = requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
         resp.raise_for_status()
@@ -218,14 +221,49 @@ def fetch_streams(
             # (which would just 429 again and burn Torrentio's rate budget).
             indexer_backoff.note_rate_limit(
                 "torrentio", (resp.headers or {}).get("Retry-After"))
-        log.warning("Torrentio unavailable for %s: %s", imdb_id, exc)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        log.warning("Torrentio %s endpoint request unavailable for %s (%s%s)",
+                    "configured" if configured else "plain", imdb_id,
+                    type(exc).__name__, f", HTTP {status}" if status else "")
+        if configured and not (resp is not None and getattr(resp, "status_code", None) == 429):
+            log.info("Torrentio configured endpoint failed; retrying plain discovery endpoint")
+            return _fetch_plain(media_type, imdb_id, season, episode, timeout)
         return []
     except ValueError as exc:
         log.warning("Torrentio bad JSON for %s: %s", imdb_id, exc)
+        if configured:
+            return _fetch_plain(media_type, imdb_id, season, episode, timeout)
         return []
     raw_streams = payload.get("streams", []) or []
     parsed = [s for s in (_to_stream(r, season) for r in raw_streams) if s is not None]
     log.info("Torrentio returned %d streams (%d parsed)", len(raw_streams), len(parsed))
+    if configured and not parsed:
+        log.info("Torrentio configured endpoint had no hash results; retrying plain discovery endpoint")
+        return _fetch_plain(media_type, imdb_id, season, episode, timeout)
+    return parsed
+
+
+def _fetch_plain(media_type: str, imdb_id: str, season: int | None,
+                 episode: int | None, timeout: int) -> list[TorrentioStream]:
+    """Retry without debrid options, which can turn hash results into URL-only streams."""
+    url = _build_url(media_type, imdb_id, season, episode, configured=False)
+    try:
+        resp = requests.get(url, timeout=timeout, headers=_HTTP_HEADERS)
+        resp.raise_for_status()
+        raw_streams = (resp.json() or {}).get("streams", []) or []
+    except requests.RequestException as exc:
+        resp = getattr(exc, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            indexer_backoff.note_rate_limit(
+                "torrentio", (resp.headers or {}).get("Retry-After"))
+        log.warning("Torrentio plain endpoint unavailable for %s: %s", imdb_id, exc)
+        return []
+    except ValueError as exc:
+        log.warning("Torrentio plain endpoint returned bad JSON for %s: %s", imdb_id, exc)
+        return []
+    parsed = [s for s in (_to_stream(r, season) for r in raw_streams) if s is not None]
+    log.info("Torrentio plain endpoint returned %d streams (%d parsed)",
+             len(raw_streams), len(parsed))
     return parsed
 
 

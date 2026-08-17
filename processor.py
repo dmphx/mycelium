@@ -80,7 +80,7 @@ def _fetch_movie_candidates(req: MediaRequest) -> list:
         if s.info_hash not in seen_hashes:
             seen_hashes.add(s.info_hash)
             streams.append(s)
-    for s in prowlarr.fetch_streams("movie", req.imdb_id):
+    for s in prowlarr.fetch_streams("movie", req.imdb_id, title=req.title):
         if s.info_hash not in seen_hashes:
             seen_hashes.add(s.info_hash)
             streams.append(s)
@@ -108,7 +108,8 @@ def _fetch_season_candidates(req: MediaRequest, season: int, episode: int, prefe
         if s.info_hash not in seen_hashes:
             seen_hashes.add(s.info_hash)
             streams.append(s)
-    for s in prowlarr.fetch_streams("series", req.imdb_id, season=season, episode=episode):
+    for s in prowlarr.fetch_streams(
+            "series", req.imdb_id, season=season, episode=episode, title=req.title):
         if s.info_hash not in seen_hashes:
             seen_hashes.add(s.info_hash)
             streams.append(s)

@@ -131,7 +131,7 @@ def _fetch_candidates(imdb_id: str, title: str, media_type: str) -> list:
         for s in _mf.fetch_streams("movie", imdb_id):
             if s.info_hash not in seen:
                 seen.add(s.info_hash); all_streams.append(s)
-        for s in _pa.fetch_streams("movie", imdb_id):
+        for s in _pa.fetch_streams("movie", imdb_id, title=title):
             if s.info_hash not in seen:
                 seen.add(s.info_hash); all_streams.append(s)
         return torrentio.rank_streams(all_streams)
@@ -148,7 +148,8 @@ def _fetch_candidates(imdb_id: str, title: str, media_type: str) -> list:
         for s in _mf.fetch_streams("series", imdb_id, season=1, episode=1):
             if s.info_hash not in seen:
                 seen.add(s.info_hash); all_streams.append(s)
-        for s in _pa.fetch_streams("series", imdb_id, season=1, episode=1):
+        for s in _pa.fetch_streams(
+                "series", imdb_id, season=1, episode=1, title=title):
             if s.info_hash not in seen:
                 seen.add(s.info_hash); all_streams.append(s)
         return torrentio.rank_streams(all_streams, prefer_season_pack=True)

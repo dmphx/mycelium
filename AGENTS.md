@@ -20,7 +20,7 @@ Self-hosted media-request-and-stream pipeline. Watchlist clicks → `.strm` file
 | Container | `mycelium`, poort 8088 |
 | Jellyfin | container `jellyfin`, poort 8096 |
 | Plex | container `plex`; Spore leest via `spore-nfs` in de Mycelium-container |
-| Debrid | TorBox primair; optionele RealDebrid-fallback via `MULTI_DEBRID_ENABLED` (standaard uit) |
+| Debrid | TorBox primair; optionele RealDebrid-fallback via `MULTI_DEBRID_ENABLED` (standaard uit); Premiumize niet ondersteund |
 | Gebruikers | 4-6 echte gebruikers |
 | Repo | corveck79/mycelium (publiek GitHub) |
 | Branch | `main` voor Onyx-productie en upstream-integratie |
@@ -179,7 +179,7 @@ ssh unraid "cd /mnt/user/appdata/onyx/compose && docker compose -f 15-media-serv
 | `playback_guard.py` | Plex playback gate voor achtergrondwerk |
 | `spore_server.py` | TCP Range server poort 8089 |
 | `cleanup.py` | Opruimen dode/dubbele strm bestanden |
-| `monitor.py` | Achtergrondtaken: series sync, Seerr sync |
+| `monitor.py` | Achtergrondtaken: 6u series-metadata, uurgewijze age-aware wanted retry, Seerr sync |
 | `upgrader.py` | Auto-upgrade kwaliteit, season-pack consolidatie |
 | `torrentio.py` | Scraper + kwaliteitsfilters |
 | `torbox.py` | TorBox API client, rate-limit bewaking |

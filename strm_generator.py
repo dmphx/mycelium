@@ -1162,7 +1162,10 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
                                quality: str | None = None,
                                source: str | None = None,
                                size_gb: float | None = None,
-                               preload_first: bool = False) -> bool:
+                               preload_first: bool = False,
+                               protocol: str = "torrent",
+                               nzb_url: str | None = None,
+                               usenet_id: int | None = None) -> bool:
     """Write a Catbox virtual episode .strm WITHOUT adding to TorBox.
     For season packs: multiple episodes share the same info_hash/magnet;
     catbox.materialize picks the right file by SxxExx at playback time.
@@ -1206,6 +1209,9 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         size_gb=size_gb,
         season=season,
         episode=episode,
+        protocol=protocol,
+        nzb_url=nzb_url,
+        usenet_id=usenet_id,
     )
     written = _write_strm(path, catbox.proxy_url(token))
     if not written:
@@ -1227,7 +1233,9 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
                 nfo_generator.fetch_images_for_folder(series_root, imdb_id, "tv")
             except Exception as exc:
                 log.debug("Image fetch skipped for %s: %s", safe_title, exc)
-        if settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD) and info_hash and magnet:
+        if (preload_first and protocol == "torrent" and
+                settings.get("CATBOX_PRELOAD", cfg.CATBOX_PRELOAD)
+                and info_hash and magnet):
             threading.Thread(
                 target=_preload_torrent,
                 args=(info_hash, magnet, ep_name),

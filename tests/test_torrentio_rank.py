@@ -98,3 +98,41 @@ def test_all_candidates_undersized_falls_back_to_allowing_them():
     fake2 = _stream("Movie.2024.1080p.WEB-DL", "1080p", size_gb=0.05)
     ranked = torrentio.rank_streams([fake1, fake2], override={"runtime_minutes": 90})
     assert len(ranked) == 2
+
+
+def test_configured_url_only_results_fall_back_to_plain_endpoint(monkeypatch, caplog):
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return Response({"streams": [{"url": "https://debrid.example/video"}]})
+        return Response({"streams": [{
+            "infoHash": "b" * 40,
+            "name": "Torrentio 1080p",
+            "title": "Show.S01E01.1080p.WEB-DL",
+        }]})
+
+    monkeypatch.setattr(torrentio, "TORRENTIO_OPTS", "private-option")
+    monkeypatch.setattr(torrentio.requests, "get", fake_get)
+
+    streams = torrentio.fetch_streams("series", "tt1234567", season=1, episode=1)
+
+    assert [stream.info_hash for stream in streams] == ["b" * 40]
+    assert len(calls) == 2
+    assert "private-option" in calls[0]
+    assert "private-option" not in calls[1]
+    assert "private-option" not in caplog.text

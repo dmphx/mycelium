@@ -121,8 +121,12 @@ The existing debrid-to-media-server toolchain kept breaking: RealDebrid purged c
 <summary><b>Core pipeline</b></summary>
 
 - **Two request paths**: built-in TMDB browser OR Seerr/Jellyseerr webhook
-- **Zilean + Torrentio** combined search with deduplication and health-aware skipping
+- **Zilean + Torrentio + MediaFusion** parallel cache discovery, with plain
+  Torrentio fallback when a configured endpoint omits torrent hashes
+- **Prowlarr torrent + Usenet fallback** when fast cache sources miss
 - **TorBox + RealDebrid** cache-first strategy with 429 retry and per-hash blacklist
+- **Age-aware episode monitoring** retries recent misses hourly while reserving
+  part of every batch for older backlog
 - **Jellyfin-friendly naming**: `Movie (Year)/Movie (Year).strm`, `Series/Season XX/S01E01.strm`
 - **Automatic library refresh** after every add
 
@@ -404,6 +408,7 @@ Full reference: [`.env.example`](.env.example). Key variables:
 | `AUDIO_LANGUAGE_PREFERENCE` | *(empty)* | e.g. `nl,en` |
 | `AUTO_UPGRADE_ENABLED` | `true` | Periodic upgrade scan |
 | `MULTI_DEBRID_ENABLED` | `false` | RealDebrid fallback when TorBox misses |
+| `WANTED_EPISODE_INTERVAL_MINUTES` | `60` | Interval for bounded missing-episode searches |
 | `WEBDAV_ENABLED` | `false` | Serve library as virtual .mkv files (Plex) |
 | `DISCORD_WEBHOOK_URL` | *(empty)* | Optional notifications (also configurable in Settings > Notifications) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(empty)* | Optional notifications |
@@ -413,6 +418,9 @@ Full reference: [`.env.example`](.env.example). Key variables:
 | `AUTO_APPROVE_DAILY_LIMIT` / `AUTO_APPROVE_ACTOR_DAILY_LIMIT` | `5` | Daily budget for genre-rule fill / favorite-actor fill |
 | `EXCLUDE_UNDERSIZED_RELEASES` | `true` | Reject releases too small to be real for their claimed quality + runtime |
 | `METRICS_TOKEN` | *(empty)* | Bearer token for `/metrics` scraping |
+
+Supported debrid services are TorBox and optional RealDebrid. Premiumize is not
+currently integrated.
 
 ---
 

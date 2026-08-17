@@ -208,13 +208,15 @@ def _usenet_stream(item: ET.Element, season: int | None,
 
 def _query_one_indexer(idx: dict, search_type: str, imdb_id: str,
                         season: int | None, episode: int | None,
-                        timeout: int) -> list[TorrentioStream]:
+                        timeout: int, title: str | None = None) -> list[TorrentioStream]:
     numeric_imdb = imdb_id.lstrip("t")
     params = {
         "t": search_type,
         "imdbid": numeric_imdb,
         "apikey": PROWLARR_API_KEY,
     }
+    if title:
+        params["q"] = title
     if search_type == "tvsearch" and season is not None:
         params["season"] = season
         if episode is not None:
@@ -259,6 +261,7 @@ def fetch_streams(
     season: int | None = None,
     episode: int | None = None,
     timeout: int = 25,
+    title: str | None = None,
 ) -> list[TorrentioStream]:
     """Return parsed TorrentioStream objects from every enabled Prowlarr
     indexer in parallel. Both torrent and usenet sources contribute."""
@@ -277,7 +280,7 @@ def fetch_streams(
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(indexers))) as ex:
         futures = {
             ex.submit(_query_one_indexer, idx, search_type, imdb_id,
-                       season, episode, timeout): idx
+                       season, episode, timeout, title): idx
             for idx in indexers
         }
         for fut in concurrent.futures.as_completed(futures):

@@ -35,13 +35,22 @@ def _series_dir(title: str) -> str | None:
     return None
 
 
-def strm_exists_episode(title: str, season: int, episode: int) -> bool:
+def strm_exists_episode(title: str, season: int, episode: int,
+                        imdb_id: str | None = None) -> bool:
+    if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
+        return True
     folder = _series_dir(title)
     if not folder:
         return False
     s_ep = f"s{season:02d}e{episode:02d}"
-    pattern = os.path.join(folder, f"Season {season}", "*.strm")
-    return any(s_ep in os.path.basename(f).lower() for f in glob.glob(pattern))
+    patterns = {
+        os.path.join(folder, f"Season {season:02d}", "*.strm"),
+        os.path.join(folder, f"Season {season}", "*.strm"),
+    }
+    return any(
+        s_ep in os.path.basename(path).lower()
+        for pattern in patterns for path in glob.glob(pattern)
+    )
 
 
 def strm_exists_movie(title: str) -> bool:
@@ -94,7 +103,7 @@ def _sync_wanted(imdb_id: str, tmdb_id: int, title: str, seasons: list[int],
                 db.upsert_wanted_episode(imdb_id, tmdb_id, title, season, ep_num, air_date)
                 db.mark_episode_status(imdb_id, season, ep_num, "not_aired")
                 continue
-            if strm_exists_episode(title, season, ep_num):
+            if strm_exists_episode(title, season, ep_num, imdb_id=imdb_id):
                 db.upsert_wanted_episode(imdb_id, tmdb_id, title, season, ep_num, air_date)
                 db.mark_episode_status(imdb_id, season, ep_num, "found")
             else:
@@ -143,48 +152,48 @@ def _check_one_series(series: dict) -> None:
     db.update_monitored_series(series["id"])
 
 
-def run_series_check() -> None:
-    """Periodic: refresh episode lists, detect new seasons, retry wanted."""
+def refresh_monitored_series() -> None:
+    """Refresh episode metadata and detect new seasons."""
     if playback_guard.defer("series_check"):
         return
-    log.info("Monitor: starting series check")
-    today = _TODAY()
+    log.info("Monitor: starting series metadata refresh")
 
     series_batch = max(1, int(os.environ.get("MONITORED_SERIES_BATCH", "250") or "250"))
-    episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
-    retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
-
     for series in db.get_monitored_series(status="active", limit=series_batch):
         title = series["title"]
         try:
             _check_one_series(series)
         except Exception as exc:
             log.error("Monitor: series check failed for %s: %s", title, exc)
+    log.info("Monitor: series metadata refresh complete")
 
-    # Retry wanted episodes  -  keep watching indefinitely (like Radarr/Sonarr).
-    # In catbox mode no TorBox quota is consumed so we never pause for budget.
+
+def search_wanted_episodes() -> None:
+    """Retry a bounded, age-aware batch of missing episodes."""
+    log.info("Monitor: starting wanted episode search")
+    today = _TODAY()
+    episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
+    retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
+
+    reconciled = db.reconcile_wanted_episodes()
+    if reconciled:
+        log.info("Monitor: reconciled %d wanted episode(s) already in the virtual library",
+                 reconciled)
+
+    # Search runs independently from the slower metadata refresh. Provider
+    # discovery and TorBox cache checks do not read CDN media bytes, so active
+    # playback must not strand newly-aired episodes until the next 6h cycle.
     import processor
     import time
-    import indexer_backoff
     catbox_mode = _settings.get("CATBOX_MODE", False)
     wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
     for ep in wanted:
-        if playback_guard.defer("series_check"):
-            break
-        # Respect Torrentio's 429 backoff: when the scraper pool is throttled,
-        # sleep it off before searching the next episode instead of hammering a
-        # provider that has already told us we're too fast. Only the monitor
-        # waits here; interactive/webhook searches never block on this.
-        _cooldown = indexer_backoff.remaining()
-        if _cooldown > 0:
-            log.info("Monitor: scraper pool in 429 backoff  -  sleeping %.0fs before next search",
-                     _cooldown)
-            time.sleep(_cooldown)
         air_date = ep.get("air_date")
         if air_date and air_date > today:
             db.mark_episode_status(ep["imdb_id"], ep["season"], ep["episode"], "not_aired")
             continue
-        if strm_exists_episode(ep["title"], ep["season"], ep["episode"]):
+        if strm_exists_episode(ep["title"], ep["season"], ep["episode"],
+                               imdb_id=ep["imdb_id"]):
             db.mark_episode_status(ep["imdb_id"], ep["season"], ep["episode"], "found")
             continue
         if not catbox_mode:
@@ -196,10 +205,6 @@ def run_series_check() -> None:
         try:
             _retry_episode(ep)
         except processor.RateLimited:
-            if catbox_mode:
-                log.info("Monitor: checkcached rate limited  -  waiting 60s then continuing")
-                import time; time.sleep(60)
-                continue
             log.info("Monitor: rate limited  -  pausing episode retries until next run")
             break
         except Exception as exc:
@@ -210,7 +215,13 @@ def run_series_check() -> None:
         if retry_delay > 0:
             time.sleep(retry_delay)
 
-    log.info("Monitor: series check complete")
+    log.info("Monitor: wanted episode search complete")
+
+
+def run_series_check() -> None:
+    """Manual/backfill compatibility wrapper for refresh plus wanted search."""
+    refresh_monitored_series()
+    search_wanted_episodes()
 
 
 def run_series_backfill() -> dict:
@@ -242,65 +253,132 @@ def _retry_episode(ep: dict) -> bool:
     log.info("Monitor: searching %s S%02dE%02d (attempt %d)", title, season, episode, ep["attempt_count"] + 1)
     db.increment_episode_attempt(ep["id"])
 
-    streams: list = []
-    seen_hashes: set = set()
-    if _settings.get("ZILEAN_ENABLED", False):
-        for s in zilean.fetch_streams(imdb_id, season=season, episode=episode):
-            if s.info_hash not in seen_hashes:
-                seen_hashes.add(s.info_hash)
-                streams.append(s)
-    for s in torrentio.fetch_streams("series", imdb_id, season=season, episode=episode):
-        if s.info_hash not in seen_hashes:
-            seen_hashes.add(s.info_hash)
-            streams.append(s)
+    import concurrent.futures
+    import indexer_backoff
     import mediafusion as _mf
     import prowlarr as _pa
-    for s in _mf.fetch_streams("series", imdb_id, season=season, episode=episode):
-        if s.info_hash not in seen_hashes:
-            seen_hashes.add(s.info_hash)
-            streams.append(s)
-    for s in _pa.fetch_streams("series", imdb_id, season=season, episode=episode):
-        if s.info_hash not in seen_hashes:
-            seen_hashes.add(s.info_hash)
-            streams.append(s)
 
-    candidates = torrentio.rank_streams(streams)
-    # Drop hashes already known to fail. processor.py filters at every grab site;
-    # this path did not, so a hash blacklisted after a bad grab was re-picked on
-    # the very next retry and the episode re-broke the same way indefinitely.
-    candidates = blacklist.filter_candidates(candidates)
-    if not candidates:
-        log.info("Monitor: no acceptable candidates for %s S%02dE%02d (still wanted)",
-                 title, season, episode)
-        return False
+    def _zilean():
+        if not _settings.get("ZILEAN_ENABLED", False):
+            return []
+        return zilean.fetch_streams(imdb_id, season=season, episode=episode)
+
+    def _torrentio():
+        if indexer_backoff.in_cooldown():
+            log.info("Monitor: Torrentio is cooling down; continuing with other providers")
+            return []
+        return torrentio.fetch_streams(
+            "series", imdb_id, season=season, episode=episode)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futures = [
+            ex.submit(_zilean),
+            ex.submit(_torrentio),
+            ex.submit(_mf.fetch_streams, "series", imdb_id, season, episode),
+        ]
+        groups = [future.result() for future in futures]
+
+    def _merged_candidates(source_groups: list[list]) -> list:
+        seen_hashes: set[str] = set()
+        merged: list = []
+        for group in source_groups:
+            for stream in group:
+                if stream.info_hash not in seen_hashes:
+                    seen_hashes.add(stream.info_hash)
+                    merged.append(stream)
+        return blacklist.filter_candidates(torrentio.rank_streams(merged))
+
+    candidates = _merged_candidates(groups)
 
     # In catbox mode: write a lazy .strm for the best cached release.
     # TorBox add is deferred until first playback  -  no quota consumed here.
     if _settings.get("CATBOX_MODE", False):
-        cached_hashes = torbox.check_cached([s.info_hash for s in candidates])
-        cached = [s for s in candidates if s.info_hash in cached_hashes]
         import release_sanity
-        cached = release_sanity.filter_cached(
-            cached, kind="episode", season=season, episode=episode,
-            imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+
+        def _cached_torrents(items: list) -> list:
+            torrents = [s for s in items if not s.is_usenet]
+            hashes = torbox.check_cached([s.info_hash for s in torrents]) if torrents else set()
+            cached = [s for s in torrents if s.info_hash in hashes]
+            return release_sanity.filter_cached(
+                cached, kind="episode", season=season, episode=episode,
+                imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+
+        cached = _cached_torrents(candidates)
+        if not cached:
+            # Prowlarr is the expensive live fan-out. Only use it when the fast
+            # cache indexes cannot already satisfy the episode, and include the
+            # title because several Newznab indexers ignore imdb-only TV queries.
+            prowlarr_streams = _pa.fetch_streams(
+                "series", imdb_id, season=season, episode=episode, title=title)
+            groups.append(prowlarr_streams)
+            candidates = _merged_candidates(groups)
+            cached = _cached_torrents(candidates)
+
         best = cached[0] if cached else None
-        if not best:
-            log.info("Monitor: no cached release for %s S%02dE%02d  -  still wanted",
-                     title, season, episode)
-            return False
-        import strm_generator
-        written = strm_generator.create_lazy_episode_strm(
-            info_hash=best.info_hash,
-            magnet=best.magnet,
-            title=title,
-            season=season,
-            episode=episode,
-            imdb_id=imdb_id,
-        )
-        if written:
-            db.mark_episode_status(imdb_id, season, episode, "found")
-            log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
-        return bool(written)
+        if best:
+            import strm_generator
+            written = strm_generator.create_lazy_episode_strm(
+                info_hash=best.info_hash,
+                magnet=best.magnet,
+                title=title,
+                season=season,
+                episode=episode,
+                imdb_id=imdb_id,
+                quality=best.quality,
+                source=best.source,
+                size_gb=best.size_gb,
+                preload_first=False,
+            )
+            if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
+                db.mark_episode_status(imdb_id, season, episode, "found")
+                log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
+                return True
+
+        nzbs = [s for s in candidates if s.is_usenet and s.nzb_url]
+        if nzbs:
+            best_nzb = nzbs[0]
+            try:
+                result = torbox.add_nzb(
+                    best_nzb.nzb_url, name=best_nzb.title,
+                    reason="series-monitor-lazy-nzb")
+                import strm_generator
+                written = strm_generator.create_lazy_episode_strm(
+                    info_hash=best_nzb.info_hash,
+                    magnet=best_nzb.nzb_url,
+                    title=title,
+                    season=season,
+                    episode=episode,
+                    imdb_id=imdb_id,
+                    quality=best_nzb.quality,
+                    source=best_nzb.source,
+                    size_gb=best_nzb.size_gb,
+                    protocol="usenet",
+                    nzb_url=best_nzb.nzb_url,
+                    usenet_id=(result or {}).get("id"),
+                )
+                if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
+                    db.mark_episode_status(imdb_id, season, episode, "found")
+                    log.info("Monitor: lazy NZB strm created for %s S%02dE%02d",
+                             title, season, episode)
+                    return True
+            except torbox.RateLimited:
+                raise processor.RateLimited()
+            except Exception as exc:
+                log.warning("Monitor: NZB fallback failed for %s S%02dE%02d: %s",
+                            title, season, episode, exc)
+
+        log.info("Monitor: no cached torrent or usable NZB for %s S%02dE%02d",
+                 title, season, episode)
+        return False
+
+    # Non-lazy mode also consults Prowlarr before choosing a download.
+    groups.append(_pa.fetch_streams(
+        "series", imdb_id, season=season, episode=episode, title=title))
+    candidates = _merged_candidates(groups)
+    if not candidates:
+        log.info("Monitor: no acceptable candidates for %s S%02dE%02d (still wanted)",
+                 title, season, episode)
+        return False
 
     # check_cached is torrent-only; usenet candidates always look "uncached"
     # so they get prioritised after cached torrents. That's the desired order:
@@ -379,7 +457,7 @@ def search_episode_now(imdb_id: str, title: str, season: int, episode: int) -> b
         fake = {"id": 0, "imdb_id": imdb_id, "title": title,
                 "season": season, "episode": episode, "attempt_count": 0}
         _retry_episode(fake)
-    return strm_exists_episode(title, season, episode)
+    return strm_exists_episode(title, season, episode, imdb_id=imdb_id)
 
 
 def _search_and_add_season(imdb_id: str, title: str, seasons: list[int]) -> None:
@@ -398,7 +476,8 @@ def _search_and_add_season(imdb_id: str, title: str, seasons: list[int]) -> None
         for s in _mf.fetch_streams("series", imdb_id, season=season, episode=1):
             if s.info_hash not in seen_pack:
                 seen_pack.add(s.info_hash); streams.append(s)
-        for s in _pa.fetch_streams("series", imdb_id, season=season, episode=1):
+        for s in _pa.fetch_streams(
+                "series", imdb_id, season=season, episode=1, title=title):
             if s.info_hash not in seen_pack:
                 seen_pack.add(s.info_hash); streams.append(s)
         candidates = torrentio.rank_streams(streams, prefer_season_pack=True)

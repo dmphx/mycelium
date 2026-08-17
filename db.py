@@ -377,6 +377,10 @@ def _migrate() -> None:
                     log.info("Migration: added virtual_items.%s", col)
                 except Exception as _e:
                     log.warning("Migration: could not add virtual_items.%s: %s", col, _e)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_virtual_episode "
+            "ON virtual_items(media_type, imdb_id, season, episode)"
+        )
 
         req_cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
         if "tmdb_id" not in req_cols:
@@ -567,31 +571,24 @@ def reconcile_wanted_movies() -> int:
 
 
 def reconcile_wanted_episodes() -> int:
-    """Mark wanted episodes as found if a matching strm file exists in virtual_items."""
-    import re as _re
-    _EP_RE = _re.compile(r'[Ss](\d{1,2})[Ee](\d{1,3})')
+    """Mark wanted episodes as found if a matching virtual item exists.
+
+    Episode identity is stored in dedicated virtual_items columns. Using those
+    columns avoids reparsing every .strm path in Python on each scheduler run.
+    """
     with _connect() as conn:
-        vis = conn.execute(
-            "SELECT imdb_id, strm_path FROM virtual_items "
-            "WHERE media_type='series' AND strm_path IS NOT NULL AND imdb_id IS NOT NULL"
-        ).fetchall()
-        have: set[tuple[str, int, int]] = set()
-        for v in vis:
-            m = _EP_RE.search(v["strm_path"] or "")
-            if m:
-                have.add((v["imdb_id"], int(m.group(1)), int(m.group(2))))
-        if not have:
-            return 0
-        updated = 0
-        for imdb_id, season, episode in have:
-            cur = conn.execute(
-                "UPDATE wanted_episodes SET status='found' "
-                "WHERE imdb_id=? AND season=? AND episode=? AND status='wanted'",
-                (imdb_id, season, episode),
-            )
-            updated += cur.rowcount
+        cur = conn.execute(
+            """UPDATE wanted_episodes AS w SET status='found'
+               WHERE w.status='wanted' AND EXISTS (
+                 SELECT 1 FROM virtual_items AS v
+                 WHERE v.media_type='series'
+                   AND v.imdb_id=w.imdb_id
+                   AND v.season=w.season
+                   AND v.episode=w.episode
+               )"""
+        )
         conn.commit()
-        return updated
+        return cur.rowcount
 
 
 # ── monitored_series ──────────────────────────────────────────────────────────
@@ -661,22 +658,64 @@ def upsert_wanted_episode(imdb_id: str, tmdb_id: int | None, title: str,
         conn.commit()
 
 
-def get_wanted_episodes(max_attempts: int = 10, limit: int | None = None) -> list[dict]:
+def get_wanted_episodes(max_attempts: int = 10, limit: int | None = None,
+                        recent_days: int = 90,
+                        recent_fraction: float = 0.8) -> list[dict]:
+    """Return episode searches that are due, reserving capacity for old misses.
+
+    Retry cadence is 2h after attempt 1, 6h after attempt 2, 12h after attempt
+    3, and daily thereafter. With a bounded batch, 80 percent is reserved for
+    episodes aired in the last 90 days and the remainder drains older backlog.
+    """
+    due = """status='wanted' AND attempt_count < ?
+             AND (air_date IS NULL OR air_date <= date('now'))
+             AND (
+               attempt_count=0 OR last_attempted IS NULL OR
+               (attempt_count=1 AND last_attempted <= datetime('now','-2 hours')) OR
+               (attempt_count=2 AND last_attempted <= datetime('now','-6 hours')) OR
+               (attempt_count=3 AND last_attempted <= datetime('now','-12 hours')) OR
+               (attempt_count>=4 AND last_attempted <= datetime('now','-24 hours'))
+             )"""
+    order = "ORDER BY attempt_count ASC, COALESCE(air_date, '') DESC"
     with _connect() as conn:
-        # Order by fewest attempts then newest air date so the monitor grab loop
-        # reaches never-tried and recently-aired episodes first. A title/season
-        # ordering buried every ongoing show's newest episode at the back of a
-        # ~290k-row queue that a single pass never finishes, so new episodes were
-        # never grabbed. Un-gettable back-catalog (high attempt_count) sinks to
-        # the back instead of starving the front every cycle.
-        sql = ("SELECT * FROM wanted_episodes "
-               "WHERE status='wanted' AND attempt_count < ? "
-               "ORDER BY attempt_count ASC, air_date DESC")
-        params: list = [max_attempts]
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+        if limit is None:
+            rows = conn.execute(
+                f"SELECT * FROM wanted_episodes WHERE {due} "
+                f"ORDER BY CASE WHEN air_date >= date('now', ?) THEN 0 ELSE 1 END, "
+                "attempt_count ASC, COALESCE(air_date, '') DESC",
+                (max_attempts, f"-{max(1, recent_days)} days"),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        limit = max(1, int(limit))
+        recent_cap = min(limit, max(1, round(limit * recent_fraction)))
+        old_cap = limit - recent_cap
+        cutoff = f"-{max(1, recent_days)} days"
+        recent = conn.execute(
+            f"SELECT * FROM wanted_episodes WHERE {due} "
+            "AND air_date >= date('now', ?) " + order + " LIMIT ?",
+            (max_attempts, cutoff, recent_cap),
+        ).fetchall()
+        old = conn.execute(
+            f"SELECT * FROM wanted_episodes WHERE {due} "
+            "AND (air_date IS NULL OR air_date < date('now', ?)) " + order + " LIMIT ?",
+            (max_attempts, cutoff, old_cap),
+        ).fetchall() if old_cap else []
+
+        rows = list(recent) + list(old)
+        remaining = limit - len(rows)
+        if remaining:
+            ids = [r["id"] for r in rows]
+            exclusion = ""
+            params: list = [max_attempts]
+            if ids:
+                exclusion = f" AND id NOT IN ({','.join('?' for _ in ids)})"
+                params.extend(ids)
+            params.append(remaining)
+            rows.extend(conn.execute(
+                f"SELECT * FROM wanted_episodes WHERE {due}{exclusion} " + order + " LIMIT ?",
+                params,
+            ).fetchall())
         return [dict(r) for r in rows]
 
 
