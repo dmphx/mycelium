@@ -719,6 +719,9 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
 
 
 _PLACEHOLDER_TITLE_RE = re.compile(r"^(tt\d{6,10}|tmdb[:_\- ]?\d+)$", re.IGNORECASE)
+_SERIES_EPISODE_SUFFIX_RE = re.compile(
+    r"\s+S\d{1,2}E\d{1,3}(?:\s.*)?$", re.IGNORECASE,
+)
 
 
 def _looks_like_placeholder_title(title: str | None) -> bool:
@@ -729,6 +732,11 @@ def _looks_like_placeholder_title(title: str | None) -> bool:
     if not title or not title.strip():
         return True
     return bool(_PLACEHOLDER_TITLE_RE.match(title.strip()))
+
+
+def _base_series_title(title: str | None) -> str:
+    """Remove a trailing episode label accidentally stored as a show title."""
+    return _SERIES_EPISODE_SUFFIX_RE.sub("", (title or "").strip()).strip()
 
 
 def _series_folder_imdb(folder: Path) -> str | None:
@@ -895,7 +903,7 @@ def _find_series_folder_by_imdb(imdb_id: str) -> Path | None:
             continue
         path = Path(strm_path)
         folder = path.parent.parent if re.match(r"^Season \d+$", path.parent.name) else path.parent
-        if folder.exists():
+        if folder.exists() and _base_series_title(folder.name) == folder.name:
             return folder
     return None
 
@@ -1286,7 +1294,8 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     # (raw imdb id, "tmdb:NNN", empty). Otherwise the folder/NFO get named after
     # the placeholder and Plex stores the show as an unmatched "TmdbNNNNN".
     # Movies already do this via _canonical_movie_folder.
-    if _looks_like_placeholder_title(title):
+    title = _base_series_title(title)
+    if imdb_id or _looks_like_placeholder_title(title):
         resolved = _canonical_series_folder(imdb_id, fallback_title=title)
         if resolved:
             title = resolved
@@ -3011,8 +3020,9 @@ def _self_heal_sample(sample_size: int = 10) -> None:
             url = s.read_text(encoding="utf-8").strip()
         except Exception:
             continue
-        # Catbox proxy URLs always work  -  skip the probe
-        if "/stream/" in url and url.startswith("http://"):
+        # Catbox proxy URLs are materialized lazily. Probing them would add ten
+        # random torrents, consume TorBox slots, and look like Plex playback.
+        if "/stream/" in url and url.startswith(("http://", "https://")):
             continue
         try:
             r = req_lib.head(url, timeout=5, allow_redirects=True)

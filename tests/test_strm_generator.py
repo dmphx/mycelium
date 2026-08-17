@@ -84,6 +84,37 @@ def test_canonical_series_folder_reuses_registered_year_folder(tmp_path, monkeyp
     assert sg._canonical_series_folder("tt0436992") == "Doctor Who (2005)"
 
 
+def test_canonical_series_folder_ignores_episode_contaminated_folder(tmp_path, monkeypatch):
+    folder = tmp_path / "series" / "Andy's Dinosaur Adventures S01E01"
+    season = folder / "Season 01"
+    season.mkdir(parents=True)
+    strm = season / "Andy's Dinosaur Adventures S01E01 S01E01.strm"
+    strm.write_text("stream", encoding="utf-8")
+    monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        sg.db,
+        "get_virtual_items_by_imdb",
+        lambda *_args, **_kwargs: [{"strm_path": str(strm)}],
+    )
+    monkeypatch.setattr(
+        "tmdb._get",
+        lambda *_args, **_kwargs: {
+            "tv_results": [{
+                "name": "Andy's Dinosaur Adventures",
+                "first_air_date": "2014-02-17",
+            }],
+        },
+    )
+
+    assert sg._canonical_series_folder("tt3609100") == "Andy's Dinosaur Adventures"
+
+
+def test_base_series_title_removes_episode_suffix():
+    assert sg._base_series_title("Andy's Dinosaur Adventures S01E01") == (
+        "Andy's Dinosaur Adventures"
+    )
+
+
 class TestSporeItemSize:
     files = [
         {"id": 11, "name": "Show S06E10.mkv", "size": 1_950_621_122},
@@ -579,3 +610,22 @@ class TestWriteStrm:
         assert sg._write_strm(
             spinoff, "http://korean-series", imdb_id="tt6568694"
         ) is True
+
+
+def test_self_heal_does_not_materialize_https_catbox_urls(tmp_path, monkeypatch):
+    series = tmp_path / "series" / "Show" / "Season 01"
+    series.mkdir(parents=True)
+    for episode in range(1, 7):
+        (series / f"Show S01E{episode:02d}.strm").write_text(
+            f"https://mycelium.example/stream/token-{episode}", encoding="utf-8"
+        )
+    monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        sg.req_lib,
+        "head",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("catbox URL must not be probed")
+        ),
+    )
+
+    sg._self_heal_sample(sample_size=6)

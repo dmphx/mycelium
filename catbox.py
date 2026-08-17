@@ -968,6 +968,12 @@ def _prepare_next_episode(imdb_id: str, title: str,
         import search_engine
         import strm_generator
 
+        title = strm_generator._base_series_title(title)
+        canonical = strm_generator._canonical_series_folder(
+            imdb_id, fallback_title=title)
+        if canonical:
+            title = canonical
+
         next_season, next_episode = season, episode + 1
         wanted = db.get_wanted_episode(imdb_id, next_season, next_episode)
         nxt = db.get_virtual_item_by_episode(imdb_id, next_season, next_episode)
