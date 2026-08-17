@@ -756,6 +756,9 @@ def _canonical_series_folder(imdb_id: str | None,
     instead of an id placeholder. Falls back to fallback_title if the TMDB
     lookup fails or imdb_id is missing."""
     if imdb_id:
+        existing_folder = _find_series_folder_by_imdb(imdb_id)
+        if existing_folder:
+            return existing_folder.name
         try:
             import tmdb as _tmdb
             results = _tmdb._get(f"/find/{imdb_id}",
@@ -880,6 +883,20 @@ def _find_movie_folder_by_imdb(imdb_id: str) -> Path | None:
             p = Path(strm_path).parent
             if p.exists():
                 return p
+    return None
+
+
+def _find_series_folder_by_imdb(imdb_id: str) -> Path | None:
+    """Return an existing series folder for this IMDb identity, when present."""
+    items = db.get_virtual_items_by_imdb(imdb_id, media_type="series")
+    for item in items:
+        strm_path = item.get("strm_path")
+        if not strm_path:
+            continue
+        path = Path(strm_path)
+        folder = path.parent.parent if re.match(r"^Season \d+$", path.parent.name) else path.parent
+        if folder.exists():
+            return folder
     return None
 
 
@@ -1214,7 +1231,7 @@ def create_lazy_movie_strm(info_hash: str, magnet: str, title: str,
         nzb_url=nzb_url,
         usenet_id=usenet_id,
     )
-    written = _write_strm(path, catbox.proxy_url(token))
+    written = _write_strm(path, catbox.proxy_url(token), imdb_id=imdb_id)
     if not written:
         # Don't leave a virtual_item row with no backing .strm - it would
         # permanently block retries via the "already exists" guard above.
@@ -1306,7 +1323,7 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         nzb_url=nzb_url,
         usenet_id=usenet_id,
     )
-    written = _write_strm(path, catbox.proxy_url(token))
+    written = _write_strm(path, catbox.proxy_url(token), imdb_id=imdb_id)
     if not written:
         # Don't leave a virtual_item row with no backing .strm - it would
         # permanently block retries via the imdb_id+season+episode guard above.
@@ -2167,7 +2184,7 @@ def update_stub_from_probe(token: str, audio_streams: list[dict],
 # Plex Spore stubs (.mkv / .minfo) worden hier NIET aangeraakt.
 # =============================================================================
 
-def _write_strm(path: Path, url: str) -> bool:
+def _write_strm(path: Path, url: str, imdb_id: str | None = None) -> bool:
     """Write .strm file only if it doesn't exist. Returns True if a new file was written."""
     if path.exists():
         return False
@@ -2182,10 +2199,19 @@ def _write_strm(path: Path, url: str) -> bool:
         title_folder = path.parent
     parent = title_folder.parent  # movies/ or series/
     norm = _norm_title(title_folder.name)
+    target_year = _YEAR_RE.search(title_folder.name)
     if parent.is_dir():
         for existing in parent.iterdir():
             if existing.is_dir() and existing != title_folder and _norm_title(existing.name) == norm:
                 if any(existing.glob("*.strm")) or any(existing.rglob("*.strm")):
+                    existing_year = _YEAR_RE.search(existing.name)
+                    if (target_year and existing_year and
+                            target_year.group(1) != existing_year.group(1)):
+                        continue
+                    if imdb_id:
+                        existing_imdb = _series_folder_imdb(existing)
+                        if existing_imdb and existing_imdb != imdb_id:
+                            continue
                     log.info("Skipping duplicate strm %s  -  already have %s", title_folder.name, existing.name)
                     return False
     try:
@@ -2290,7 +2316,7 @@ def process_torrent(item: dict, canonical_title: str | None = None,
         url = _resolve_url(item, file_id, file_name, info, info['type'] if info['type'] == 'movie' else 'series')
         if not url:
             continue
-        if _write_strm(path, url):
+        if _write_strm(path, url, imdb_id=imdb_id):
             written += 1
             if imdb_id and info['type'] != 'movie' and not nfo_written:
                 series_root = path.parent.parent
@@ -2332,7 +2358,7 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
         url = _resolve_url(item, main_file['id'], main_file.get('name', ''), info, 'movie')
         if not url:
             return 0
-        written = _write_strm(path, url)
+        written = _write_strm(path, url, imdb_id=imdb_id)
         if written and (imdb_id or tmdb_id):
             _write_nfo(path, imdb_id, tmdb_id)
         return 1 if written else 0
@@ -2483,7 +2509,7 @@ def _run_once_catbox() -> int:
         if path.exists():
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        if _write_strm(path, catbox.proxy_url(item["token"])):
+        if _write_strm(path, catbox.proxy_url(item["token"]), imdb_id=item.get("imdb_id")):
             log.info("Recreated missing catbox .strm: %s", path.name)
             recreated += 1
     log.info("strm_generator catbox: %d missing .strm file(s) recreated from virtual_items", recreated)

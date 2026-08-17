@@ -69,6 +69,21 @@ def test_canonical_series_folder_adds_year_for_existing_different_identity(tmp_p
     assert sg._canonical_series_folder("tt6568694") == "Criminal Minds (2017)"
 
 
+def test_canonical_series_folder_reuses_registered_year_folder(tmp_path, monkeypatch):
+    folder = tmp_path / "series" / "Doctor Who (2005)"
+    season = folder / "Season 01"
+    season.mkdir(parents=True)
+    strm = season / "Doctor Who (2005) S01E01.strm"
+    strm.write_text("stream", encoding="utf-8")
+    monkeypatch.setattr(
+        sg.db,
+        "get_virtual_items_by_imdb",
+        lambda *_args, **_kwargs: [{"strm_path": str(strm)}],
+    )
+
+    assert sg._canonical_series_folder("tt0436992") == "Doctor Who (2005)"
+
+
 class TestSporeItemSize:
     files = [
         {"id": 11, "name": "Show S06E10.mkv", "size": 1_950_621_122},
@@ -536,3 +551,31 @@ class TestWriteStrm:
         assert sg._write_strm(second, "http://dune2") is True
         assert first.exists()
         assert second.exists()
+
+    def test_allows_same_movie_title_from_different_year(self, tmp_path):
+        movies = tmp_path / "movies"
+        first = movies / "Hush (2008)" / "Hush (2008).strm"
+        second = movies / "Hush (2016)" / "Hush (2016).strm"
+        assert sg._write_strm(first, "http://hush-2008") is True
+        assert sg._write_strm(second, "http://hush-2016") is True
+
+    def test_allows_same_series_title_with_different_identity(self, tmp_path):
+        series = tmp_path / "series"
+        existing = series / "Criminal Minds"
+        existing.mkdir(parents=True)
+        (existing / "tvshow.nfo").write_text(
+            '<tvshow><uniqueid type="imdb">tt0452046</uniqueid></tvshow>',
+            encoding="utf-8",
+        )
+        (existing / "Season 01").mkdir()
+        (existing / "Season 01" / "Criminal Minds S01E01.strm").write_text(
+            "http://original", encoding="utf-8",
+        )
+        spinoff = (
+            series / "Criminal Minds (2017)" / "Season 01" /
+            "Criminal Minds (2017) S01E01.strm"
+        )
+
+        assert sg._write_strm(
+            spinoff, "http://korean-series", imdb_id="tt6568694"
+        ) is True
