@@ -86,6 +86,20 @@ def test_reconcile_uses_virtual_episode_identity():
     assert db.get_all_wanted_episodes()[0]["status"] == "found"
 
 
+def test_reconcile_preserves_deterministic_no_file_retry():
+    _insert_episode(1)
+    db.insert_virtual_item(
+        token="bad-episode-token", info_hash="a" * 40,
+        magnet="magnet:?xt=urn:btih:" + "a" * 40,
+        title="Show 1 S01E01", media_type="series",
+        imdb_id="tt0000001", season=1, episode=1,
+    )
+    db.update_playability_fail("tt0000001:S01E01", "NO_FILE")
+
+    assert db.reconcile_wanted_episodes() == 0
+    assert db.get_all_wanted_episodes()[0]["status"] == "wanted"
+
+
 def test_unplayable_found_episode_is_requeued_immediately():
     _insert_episode(1, attempts=4, attempted_ago_hours=1)
     db.mark_episode_status("tt0000001", 1, 1, "found")

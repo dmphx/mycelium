@@ -681,6 +681,14 @@ def reconcile_wanted_episodes() -> int:
                    AND v.imdb_id=w.imdb_id
                    AND v.season=w.season
                    AND v.episode=w.episode
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM playability_state AS ps
+                 WHERE ps.content_key=(
+                   w.imdb_id || ':S' || printf('%02d', w.season) ||
+                   'E' || printf('%02d', w.episode)
+                 )
+                   AND ps.status='degraded'
+                   AND ps.last_fail_reason='NO_FILE'
                )"""
         )
         conn.commit()
