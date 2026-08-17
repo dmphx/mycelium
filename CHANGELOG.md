@@ -31,6 +31,11 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Plex legacy phantom episodes can now be identified against a double-confirmed
+  TMDB season boundary and safely quarantined with playback and maintenance
+  gates. This cleans up bogus tail episodes left by older fixed-size season
+  registration without risking legitimate numbering mismatches.
+
 - Plex Spore season-pack entries now advertise the selected episode file's
   exact byte size instead of the pack's largest file or aggregate size,
   preventing NFS read errors and HTTP 416 loops when Plex reads past EOF

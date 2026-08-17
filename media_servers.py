@@ -104,6 +104,11 @@ def mark(strm_path):
     _enqueue(strm_path, "scan")
 
 
+def mark_removed(strm_path):
+    """Record a removed item so both libraries rescan its season or folder."""
+    _enqueue(strm_path, "remove")
+
+
 def request_reanalyze(strm_path):
     """Queue a Plex re-analyze (and Jellyfin refresh) for an item whose media
     changed on disk, e.g. a Spore stub rewritten with a corrected codec.
@@ -141,7 +146,8 @@ def _flush():
     # Jellyfin is a single batched POST -- fire it up front so the Plex scan
     # pacing below never delays it.
     _scan_jellyfin([{"Path": "%s/%s/%s" % (JF_LIBRARY_ROOT, kind, folder),
-                     "UpdateType": "Modified" if mode == "analyze" else "Created"}
+                     "UpdateType": ("Deleted" if mode == "remove" else
+                                    "Modified" if mode == "analyze" else "Created")}
                     for kind, folder, mode in batch])
     plex_queue_lines = []
     scanned = 0
