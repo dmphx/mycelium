@@ -31,6 +31,9 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Legacy series folders named with a raw TMDB placeholder can now be repaired
+  only after IMDb confirmation and conflict checks, with originals quarantined
+  instead of deleted
 - Plex movie folders now include an IMDb match hint when the title contains a
   misleading four-digit year, preventing a local unmatched item with the wrong
   release year
