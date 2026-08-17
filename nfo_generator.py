@@ -60,19 +60,36 @@ def _xml_escape(s: str) -> str:
     return _stdlib_xml_escape(s or "")
 
 
-def _movie_nfo(title: str, year: int | None, imdb_id: str) -> str:
+def _runtime_minutes(runtime_minutes: int | float | None) -> int | None:
+    try:
+        minutes = int(round(float(runtime_minutes or 0)))
+    except (TypeError, ValueError):
+        return None
+    return minutes if minutes > 0 else None
+
+
+def _runtime_tag(runtime_minutes: int | float | None) -> str:
+    """Return a Kodi/Jellyfin runtime tag (whole minutes), or an empty string."""
+    minutes = _runtime_minutes(runtime_minutes)
+    return f"\n  <runtime>{minutes}</runtime>" if minutes else ""
+
+
+def _movie_nfo(title: str, year: int | None, imdb_id: str,
+               runtime_minutes: int | float | None = None) -> str:
     year_tag = f"\n  <year>{year}</year>" if year else ""
+    runtime_tag = _runtime_tag(runtime_minutes)
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         "<movie>\n"
-        f"  <title>{_xml_escape(title)}</title>{year_tag}\n"
+        f"  <title>{_xml_escape(title)}</title>{year_tag}{runtime_tag}\n"
         f'  <uniqueid type="imdb" default="true">{_xml_escape(imdb_id)}</uniqueid>\n'
         "</movie>\n"
     )
 
 
 def _episode_nfo(title: str, season: int, episode: int,
-                 plot: str | None = None, aired: str | None = None) -> str:
+                 plot: str | None = None, aired: str | None = None,
+                 runtime_minutes: int | float | None = None) -> str:
     lines = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         "<episodedetails>",
@@ -84,8 +101,114 @@ def _episode_nfo(title: str, season: int, episode: int,
         lines.append("  <plot>%s</plot>" % _xml_escape(plot))
     if aired:
         lines.append("  <aired>%s</aired>" % _xml_escape(aired))
+    runtime_tag = _runtime_tag(runtime_minutes).strip()
+    if runtime_tag:
+        lines.append("  %s" % runtime_tag)
     lines.append("</episodedetails>")
     return "\n".join(lines) + "\n"
+
+
+_GENERIC_EPISODE_TITLE_RE = re.compile(r"^Episode\s+\d+$", re.IGNORECASE)
+
+
+def _positive_runtime(root: ET.Element) -> bool:
+    el = root.find("runtime")
+    try:
+        return bool(el is not None and float(el.text or 0) > 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _episode_nfo_needs_metadata(nfo_path: Path) -> bool:
+    if not nfo_path.exists():
+        return True
+    try:
+        root = ET.parse(nfo_path).getroot()
+    except Exception:
+        return False
+    title = (root.findtext("title") or "").strip()
+    return not _positive_runtime(root) or not title or bool(_GENERIC_EPISODE_TITLE_RE.match(title))
+
+
+def _nfo_needs_runtime(nfo_path: Path) -> bool:
+    if not nfo_path.exists():
+        return False
+    try:
+        return not _positive_runtime(ET.parse(nfo_path).getroot())
+    except Exception:
+        return False
+
+
+def _write_xml_tree(path: Path, root: ET.Element) -> None:
+    ET.indent(root, space="  ")
+    body = ET.tostring(root, encoding="unicode", short_empty_elements=True)
+    atomic_write_text(
+        path,
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + body + "\n",
+    )
+
+
+def _merge_episode_metadata(nfo_path: Path, title: str, season: int, episode: int,
+                            plot: str | None = None, aired: str | None = None,
+                            runtime_minutes: int | float | None = None) -> bool:
+    """Add trustworthy TMDB metadata without discarding existing stream details."""
+    if not nfo_path.exists():
+        atomic_write_text(
+            nfo_path,
+            _episode_nfo(title, season, episode, plot, aired, runtime_minutes),
+        )
+        return True
+    try:
+        root = ET.parse(nfo_path).getroot()
+    except Exception:
+        return False
+
+    changed = False
+    current_title = (root.findtext("title") or "").strip()
+    if title and (not current_title or _GENERIC_EPISODE_TITLE_RE.match(current_title)):
+        el = root.find("title")
+        if el is None:
+            el = ET.Element("title")
+            root.insert(0, el)
+        el.text = title
+        changed = True
+
+    for tag, value in (("season", season), ("episode", episode),
+                       ("plot", plot), ("aired", aired)):
+        if value is None or (root.findtext(tag) or "").strip():
+            continue
+        ET.SubElement(root, tag).text = str(value)
+        changed = True
+
+    runtime = _runtime_minutes(runtime_minutes)
+    if runtime and not _positive_runtime(root):
+        el = root.find("runtime")
+        if el is None:
+            el = ET.SubElement(root, "runtime")
+        el.text = str(runtime)
+        changed = True
+
+    if changed:
+        _write_xml_tree(nfo_path, root)
+    return changed
+
+
+def _merge_runtime(nfo_path: Path, runtime_minutes: int | float | None) -> bool:
+    minutes = _runtime_minutes(runtime_minutes)
+    if not nfo_path.exists() or not minutes:
+        return False
+    try:
+        root = ET.parse(nfo_path).getroot()
+    except Exception:
+        return False
+    if _positive_runtime(root):
+        return False
+    el = root.find("runtime")
+    if el is None:
+        el = ET.SubElement(root, "runtime")
+    el.text = str(minutes)
+    _write_xml_tree(nfo_path, root)
+    return True
 
 
 def _tvshow_nfo(title: str, imdb_id: str) -> str:
@@ -300,7 +423,15 @@ def fetch_images_for_folder(folder: Path, imdb_id: str, media_type: str = "movie
                 _download_image(f"{_IMAGE_BASE_BACKDROP}{b}", fanart)
         except Exception as exc:
             log.debug("fetch_images_for_folder %s: %s", folder.name, exc)
-    if media_type != "movie":
+    if media_type == "movie":
+        nfo_path = folder / f"{folder.name}.nfo"
+        try:
+            runtime_sec = tmdb.get_movie_runtime_sec(imdb_id)
+            if runtime_sec:
+                _merge_runtime(nfo_path, runtime_sec / 60.0)
+        except Exception as exc:
+            log.debug("movie runtime %s: %s", folder.name, exc)
+    else:
         try:
             tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
             if tmdb_id:
@@ -327,7 +458,7 @@ def _write_episode_meta(folder: Path, tmdb_id: int) -> tuple[int, int]:
                 continue
             nfo = strm.with_suffix(".nfo")
             thumb = strm.with_name(f"{strm.stem}-thumb.jpg")
-            if nfo.exists() and thumb.exists():
+            if not _episode_nfo_needs_metadata(nfo) and thumb.exists():
                 continue
             by_season.setdefault(int(m.group(1)), []).append(
                 (int(m.group(2)), nfo, thumb))
@@ -342,11 +473,18 @@ def _write_episode_meta(folder: Path, tmdb_id: int) -> tuple[int, int]:
                 det = eps.get(e_num)
                 if not det:
                     continue
-                if not nfo.exists() and det.get("name"):
+                if det.get("name") and _episode_nfo_needs_metadata(nfo):
                     try:
-                        atomic_write_text(nfo, _episode_nfo(det["name"], s_num, e_num,
-                                                            det.get("overview"), det.get("air_date")))
-                        n_nfo += 1
+                        if _merge_episode_metadata(
+                            nfo,
+                            det["name"],
+                            s_num,
+                            e_num,
+                            det.get("overview"),
+                            det.get("air_date"),
+                            det.get("runtime"),
+                        ):
+                            n_nfo += 1
                     except Exception as exc:
                         log.debug("episode nfo write failed %s: %s", nfo.name, exc)
                 still = det.get("still_path")
@@ -363,7 +501,7 @@ def fetch_local_images() -> dict:
     TMDB calls to stay well under the 50 req/s rate limit.
     """
     media = Path(MEDIA_PATH)
-    m_count = s_count = e_count = 0
+    m_count = s_count = e_count = metadata_count = 0
 
     movies_dir = media / "movies"
     if movies_dir.is_dir():
@@ -372,13 +510,24 @@ def fetch_local_images() -> dict:
                 continue
             poster = folder / "poster.jpg"
             fanart = folder / "fanart.jpg"
-            if poster.exists() and fanart.exists():
-                continue
             nfo = folder / f"{folder.name}.nfo"
             if not nfo.exists():
                 continue
+            needs_runtime = _nfo_needs_runtime(nfo)
+            if poster.exists() and fanart.exists() and not needs_runtime:
+                continue
             imdb_id = _read_imdb_from_nfo(nfo)
             if not imdb_id:
+                continue
+            if needs_runtime:
+                try:
+                    runtime_sec = tmdb.get_movie_runtime_sec(imdb_id)
+                    time.sleep(0.15)
+                    if runtime_sec and _merge_runtime(nfo, runtime_sec / 60.0):
+                        metadata_count += 1
+                except Exception:
+                    pass
+            if poster.exists() and fanart.exists():
                 continue
             try:
                 p, b = tmdb.get_images(imdb_id, "movie")
@@ -420,10 +569,13 @@ def fetch_local_images() -> dict:
                     time.sleep(0.15)
                     try:
                         _n_nfo, _n_still = _write_episode_meta(folder, tmdb_id)
+                        metadata_count += _n_nfo
                         e_count += _n_still
                     except Exception as exc:
                         log.debug("episode meta backfill %s: %s", folder.name, exc)
 
-    log.info("fetch_local_images: %d movie poster(s), %d series poster(s), %d episode still(s)",
-             m_count, s_count, e_count)
-    return {"movies": m_count, "series": s_count, "episodes": e_count}
+    log.info("fetch_local_images: %d movie poster(s), %d series poster(s), "
+             "%d episode still(s), %d metadata update(s)",
+             m_count, s_count, e_count, metadata_count)
+    return {"movies": m_count, "series": s_count, "episodes": e_count,
+            "metadata": metadata_count}
