@@ -90,3 +90,25 @@ def test_episode_backfill_updates_existing_nfo_even_when_thumb_exists(tmp_path, 
     assert root.findtext("title") == "Tree Trunks"
     assert root.findtext("runtime") == "11"
 
+
+def test_routine_nfo_pass_skips_untracked_folders_without_tmdb_search(tmp_path, monkeypatch):
+    movie = tmp_path / "movies" / "Unmatched Movie"
+    series = tmp_path / "series" / "Unmatched Series"
+    movie.mkdir(parents=True)
+    series.mkdir(parents=True)
+
+    monkeypatch.setattr(nfo_generator, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(nfo_generator.db, "get_media_items", lambda: [])
+    monkeypatch.setattr(nfo_generator.db, "get_all_monitored_series", lambda: [])
+
+    def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("routine NFO pass must not perform broad TMDB searches")
+
+    monkeypatch.setattr(nfo_generator.tmdb, "search_movie", unexpected_lookup)
+    monkeypatch.setattr(nfo_generator.tmdb, "search_tv", unexpected_lookup)
+
+    result = nfo_generator.generate_all(lookup_missing=False)
+
+    assert result == {"movies": 0, "series": 0}
+    assert not (movie / "Unmatched Movie.nfo").exists()
+    assert not (series / "tvshow.nfo").exists()

@@ -317,12 +317,14 @@ def _write(path: Path, content: str) -> bool:
         return False
 
 
-def generate_all() -> dict:
+def generate_all(*, lookup_missing: bool = True) -> dict:
     """Write missing NFO files for all movies and series using IMDb IDs from DB.
 
     For series folders not found in the DB (messy torrent names), a TMDB lookup
     is attempted so that duplicate series folders get the same IMDb ID in their
-    tvshow.nfo  -  Jellyfin then merges them into a single library entry.
+    tvshow.nfo  -  Jellyfin then merges them into a single library entry. Routine
+    refreshes can disable those broad lookups so unresolved legacy folders do not
+    consume TMDB quota and CPU again after every TorBox event.
     """
     media = Path(MEDIA_PATH)
     items_by_title = {m["title"]: m["imdb_id"] for m in db.get_media_items()}
@@ -352,6 +354,8 @@ def generate_all() -> dict:
             if imdb_id and imdb_id.startswith("unknown_"):
                 imdb_id = None
 
+            if not imdb_id and not lookup_missing:
+                continue
             if not imdb_id:
                 if not clean:
                     continue
@@ -385,6 +389,8 @@ def generate_all() -> dict:
                 continue
 
             imdb_id = items_by_title.get(folder.name)
+            if (not imdb_id or imdb_id.startswith("unknown_")) and not lookup_missing:
+                continue
             if not imdb_id or imdb_id.startswith("unknown_"):
                 # Not in DB  -  try TMDB lookup so duplicate folders get the right ID
                 clean = _clean_for_tmdb(folder.name)
