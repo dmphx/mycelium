@@ -162,9 +162,9 @@ def discover() -> list[dict]:
             conflict_reasons.append("canonical title unavailable")
         canonical = strm_generator._safe(canonical) if canonical else ""
         target = series_root / canonical if canonical else series_root / current_title
-        if canonical and (not target.is_dir() or target.is_symlink()):
-            conflict_reasons.append("canonical folder unavailable")
-        elif canonical:
+        if canonical and target.exists() and (not target.is_dir() or target.is_symlink()):
+            conflict_reasons.append("canonical folder is not a safe directory")
+        elif canonical and target.is_dir():
             target_imdb = _nfo_imdb(target)
             virtual_ids = db.get_virtual_item_imdb_ids_under_path(str(target))
             if target_imdb and target_imdb != imdb_id:
@@ -241,20 +241,22 @@ def cleanup(dry_run: bool = True) -> dict:
                 continue
             source = plan["source"]
             target = plan["target"]
-            target.mkdir(parents=True, exist_ok=True)
 
             if plan["title_only"]:
-                atomic_write_text(
-                    target / "tvshow.nfo",
-                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-                    "<tvshow>\n"
-                    f"  <title>{_xml_escape(plan['title'])}</title>\n"
-                    f'  <uniqueid type="imdb" default="true">{_xml_escape(plan["imdb_id"])}</uniqueid>\n'
-                    "</tvshow>\n",
-                )
+                if target.is_dir():
+                    atomic_write_text(
+                        target / "tvshow.nfo",
+                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                        "<tvshow>\n"
+                        f"  <title>{_xml_escape(plan['title'])}</title>\n"
+                        f'  <uniqueid type="imdb" default="true">{_xml_escape(plan["imdb_id"])}</uniqueid>\n'
+                        "</tvshow>\n",
+                    )
                 _update_identity_titles(plan["imdb_id"], plan["title"])
                 result["titles_repaired"] += 1
                 continue
+
+            target.mkdir(parents=True, exist_ok=True)
 
             for old_path, new_path in plan["source_files"]:
                 new_path.parent.mkdir(parents=True, exist_ok=True)

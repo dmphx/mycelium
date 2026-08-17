@@ -96,7 +96,7 @@ def test_discover_repairs_placeholder_database_title(monkeypatch, tmp_path):
     assert plans[0]["conflicts"] == []
 
 
-def test_discover_holds_title_only_repair_without_canonical_folder(monkeypatch, tmp_path):
+def test_discover_accepts_title_only_repair_without_canonical_folder(monkeypatch, tmp_path):
     media = tmp_path / "media"
     spore = tmp_path / "spore"
     (media / "series").mkdir(parents=True)
@@ -113,4 +113,4 @@ def test_discover_holds_title_only_repair_without_canonical_folder(monkeypatch, 
 
     assert len(plans) == 1
     assert plans[0]["title_only"] is True
-    assert plans[0]["conflicts"] == ["canonical folder unavailable"]
+    assert plans[0]["conflicts"] == []
