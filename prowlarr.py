@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 
 import requests
 
+import db
 from config import PROWLARR_API_KEY, PROWLARR_BASE_URL, PROWLARR_ENABLED
 from torrentio import (
     TorrentioStream,
@@ -76,7 +77,8 @@ def _enabled_indexers() -> list[dict]:
         return _indexer_cache["items"] or []
     items = [
         {"id": r["id"], "name": r.get("name", "?"),
-         "protocol": (r.get("protocol") or "torrent").lower()}
+         "protocol": (r.get("protocol") or "torrent").lower(),
+         "priority": int(r.get("priority") or 25)}
         for r in rows if r.get("enable")
     ]
     _indexer_cache["items"] = items
@@ -208,7 +210,21 @@ def _usenet_stream(item: ET.Element, season: int | None,
 
 def _query_one_indexer(idx: dict, search_type: str, imdb_id: str,
                         season: int | None, episode: int | None,
-                        timeout: int, title: str | None = None) -> list[TorrentioStream]:
+                        timeout: int, title: str | None = None,
+                        aliases: tuple[str, ...] = ()) -> list[TorrentioStream]:
+    started = time.monotonic()
+    metric_source = f"prowlarr/{idx['name'].lower()}"
+
+    def _done(result: list[TorrentioStream], success: bool = True,
+              error: str | None = None) -> list[TorrentioStream]:
+        try:
+            db.record_source_query(
+                metric_source, len(result), time.monotonic() - started,
+                success, error)
+        except Exception:
+            pass
+        return result
+
     numeric_imdb = imdb_id.lstrip("t")
     params = {
         "t": search_type,
@@ -236,23 +252,50 @@ def _query_one_indexer(idx: dict, search_type: str, imdb_id: str,
             _indexer_cooldowns[idx["id"]] = time.monotonic() + delay
             log.warning("Prowlarr [%s] rate limited, cooling down for %.0fs",
                         idx["name"], delay)
-            return []
+            return _done([], False, "HTTP 429")
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.warning("Prowlarr [%s] query failed: %s", idx["name"], exc)
-        return []
+        return _done([], False, str(exc)[:300])
     try:
         root = ET.fromstring(resp.content)
     except ET.ParseError as exc:
         log.warning("Prowlarr [%s] XML parse failed: %s", idx["name"], exc)
-        return []
+        return _done([], False, f"XML parse: {exc}")
     items = root.findall(".//item")
     parser = _usenet_stream if idx["protocol"] == "usenet" else _torrent_stream
     parsed = [s for s in (parser(it, season, idx["name"]) for it in items) if s is not None]
+    if not parsed and aliases:
+        for alias in aliases:
+            if not alias or alias.casefold() == (title or "").casefold():
+                continue
+            try:
+                alias_params = dict(params)
+                alias_params["q"] = alias
+                alias_resp = requests.get(
+                    url, params=alias_params, timeout=timeout,
+                    headers={"X-Api-Key": PROWLARR_API_KEY},
+                )
+                if alias_resp.status_code == 429:
+                    _indexer_cooldowns[idx["id"]] = (
+                        time.monotonic() + _retry_after_seconds(alias_resp))
+                    break
+                alias_resp.raise_for_status()
+                alias_root = ET.fromstring(alias_resp.content)
+                alias_items = alias_root.findall(".//item")
+                parsed = [s for s in
+                          (parser(it, season, idx["name"]) for it in alias_items)
+                          if s is not None]
+                if parsed:
+                    log.info("Prowlarr [%s] alias %r produced %d result(s)",
+                             idx["name"], alias, len(parsed))
+                    break
+            except (requests.RequestException, ET.ParseError):
+                continue
     if items:
         log.info("Prowlarr [%s/%s] %d items -> %d parsed",
                  idx["name"], idx["protocol"], len(items), len(parsed))
-    return parsed
+    return _done(parsed)
 
 
 def fetch_streams(
@@ -262,6 +305,7 @@ def fetch_streams(
     episode: int | None = None,
     timeout: int = 25,
     title: str | None = None,
+    aliases: tuple[str, ...] = (),
 ) -> list[TorrentioStream]:
     """Return parsed TorrentioStream objects from every enabled Prowlarr
     indexer in parallel. Both torrent and usenet sources contribute."""
@@ -272,6 +316,18 @@ def fetch_streams(
                 if _indexer_cooldowns.get(idx["id"], 0.0) <= now]
     if not indexers:
         return []
+    stats = {row["source"]: row for row in db.get_source_query_stats()}
+
+    def _adaptive_order(idx: dict) -> tuple:
+        stat = stats.get(f"prowlarr/{idx['name'].lower()}") or {}
+        return (
+            int(stat.get("consecutive_errors") or 0),
+            int(idx.get("priority") or 25),
+            -float(stat.get("avg_results") or 0),
+            float(stat.get("avg_latency") or 0),
+        )
+
+    indexers.sort(key=_adaptive_order)
     search_type = "movie" if media_type == "movie" else "tvsearch"
     log.info("Prowlarr: fanning out %s search across %d enabled indexers",
              search_type, len(indexers))
@@ -280,7 +336,7 @@ def fetch_streams(
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(indexers))) as ex:
         futures = {
             ex.submit(_query_one_indexer, idx, search_type, imdb_id,
-                       season, episode, timeout, title): idx
+                       season, episode, timeout, title, aliases): idx
             for idx in indexers
         }
         for fut in concurrent.futures.as_completed(futures):

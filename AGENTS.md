@@ -321,5 +321,3 @@ Tests zijn schaars; focus op integratiecorrectheid.
 ## Bekende open punten
 
 1. **Plex audio/subtitle wisselen**: na eerste play wordt stub bijgewerkt met echte tracks. Plex moet daarna handmatig re-analyzeren ("Fix Incorrect Match" of wacht op automatische scan).
-2. **Re-resolve knop in Library tab** (zonder curl)
-3. **Playability state tabel in UI**

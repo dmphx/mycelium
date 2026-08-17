@@ -498,15 +498,25 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
     """Return the subset of hashes that TorBox has cached (instant download available)."""
     if not hashes:
         return set()
+    import db
+    normalized = list(dict.fromkeys(value.lower() for value in hashes if value))
+    known_cached, known_uncached = db.get_provider_cache_status("torbox", normalized)
+    pending = [value for value in normalized
+               if value not in known_cached and value not in known_uncached]
+    if not pending:
+        log.debug("TorBox cache check served %d hash status(es) from durable cache",
+                  len(normalized))
+        return known_cached
     _BATCH = 100
-    if len(hashes) > _BATCH:
-        cached: set[str] = set()
-        for i in range(0, len(hashes), _BATCH):
-            cached |= check_cached(hashes[i:i + _BATCH], timeout=timeout)
-        log.info("TorBox cache check: %d/%d hashes cached (batched)", len(cached), len(hashes))
+    if len(pending) > _BATCH:
+        cached = set(known_cached)
+        for i in range(0, len(pending), _BATCH):
+            cached |= check_cached(pending[i:i + _BATCH], timeout=timeout)
+        log.info("TorBox cache check: %d/%d hashes cached (batched)",
+                 len(cached), len(normalized))
         return cached
     url = f"{_base_url().rstrip('/')}/torrents/checkcached"
-    params = {"hash": ",".join(hashes), "format": "object"}
+    params = {"hash": ",".join(pending), "format": "object"}
     try:
         resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
         resp.raise_for_status()
@@ -521,8 +531,11 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
         # instead of silently returning an empty set that causes a false 6h miss.
         raise RuntimeError(f"TorBox checkcached unavailable: {exc}")
     data = (resp.json() or {}).get("data") or {}
-    cached = {h.lower() for h in data.keys()}
-    log.info("TorBox cache check: %d/%d hashes cached", len(cached), len(hashes))
+    fresh_cached = {h.lower() for h in data.keys()}
+    db.set_provider_cache_status("torbox", fresh_cached, pending)
+    cached = known_cached | fresh_cached
+    log.info("TorBox cache check: %d/%d hashes cached (%d API checked)",
+             len(cached), len(normalized), len(pending))
     return cached
 
 
@@ -553,7 +566,13 @@ def check_cached_files(hashes: list[str], timeout: int = 15) -> dict[str, dict]:
         log.warning("TorBox checkcached (files) failed: %s", exc)
         return {}
     data = (resp.json() or {}).get("data") or {}
-    return {h.lower(): v for h, v in data.items()}
+    normalized = {h.lower(): v for h, v in data.items()}
+    try:
+        import db
+        db.set_provider_cache_status("torbox", set(normalized), hashes)
+    except Exception:
+        pass
+    return normalized
 
 
 def title_exists(title: str) -> bool:

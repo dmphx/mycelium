@@ -130,4 +130,44 @@ export interface WantedEpisode {
   attempt_count: number;
   first_attempted: string | null;
   last_attempted: string | null;
+  next_retry_at: string | null;
+  last_search_status?: string | null;
+  last_search_sources?: Record<string, number>;
+  last_search_counts?: Record<string, number>;
+  chosen_source?: string | null;
+  last_search_error?: string | null;
+  last_search_at?: string | null;
+}
+
+export interface SearchCandidate {
+  info_hash: string;
+  protocol: string;
+  title: string | null;
+  source: string | null;
+  quality: string | null;
+  size_gb: number | null;
+  seeders: number | null;
+  rank_order: number | null;
+  cached_provider: string | null;
+  state: string;
+  reject_reason: string | null;
+  file_id: number | null;
+  file_name: string | null;
+  last_seen: string;
+  last_tried: string | null;
+}
+
+export interface SearchTrace {
+  run: {
+    id: number;
+    content_key: string;
+    status: string;
+    sources: Record<string, number>;
+    counts: Record<string, number>;
+    chosen_hash: string | null;
+    chosen_source: string | null;
+    error: string | null;
+    started_at: string;
+  } | null;
+  candidates: SearchCandidate[];
 }

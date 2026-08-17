@@ -294,6 +294,97 @@ CREATE TABLE IF NOT EXISTS createtorrent_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_createtorrent_ts ON createtorrent_log(ts);
+
+CREATE TABLE IF NOT EXISTS search_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_key    TEXT    NOT NULL,
+    title          TEXT,
+    media_type     TEXT    NOT NULL,
+    season         INTEGER,
+    episode        INTEGER,
+    trigger_name   TEXT    NOT NULL DEFAULT 'unknown',
+    status         TEXT    NOT NULL DEFAULT 'running',
+    sources_json   TEXT,
+    counts_json    TEXT,
+    chosen_hash    TEXT,
+    chosen_source  TEXT,
+    error          TEXT,
+    started_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    finished_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_runs_content_time
+    ON search_runs(content_key, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS source_query_stats (
+    source          TEXT    PRIMARY KEY,
+    query_count     INTEGER NOT NULL DEFAULT 0,
+    success_count   INTEGER NOT NULL DEFAULT 0,
+    result_count    INTEGER NOT NULL DEFAULT 0,
+    error_count     INTEGER NOT NULL DEFAULT 0,
+    total_latency   REAL    NOT NULL DEFAULT 0,
+    consecutive_errors INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    last_queried    TEXT,
+    last_success    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS release_candidates (
+    content_key     TEXT    NOT NULL,
+    info_hash       TEXT    NOT NULL,
+    protocol        TEXT    NOT NULL DEFAULT 'torrent',
+    magnet          TEXT,
+    nzb_url         TEXT,
+    title           TEXT,
+    source          TEXT,
+    quality         TEXT,
+    size_gb         REAL,
+    seeders         INTEGER,
+    rank_order      INTEGER,
+    cached_provider TEXT,
+    state           TEXT    NOT NULL DEFAULT 'candidate',
+    reject_reason   TEXT,
+    file_id         INTEGER,
+    file_name       TEXT,
+    first_seen      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    last_seen       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    last_tried      TEXT,
+    PRIMARY KEY (content_key, info_hash, protocol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_candidates_ready
+    ON release_candidates(content_key, state, rank_order, last_seen DESC);
+
+CREATE TABLE IF NOT EXISTS identity_repairs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    token          TEXT    NOT NULL,
+    old_imdb_id    TEXT,
+    new_imdb_id    TEXT,
+    old_season     INTEGER,
+    new_season     INTEGER,
+    old_episode    INTEGER,
+    new_episode    INTEGER,
+    method         TEXT    NOT NULL,
+    confidence     REAL    NOT NULL,
+    status         TEXT    NOT NULL,
+    detail         TEXT,
+    created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_repairs_token_time
+    ON identity_repairs(token, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_cache_status (
+    provider       TEXT    NOT NULL,
+    info_hash      TEXT    NOT NULL,
+    cached         INTEGER NOT NULL,
+    checked_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    expires_at     TEXT    NOT NULL,
+    PRIMARY KEY (provider, info_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_cache_expiry
+    ON provider_cache_status(provider, expires_at);
 """
 
 
@@ -370,6 +461,7 @@ def _migrate() -> None:
             ("protocol", "TEXT NOT NULL DEFAULT 'torrent'"),
             ("nzb_url", "TEXT"),
             ("usenet_id", "INTEGER"),
+            ("identity_checked_at", "TEXT"),
         ]:
             if col not in vi_cols:
                 try:
@@ -476,6 +568,10 @@ _PRUNE_TARGETS: dict[str, str] = {
     "webhook_events":   "received_at",
     "metric_events":    "created_at",
     "playability_state": "updated_at",
+    "search_runs":       "started_at",
+    "release_candidates": "last_seen",
+    "identity_repairs":  "created_at",
+    "provider_cache_status": "expires_at",
 }
 
 
@@ -744,6 +840,81 @@ def get_all_wanted_episodes() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_wanted_episodes_with_search() -> list[dict]:
+    """Wanted rows enriched with retry timing and the latest search summary."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT w.*,
+                      CASE
+                        WHEN w.status!='wanted' THEN NULL
+                        WHEN w.attempt_count=0 OR w.last_attempted IS NULL THEN datetime('now')
+                        WHEN w.air_date >= date('now','-3 days') AND w.attempt_count BETWEEN 1 AND 3
+                          THEN datetime(w.last_attempted,'+30 minutes')
+                        WHEN w.air_date >= date('now','-3 days') AND w.attempt_count BETWEEN 4 AND 8
+                          THEN datetime(w.last_attempted,'+2 hours')
+                        WHEN w.air_date >= date('now','-3 days')
+                          THEN datetime(w.last_attempted,'+6 hours')
+                        WHEN w.attempt_count=1 THEN datetime(w.last_attempted,'+2 hours')
+                        WHEN w.attempt_count=2 THEN datetime(w.last_attempted,'+6 hours')
+                        WHEN w.attempt_count=3 THEN datetime(w.last_attempted,'+12 hours')
+                        ELSE datetime(w.last_attempted,'+24 hours')
+                      END AS next_retry_at,
+                      sr.status AS last_search_status,
+                      sr.sources_json AS last_search_sources,
+                      sr.counts_json AS last_search_counts,
+                      sr.chosen_source AS chosen_source,
+                      sr.error AS last_search_error,
+                      sr.started_at AS last_search_at
+               FROM wanted_episodes w
+               LEFT JOIN search_runs sr ON sr.id=(
+                 SELECT id FROM search_runs
+                 WHERE content_key=(w.imdb_id || ':S' || printf('%02d', w.season) ||
+                                    'E' || printf('%02d', w.episode))
+                 ORDER BY id DESC LIMIT 1
+               )
+               ORDER BY w.title, w.season, w.episode"""
+        ).fetchall()
+    import json
+    result = []
+    for raw in rows:
+        row = dict(raw)
+        for field in ("last_search_sources", "last_search_counts"):
+            value = row.get(field)
+            try:
+                row[field] = json.loads(value) if value else {}
+            except ValueError:
+                row[field] = {}
+        result.append(row)
+    return result
+
+
+def get_fresh_wanted_episodes(limit: int = 12,
+                              window_days: int = 3) -> list[dict]:
+    """Return newly aired episodes due for the fast release-window lane."""
+    cutoff = f"-{max(1, int(window_days))} days"
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM wanted_episodes
+               WHERE status='wanted'
+                 AND (air_date IS NULL OR air_date <= date('now'))
+                 AND (air_date IS NULL OR air_date >= date('now', ?))
+                 AND (
+                   attempt_count=0 OR last_attempted IS NULL OR
+                   (attempt_count BETWEEN 1 AND 3 AND
+                    last_attempted <= datetime('now','-30 minutes')) OR
+                   (attempt_count BETWEEN 4 AND 8 AND
+                    last_attempted <= datetime('now','-2 hours')) OR
+                   (attempt_count>=9 AND
+                    last_attempted <= datetime('now','-6 hours'))
+                 )
+               ORDER BY CASE WHEN air_date=date('now') THEN 0 ELSE 1 END,
+                        attempt_count ASC, COALESCE(air_date, '') DESC
+               LIMIT ?""",
+            (cutoff, max(1, int(limit))),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def mark_episode_status(imdb_id: str, season: int, episode: int, status: str) -> None:
     with _connect() as conn:
         conn.execute(
@@ -751,6 +922,16 @@ def mark_episode_status(imdb_id: str, season: int, episode: int, status: str) ->
             (status, imdb_id, season, episode),
         )
         conn.commit()
+
+
+def get_wanted_episode(imdb_id: str, season: int, episode: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM wanted_episodes
+               WHERE imdb_id=? AND season=? AND episode=? LIMIT 1""",
+            (imdb_id, season, episode),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def increment_episode_attempt(episode_id: int) -> None:
@@ -1056,6 +1237,34 @@ def get_all_virtual_items() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_virtual_items_missing_identity(limit: int = 500) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM virtual_items
+               WHERE imdb_id IS NULL OR imdb_id='' OR imdb_id NOT GLOB 'tt[0-9]*'
+                  OR (media_type='series' AND (season IS NULL OR episode IS NULL))
+               ORDER BY COALESCE(identity_checked_at, '') ASC,
+                        CASE WHEN last_played IS NULL THEN 1 ELSE 0 END,
+                        last_played DESC, created_at DESC
+               LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_identity_gap_counts() -> dict:
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN imdb_id IS NULL OR imdb_id='' OR imdb_id NOT GLOB 'tt[0-9]*'
+                          THEN 1 ELSE 0 END) AS missing_imdb,
+                 SUM(CASE WHEN media_type='series' AND season IS NULL THEN 1 ELSE 0 END) AS missing_season,
+                 SUM(CASE WHEN media_type='series' AND episode IS NULL THEN 1 ELSE 0 END) AS missing_episode
+               FROM virtual_items"""
+        ).fetchone()
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
 def get_virtual_item_spore_index() -> list[dict]:
     """Return only fields needed by the spore status sweep."""
     with _connect() as conn:
@@ -1108,6 +1317,32 @@ def update_virtual_item_imdb(token: str, imdb_id: str) -> None:
         conn.commit()
 
 
+def update_virtual_item_identity(token: str, imdb_id: str | None,
+                                 season: int | None,
+                                 episode: int | None) -> None:
+    """Persist a conservatively resolved identity for one virtual item."""
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE virtual_items
+               SET imdb_id=COALESCE(?, imdb_id),
+                   season=COALESCE(?, season),
+                   episode=COALESCE(?, episode)
+               WHERE token=?""",
+            (imdb_id, season, episode, token),
+        )
+        conn.commit()
+
+
+def touch_virtual_identity_check(token: str) -> None:
+    """Advance the repair cursor even when no safe identity match was found."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE virtual_items SET identity_checked_at=datetime('now') WHERE token=?",
+            (token,),
+        )
+        conn.commit()
+
+
 def update_virtual_debrid_provider(token: str, provider: str) -> None:
     with _connect() as conn:
         conn.execute("UPDATE virtual_items SET debrid_provider=? WHERE token=?", (provider, token))
@@ -1124,6 +1359,18 @@ def update_virtual_usenet_id(token: str, usenet_id: int | None) -> None:
     with _connect() as conn:
         conn.execute("UPDATE virtual_items SET usenet_id=? WHERE token=?",
                       (usenet_id, token))
+        conn.commit()
+
+
+def update_virtual_protocol(token: str, protocol: str,
+                            nzb_url: str | None = None,
+                            usenet_id: int | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE virtual_items SET protocol=?, nzb_url=?, usenet_id=?
+               WHERE token=?""",
+            (protocol, nzb_url, usenet_id, token),
+        )
         conn.commit()
 
 
@@ -1904,3 +2151,292 @@ def get_createtorrent_log(since_ts: float) -> list[tuple[float, str]]:
             (since_ts,),
         ).fetchall()
     return [(r["ts"], r["reason"]) for r in rows]
+
+
+# Search observability and durable alternate candidates
+
+def start_search_run(content_key: str, title: str, media_type: str,
+                     season: int | None, episode: int | None,
+                     trigger_name: str) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO search_runs
+               (content_key, title, media_type, season, episode, trigger_name)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (content_key, title, media_type, season, episode, trigger_name),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def finish_search_run(run_id: int, status: str, sources: dict,
+                      counts: dict, error: str | None = None,
+                      chosen_hash: str | None = None,
+                      chosen_source: str | None = None) -> None:
+    import json
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE search_runs SET status=?, sources_json=?, counts_json=?,
+                   error=?, chosen_hash=COALESCE(?, chosen_hash),
+                   chosen_source=COALESCE(?, chosen_source),
+                   finished_at=strftime('%Y-%m-%d %H:%M:%S','now')
+               WHERE id=?""",
+            (status, json.dumps(sources, sort_keys=True),
+             json.dumps(counts, sort_keys=True), error,
+             chosen_hash, chosen_source, run_id),
+        )
+        conn.commit()
+
+
+def mark_latest_search_choice(content_key: str, info_hash: str,
+                              source: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE search_runs SET chosen_hash=?, chosen_source=?
+               WHERE id=(SELECT id FROM search_runs WHERE content_key=?
+                         ORDER BY id DESC LIMIT 1)""",
+            (info_hash.lower(), source, content_key),
+        )
+        conn.commit()
+
+
+def record_source_query(source: str, result_count: int, latency_seconds: float,
+                        success: bool, error: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO source_query_stats
+               (source, query_count, success_count, result_count, error_count,
+                total_latency, consecutive_errors, last_error, last_queried, last_success)
+               VALUES (?, 1, ?, ?, ?, ?, ?, ?,
+                       strftime('%Y-%m-%d %H:%M:%S','now'),
+                       CASE WHEN ? THEN strftime('%Y-%m-%d %H:%M:%S','now') ELSE NULL END)
+               ON CONFLICT(source) DO UPDATE SET
+                 query_count=query_count+1,
+                 success_count=success_count+excluded.success_count,
+                 result_count=result_count+excluded.result_count,
+                 error_count=error_count+excluded.error_count,
+                 total_latency=total_latency+excluded.total_latency,
+                 consecutive_errors=CASE WHEN ? THEN 0 ELSE consecutive_errors+1 END,
+                 last_error=excluded.last_error,
+                 last_queried=excluded.last_queried,
+                 last_success=COALESCE(excluded.last_success, last_success)""",
+            (source, int(success), int(result_count), int(not success),
+             float(latency_seconds), 0 if success else 1, error,
+             int(success), int(success)),
+        )
+        conn.commit()
+
+
+def get_source_query_stats() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT *,
+                      CASE WHEN query_count > 0 THEN total_latency/query_count ELSE 0 END AS avg_latency,
+                      CASE WHEN query_count > 0 THEN CAST(result_count AS REAL)/query_count ELSE 0 END AS avg_results
+               FROM source_query_stats
+               ORDER BY consecutive_errors ASC,
+                        CASE WHEN query_count > 0 THEN CAST(success_count AS REAL)/query_count ELSE 0 END DESC,
+                        avg_latency ASC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_release_candidates(content_key: str, candidates: list[dict]) -> None:
+    with _connect() as conn:
+        for row in candidates:
+            conn.execute(
+                """INSERT INTO release_candidates
+                   (content_key, info_hash, protocol, magnet, nzb_url, title,
+                    source, quality, size_gb, seeders, rank_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(content_key, info_hash, protocol) DO UPDATE SET
+                     magnet=excluded.magnet,
+                     nzb_url=excluded.nzb_url,
+                     title=excluded.title,
+                     source=excluded.source,
+                     quality=excluded.quality,
+                     size_gb=excluded.size_gb,
+                     seeders=excluded.seeders,
+                     rank_order=excluded.rank_order,
+                     last_seen=strftime('%Y-%m-%d %H:%M:%S','now'),
+                     state=CASE WHEN release_candidates.state='rejected'
+                                THEN 'rejected' ELSE 'candidate' END""",
+                (content_key, row["info_hash"].lower(), row.get("protocol") or "torrent",
+                 row.get("magnet"), row.get("nzb_url"), row.get("title"),
+                 row.get("source"), row.get("quality"), row.get("size_gb"),
+                 row.get("seeders"), row.get("rank_order")),
+            )
+        conn.commit()
+
+
+def mark_candidate_cached(content_key: str, info_hash: str,
+                          provider: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE release_candidates SET cached_provider=?
+               WHERE content_key=? AND info_hash=?""",
+            (provider, content_key, info_hash.lower()),
+        )
+        conn.commit()
+
+
+def mark_candidate_selected(content_key: str, info_hash: str,
+                            source: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE release_candidates SET state='selected', reject_reason=NULL,
+                   last_tried=strftime('%Y-%m-%d %H:%M:%S','now')
+               WHERE content_key=? AND info_hash=?""",
+            (content_key, info_hash.lower()),
+        )
+        conn.commit()
+    mark_latest_search_choice(content_key, info_hash, source)
+
+
+def reject_release_candidate(content_key: str, info_hash: str,
+                             reason: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO release_candidates
+               (content_key, info_hash, state, reject_reason, last_tried)
+               VALUES (?, ?, 'rejected', ?, strftime('%Y-%m-%d %H:%M:%S','now'))
+               ON CONFLICT(content_key, info_hash, protocol) DO UPDATE SET
+                 state='rejected', reject_reason=excluded.reject_reason,
+                 last_tried=excluded.last_tried""",
+            (content_key, info_hash.lower(), reason),
+        )
+        conn.commit()
+
+
+def save_candidate_file_match(content_key: str, info_hash: str,
+                              file_id: int, file_name: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE release_candidates SET file_id=?, file_name=?
+               WHERE content_key=? AND info_hash=?""",
+            (file_id, file_name, content_key, info_hash.lower()),
+        )
+        conn.commit()
+
+
+def get_rejected_candidate_hashes(content_key: str) -> set[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT info_hash FROM release_candidates WHERE content_key=? AND state='rejected'",
+            (content_key,),
+        ).fetchall()
+    return {r["info_hash"].lower() for r in rows}
+
+
+def get_alternate_candidates(content_key: str, limit: int = 5) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM release_candidates
+               WHERE content_key=? AND state!='rejected' AND protocol='torrent'
+                 AND magnet IS NOT NULL
+               ORDER BY CASE WHEN cached_provider='torbox' THEN 0
+                             WHEN cached_provider IS NOT NULL THEN 1 ELSE 2 END,
+                        rank_order ASC, last_seen DESC LIMIT ?""",
+            (content_key, max(1, int(limit))),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_search_trace(content_key: str) -> dict:
+    import json
+    with _connect() as conn:
+        run = conn.execute(
+            "SELECT * FROM search_runs WHERE content_key=? ORDER BY id DESC LIMIT 1",
+            (content_key,),
+        ).fetchone()
+        candidates = conn.execute(
+            """SELECT info_hash, protocol, title, source, quality, size_gb,
+                      seeders, rank_order, cached_provider, state, reject_reason,
+                      file_id, file_name, last_seen, last_tried
+               FROM release_candidates WHERE content_key=?
+               ORDER BY CASE state WHEN 'selected' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
+                        rank_order ASC LIMIT 30""",
+            (content_key,),
+        ).fetchall()
+    run_dict = dict(run) if run else None
+    if run_dict:
+        for key in ("sources_json", "counts_json"):
+            raw = run_dict.pop(key, None)
+            run_dict[key[:-5]] = json.loads(raw) if raw else {}
+    return {"run": run_dict, "candidates": [dict(r) for r in candidates]}
+
+
+def record_identity_repair(token: str, old_imdb_id: str | None,
+                           new_imdb_id: str | None, old_season: int | None,
+                           new_season: int | None, old_episode: int | None,
+                           new_episode: int | None, method: str,
+                           confidence: float, status: str,
+                           detail: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO identity_repairs
+               (token, old_imdb_id, new_imdb_id, old_season, new_season,
+                old_episode, new_episode, method, confidence, status, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (token, old_imdb_id, new_imdb_id, old_season, new_season,
+             old_episode, new_episode, method, confidence, status, detail),
+        )
+        conn.commit()
+
+
+def get_identity_repair_summary() -> dict:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM identity_repairs GROUP BY status"
+        ).fetchall()
+        pending = conn.execute(
+            """SELECT * FROM identity_repairs WHERE status='review'
+               ORDER BY created_at DESC LIMIT 100"""
+        ).fetchall()
+    return {"counts": {r["status"]: r["count"] for r in rows},
+            "review": [dict(r) for r in pending]}
+
+
+def get_provider_cache_status(provider: str,
+                              hashes: list[str]) -> tuple[set[str], set[str]]:
+    """Return fresh known-cached and known-uncached hash sets."""
+    if not hashes:
+        return set(), set()
+    normalized = list(dict.fromkeys(value.lower() for value in hashes if value))
+    cached: set[str] = set()
+    uncached: set[str] = set()
+    with _connect() as conn:
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""SELECT info_hash, cached FROM provider_cache_status
+                    WHERE provider=? AND expires_at > datetime('now')
+                      AND info_hash IN ({placeholders})""",
+                [provider, *chunk],
+            ).fetchall()
+            for row in rows:
+                (cached if row["cached"] else uncached).add(row["info_hash"])
+    return cached, uncached
+
+
+def set_provider_cache_status(provider: str, cached_hashes: set[str],
+                              checked_hashes: list[str],
+                              positive_ttl_seconds: int = 3600,
+                              negative_ttl_seconds: int = 600) -> None:
+    cached_lower = {value.lower() for value in cached_hashes}
+    with _connect() as conn:
+        for info_hash in dict.fromkeys(value.lower() for value in checked_hashes if value):
+            is_cached = info_hash in cached_lower
+            ttl = positive_ttl_seconds if is_cached else negative_ttl_seconds
+            conn.execute(
+                """INSERT INTO provider_cache_status
+                   (provider, info_hash, cached, checked_at, expires_at)
+                   VALUES (?, ?, ?, strftime('%Y-%m-%d %H:%M:%S','now'),
+                           datetime('now', ?))
+                   ON CONFLICT(provider, info_hash) DO UPDATE SET
+                     cached=excluded.cached, checked_at=excluded.checked_at,
+                     expires_at=excluded.expires_at""",
+                (provider, info_hash, int(is_cached), f"+{ttl} seconds"),
+            )
+        conn.commit()

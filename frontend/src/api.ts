@@ -10,6 +10,7 @@ import type {
   WantedMovie,
   WantedEpisode,
   PersonDetail,
+  SearchTrace,
 } from './types';
 
 export const csrfToken = (): string => {
@@ -241,6 +242,18 @@ export const api = {
   wantedMovies: () => http<{ items: WantedMovie[] }>('/ui/api/wanted-movies'),
   wantedRecheck: () => http<{ ok: boolean; message?: string }>('/ui/api/wanted-recheck', { method: 'POST' }),
   wantedEpisodes: () => http<{ items: WantedEpisode[] }>('/ui/api/wanted-episodes'),
+  wantedEpisodeSearch: (id: number) =>
+    http<{ ok: boolean; message?: string }>(`/ui/api/wanted-episodes/${id}/search`, {
+      method: 'POST',
+    }),
+  searchTrace: (contentKey: string) =>
+    http<SearchTrace>(`/ui/api/search-trace/${encodeURIComponent(contentKey)}`),
+  playabilityState: () => http<{ items: any[] }>('/ui/api/playability-state'),
+  reResolve: (token: string) =>
+    http<{ ok: boolean; resolved: boolean; title?: string; hint?: string }>(
+      `/ui/api/virtual-items/${encodeURIComponent(token)}/re-resolve`,
+      { method: 'POST' },
+    ),
 
   // Failed processing requests
   failedRequests: () => http<{ items: any[] }>('/ui/api/requests/failed'),

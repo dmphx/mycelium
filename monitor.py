@@ -3,6 +3,7 @@
 import glob
 import logging
 import os
+import threading
 from datetime import date
 
 import blacklist
@@ -13,12 +14,15 @@ import tmdb
 import torbox
 import torrentio
 import zilean
+import search_engine
 import settings as _settings
+import config as _cfg
 from config import MEDIA_PATH
 
 log = logging.getLogger(__name__)
 
 _TODAY = lambda: date.today().isoformat()  # noqa: E731
+_wanted_search_lock = threading.Lock()
 
 
 # ── Filesystem helpers ────────────────────────────────────────────────────────
@@ -168,12 +172,29 @@ def refresh_monitored_series() -> None:
     log.info("Monitor: series metadata refresh complete")
 
 
-def search_wanted_episodes() -> None:
+def search_wanted_episodes(fresh_only: bool = False) -> None:
     """Retry a bounded, age-aware batch of missing episodes."""
-    log.info("Monitor: starting wanted episode search")
+    if not _wanted_search_lock.acquire(blocking=False):
+        log.info("Monitor: wanted episode search already running, skipping overlap")
+        return
+    try:
+        _search_wanted_episodes_locked(fresh_only=fresh_only)
+    finally:
+        _wanted_search_lock.release()
+
+
+def _search_wanted_episodes_locked(fresh_only: bool = False) -> None:
+    lane = "fresh" if fresh_only else "regular"
+    log.info("Monitor: starting %s wanted episode search", lane)
     today = _TODAY()
-    episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
-    retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
+    if fresh_only:
+        episode_batch = max(1, int(_settings.get(
+            "WANTED_FRESH_BATCH", _cfg.WANTED_FRESH_BATCH)))
+        retry_delay = max(0.0, float(os.environ.get(
+            "WANTED_FRESH_DELAY_SEC", "1") or "1"))
+    else:
+        episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
+        retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
 
     reconciled = db.reconcile_wanted_episodes()
     if reconciled:
@@ -186,7 +207,14 @@ def search_wanted_episodes() -> None:
     import processor
     import time
     catbox_mode = _settings.get("CATBOX_MODE", False)
-    wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
+    if fresh_only:
+        wanted = db.get_fresh_wanted_episodes(
+            limit=episode_batch,
+            window_days=int(_settings.get(
+                "WANTED_FRESH_WINDOW_DAYS", _cfg.WANTED_FRESH_WINDOW_DAYS)),
+        )
+    else:
+        wanted = db.get_wanted_episodes(max_attempts=10_000, limit=episode_batch)
     for ep in wanted:
         air_date = ep.get("air_date")
         if air_date and air_date > today:
@@ -215,7 +243,7 @@ def search_wanted_episodes() -> None:
         if retry_delay > 0:
             time.sleep(retry_delay)
 
-    log.info("Monitor: wanted episode search complete")
+    log.info("Monitor: %s wanted episode search complete", lane)
 
 
 def run_series_check() -> None:
@@ -253,42 +281,10 @@ def _retry_episode(ep: dict) -> bool:
     log.info("Monitor: searching %s S%02dE%02d (attempt %d)", title, season, episode, ep["attempt_count"] + 1)
     db.increment_episode_attempt(ep["id"])
 
-    import concurrent.futures
-    import indexer_backoff
-    import mediafusion as _mf
-    import prowlarr as _pa
-
-    def _zilean():
-        if not _settings.get("ZILEAN_ENABLED", False):
-            return []
-        return zilean.fetch_streams(imdb_id, season=season, episode=episode)
-
-    def _torrentio():
-        if indexer_backoff.in_cooldown():
-            log.info("Monitor: Torrentio is cooling down; continuing with other providers")
-            return []
-        return torrentio.fetch_streams(
-            "series", imdb_id, season=season, episode=episode)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        futures = [
-            ex.submit(_zilean),
-            ex.submit(_torrentio),
-            ex.submit(_mf.fetch_streams, "series", imdb_id, season, episode),
-        ]
-        groups = [future.result() for future in futures]
-
-    def _merged_candidates(source_groups: list[list]) -> list:
-        seen_hashes: set[str] = set()
-        merged: list = []
-        for group in source_groups:
-            for stream in group:
-                if stream.info_hash not in seen_hashes:
-                    seen_hashes.add(stream.info_hash)
-                    merged.append(stream)
-        return blacklist.filter_candidates(torrentio.rank_streams(merged))
-
-    candidates = _merged_candidates(groups)
+    candidates = search_engine.search_candidates(
+        "series", imdb_id, title, season=season, episode=episode,
+        trigger="wanted_episode", prowlarr_on_cache_miss=True)
+    ckey = search_engine.content_key(imdb_id, season, episode)
 
     # In catbox mode: write a lazy .strm for the best cached release.
     # TorBox add is deferred until first playback  -  no quota consumed here.
@@ -297,23 +293,14 @@ def _retry_episode(ep: dict) -> bool:
 
         def _cached_torrents(items: list) -> list:
             torrents = [s for s in items if not s.is_usenet]
-            hashes = torbox.check_cached([s.info_hash for s in torrents]) if torrents else set()
+            cache_results = search_engine.cache_map(ckey, torrents)
+            hashes = cache_results.get("torbox", set())
             cached = [s for s in torrents if s.info_hash in hashes]
             return release_sanity.filter_cached(
                 cached, kind="episode", season=season, episode=episode,
                 imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
 
         cached = _cached_torrents(candidates)
-        if not cached:
-            # Prowlarr is the expensive live fan-out. Only use it when the fast
-            # cache indexes cannot already satisfy the episode, and include the
-            # title because several Newznab indexers ignore imdb-only TV queries.
-            prowlarr_streams = _pa.fetch_streams(
-                "series", imdb_id, season=season, episode=episode, title=title)
-            groups.append(prowlarr_streams)
-            candidates = _merged_candidates(groups)
-            cached = _cached_torrents(candidates)
-
         best = cached[0] if cached else None
         if best:
             import strm_generator
@@ -330,6 +317,7 @@ def _retry_episode(ep: dict) -> bool:
                 preload_first=False,
             )
             if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
+                search_engine.mark_selected(ckey, best, "torbox")
                 db.mark_episode_status(imdb_id, season, episode, "found")
                 log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
                 return True
@@ -357,6 +345,7 @@ def _retry_episode(ep: dict) -> bool:
                     usenet_id=(result or {}).get("id"),
                 )
                 if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
+                    search_engine.mark_selected(ckey, best_nzb, "torbox-usenet")
                     db.mark_episode_status(imdb_id, season, episode, "found")
                     log.info("Monitor: lazy NZB strm created for %s S%02dE%02d",
                              title, season, episode)
@@ -371,10 +360,6 @@ def _retry_episode(ep: dict) -> bool:
                  title, season, episode)
         return False
 
-    # Non-lazy mode also consults Prowlarr before choosing a download.
-    groups.append(_pa.fetch_streams(
-        "series", imdb_id, season=season, episode=episode, title=title))
-    candidates = _merged_candidates(groups)
     if not candidates:
         log.info("Monitor: no acceptable candidates for %s S%02dE%02d (still wanted)",
                  title, season, episode)
@@ -384,7 +369,8 @@ def _retry_episode(ep: dict) -> bool:
     # so they get prioritised after cached torrents. That's the desired order:
     # cached torrent (instant) > NZB (downloaded fresh, usually fast) > uncached torrent.
     torrent_hashes = [s.info_hash for s in candidates if not s.is_usenet]
-    cached_hashes = torbox.check_cached(torrent_hashes) if torrent_hashes else set()
+    cached_hashes = search_engine.cache_map(ckey, candidates).get("torbox", set()) \
+        if torrent_hashes else set()
     cached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes]
     # Drop any cached torrent whose real TorBox files aren't this episode (e.g. a
     # full-season/complete-series pack with no identifiable SxxEyy file), so we
@@ -404,6 +390,7 @@ def _retry_episode(ep: dict) -> bool:
                 continue
             try:
                 torbox.add_nzb(stream.nzb_url, name=stream.title, reason="series-monitor-nzb")
+                search_engine.mark_selected(ckey, stream, "torbox-usenet")
                 log.info("Monitor: added NZB %s S%02dE%02d (%s)",
                          title, season, episode, stream.source)
                 return True
@@ -419,6 +406,7 @@ def _retry_episode(ep: dict) -> bool:
         # Skip createtorrent if already in the TorBox library.
         existing = torbox.find_by_hash(stream.info_hash)
         if existing and torbox._is_ready(existing):
+            search_engine.mark_selected(ckey, stream, "torbox")
             log.info("Monitor: %s S%02dE%02d already in TorBox library", title, season, episode)
             return True
         try:
@@ -429,6 +417,7 @@ def _retry_episode(ep: dict) -> bool:
                          title, season, episode)
                 return False
             log.info("Monitor: added %s S%02dE%02d", title, season, episode)
+            search_engine.mark_selected(ckey, stream, "torbox")
             return True
         except torbox.RateLimited:
             raise processor.RateLimited()

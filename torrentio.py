@@ -17,6 +17,7 @@ from config import (
     EXCLUDE_UNDERSIZED_RELEASES,
     MAX_SIZE_GB,
     MIN_SEEDERS,
+    PLAYBACK_PROFILE,
     PREFER_HEVC,
     PREFER_WEBDL,
     QUALITY_PREFERENCE,
@@ -44,6 +45,13 @@ _BLURAY_RE = re.compile(r"\b(bluray|blu-ray|bdrip|brrip)\b", re.IGNORECASE)
 _CAM_RE = re.compile(r"\b(cam|camrip|hdcam|ts|telesync|hdts|scr|screener|dvdscr|workprint|r5)\b", re.IGNORECASE)
 _WEBDL_RE = re.compile(r"\b(web-?dl|webrip|web)\b", re.IGNORECASE)
 _HEVC_RE  = re.compile(r"\b(hevc|x265|h\.?265)\b", re.IGNORECASE)
+_H264_RE  = re.compile(r"\b(h\.?264|x264|avc)\b", re.IGNORECASE)
+_AV1_RE   = re.compile(r"\bav1\b", re.IGNORECASE)
+_MP4_RE   = re.compile(r"\bmp4\b", re.IGNORECASE)
+_AAC_RE   = re.compile(r"\baac\b", re.IGNORECASE)
+_APPLE_AUDIO_RE = re.compile(r"\b(eac3|e-ac-?3|ddp|dd\+|ac3|aac)\b", re.IGNORECASE)
+_TRANSCODE_AUDIO_RE = re.compile(r"\b(truehd|dts(?:-?hd)?|flac)\b", re.IGNORECASE)
+_IMAGE_SUB_RE = re.compile(r"\b(pgs|hdmv)\b", re.IGNORECASE)
 # Dolby Vision without an HDR10 base layer (Profile 5). The release name has
 # DV/DoVi but no HDR10 keyword alongside it. Profile 8 (DV + HDR10) is safe
 # and is NOT matched here.
@@ -309,6 +317,7 @@ def rank_streams(
     min_seeders = _settings.get("MIN_SEEDERS", MIN_SEEDERS)
     max_size_gb = _settings.get("MAX_SIZE_GB", MAX_SIZE_GB)
     audio_pref = _settings.get("AUDIO_LANGUAGE_PREFERENCE", AUDIO_LANGUAGE_PREFERENCE)
+    playback_profile = str(_settings.get("PLAYBACK_PROFILE", PLAYBACK_PROFILE) or "balanced").lower()
 
     candidates = streams if allow_4k else [s for s in streams if s.quality != "2160p"]
     if not candidates:
@@ -424,12 +433,35 @@ def rank_streams(
                 return idx
         return len(audio_pref) + 1
 
+    def _compat_score(s: TorrentioStream) -> int:
+        """Lower is better for the configured dominant playback client."""
+        blob = f"{s.name} {s.title}"
+        if playback_profile == "apple_tv":
+            score = 0
+            score += 0 if (_H264_RE.search(blob) or _HEVC_RE.search(blob)) else 2
+            score += 0 if _APPLE_AUDIO_RE.search(blob) else 1
+            score += 2 if _TRANSCODE_AUDIO_RE.search(blob) else 0
+            score += 2 if _AV1_RE.search(blob) else 0
+            score += 1 if _IMAGE_SUB_RE.search(blob) else 0
+            score -= 1 if _MP4_RE.search(blob) else 0
+            return score
+        if playback_profile == "web":
+            score = 0
+            score += 0 if _H264_RE.search(blob) else 2
+            score += 0 if _AAC_RE.search(blob) else 1
+            score += 2 if (_HEVC_RE.search(blob) or _AV1_RE.search(blob)) else 0
+            score += 1 if _IMAGE_SUB_RE.search(blob) else 0
+            score -= 1 if _MP4_RE.search(blob) else 0
+            return score
+        return 0
+
     def sort_key(s: TorrentioStream) -> tuple:
         blob = f"{s.name} {s.title}"
         return (
             0 if prefer_season_pack and s.is_season_pack else 1,
             _quality_rank(s, quality_pref),
             _lang_score(s),
+            _compat_score(s),
             0 if prefer_webdl and _WEBDL_RE.search(blob) else 1,
             0 if prefer_hevc and _HEVC_RE.search(blob) else 1,
             -s.seeders,

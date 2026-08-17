@@ -99,6 +99,11 @@ _search_cache: "cachetools.LRUCache[tuple, tuple[float, object]]" = cachetools.L
 _search_cache_lock = threading.Lock()
 _SEARCH_HIT_TTL    = 300    # 5 min: re-check soon if a cached release was found
 _SEARCH_MISS_TTL   = 21600  # 6 h:  nothing cached  -  back off (matches _fail_put below)
+_SEARCH_ERROR_TTL  = 30     # transient source failure must remain quickly retryable
+_next_prepare_cache: "cachetools.TTLCache[str, bool]" = cachetools.TTLCache(
+    maxsize=10000, ttl=3600
+)
+_next_prepare_lock = threading.Lock()
 _token_locks_lock = threading.Lock()
 
 # ── scan/probe burst detection ────────────────────────────────────────────────
@@ -395,7 +400,8 @@ def _rd_get_url(item: dict, rd_id: str) -> str | None:
     return pairs[0][1] if len(pairs) == 1 else None
 
 
-def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
+def _materialize_locked(token: str, allow_readd: bool = True,
+                        alternate_attempts: int = 0) -> str | None:
     item = db.get_virtual_item(token)
     if not item:
         log.warning("Catbox: unknown token %s", token)
@@ -685,6 +691,10 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 log.error("Catbox: release sanity rejected torrent %s for %s (%s)  -  "
                           "keeping .strm, not serving a mislabeled pack",
                           torbox_id, item["title"], _bad)
+                alternate = _try_alternate_release(
+                    token, item, ckey, f"sanity:{_bad}", alternate_attempts)
+                if alternate:
+                    return alternate
                 _fail_put(token, _FAIL_COOLDOWN_SEC)
                 if ckey:
                     db.update_playability_fail(ckey, REASON_NO_FILE)
@@ -695,6 +705,9 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 if main:
                     file_id = main["id"]
                     db.update_virtual_file_id(token, file_id)
+                    if ckey and item.get("info_hash"):
+                        db.save_candidate_file_match(
+                            ckey, item["info_hash"], file_id, main.get("name"))
                 elif not (live.get("files")):
                     # TorBox returned the torrent without a files list (common for the
                     # ?id= single-item endpoint).  Use file_id=0 which tells TorBox to
@@ -721,6 +734,9 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
                 if main:
                     file_id = main["id"]
                     db.update_virtual_file_id(token, file_id)
+                    if ckey and item.get("info_hash"):
+                        db.save_candidate_file_match(
+                            ckey, item["info_hash"], file_id, main.get("name"))
                 else:
                     # No confident match.  Do NOT guess (the old largest-file guess
                     # served the wrong episode).  Leave unresolved so it re-scrapes.
@@ -729,6 +745,10 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
 
     if file_id is None or (not file_id and file_id != 0):
         log.error("Catbox: no playable file found for %s  -  keeping .strm, retry later", token)
+        alternate = _try_alternate_release(
+            token, item, ckey, REASON_NO_FILE, alternate_attempts)
+        if alternate:
+            return alternate
         _fail_put(token, _FAIL_COOLDOWN_SEC)
         if ckey:
             db.update_playability_fail(ckey, REASON_NO_FILE)
@@ -744,6 +764,38 @@ def _materialize_locked(token: str, allow_readd: bool = True) -> str | None:
     else:
         _metrics_inc("failed")
     return url
+
+
+def _try_alternate_release(token: str, item: dict, ckey: str | None,
+                           reason: str, alternate_attempts: int) -> str | None:
+    """Reject a bad content-release pairing and try a cached alternate once."""
+    if not ckey or not item.get("info_hash") or alternate_attempts >= 2:
+        return None
+    import search_engine
+    old_hash = item["info_hash"].lower()
+    search_engine.reject(ckey, old_hash, reason)
+    key = (item.get("imdb_id"), item.get("season"), item.get("episode"))
+    with _search_cache_lock:
+        _search_cache.pop(key, None)
+    fresh = search_engine.next_cached_alternate(
+        ckey, item.get("media_type") or "movie", item.get("imdb_id") or "",
+        season=item.get("season"), episode=item.get("episode"))
+    if not fresh:
+        fresh = _search_cached_release(item)
+    if not fresh or fresh is _SEARCH_UNAVAILABLE:
+        return None
+    new_hash, new_magnet, provider = fresh
+    if new_hash.lower() == old_hash:
+        return None
+    log.warning("Catbox: switching %s from rejected hash %s to alternate %s",
+                item.get("title"), old_hash, new_hash)
+    db.update_virtual_item_upgrade(
+        token, new_hash, new_magnet, None, f"alternate/{provider}")
+    db.update_virtual_protocol(token, "torrent")
+    db.update_virtual_debrid_provider(token, provider)
+    invalidate_url_cache(token)
+    return _materialize_locked(
+        token, allow_readd=True, alternate_attempts=alternate_attempts + 1)
 
 
 def _metrics_inc(result: str) -> None:
@@ -792,129 +844,67 @@ def _search_cached_release(item: dict) -> object:
                       imdb_id, key[1:])
             return result
     result = _search_best_cached_release(item)
-    ttl = _SEARCH_HIT_TTL if result and result is not _SEARCH_UNAVAILABLE else _SEARCH_MISS_TTL
+    if result is _SEARCH_UNAVAILABLE:
+        ttl = _SEARCH_ERROR_TTL
+    else:
+        ttl = _SEARCH_HIT_TTL if result else _SEARCH_MISS_TTL
     with _search_cache_lock:
         _search_cache[key] = (now + ttl, result)
     return result
 
 
-def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
-    """Search Torrentio for the best currently-cached release for this item.
+def _search_best_cached_release(item: dict) -> tuple[str, str, str] | None | object:
+    """Search all configured catalogs for the best cached release.
 
     Returns:
-      (info_hash, magnet)   -  found a cached release
+      (info_hash, magnet, provider) - found a cached release
       None                  -  searched OK, nothing cached right now
       _SEARCH_UNAVAILABLE   -  couldn't search (no imdb_id, network error)  -  do NOT remove .strm
     """
     imdb_id = item.get("imdb_id")
     if not imdb_id:
-        # Try to resolve imdb_id from TMDB using title + year, then persist it.
-        try:
-            import tmdb as _tmdb
-            kind = "movie" if item.get("media_type") == "movie" else "tv"
-            title = item.get("title") or ""
-            year = item.get("year")
-            results = _tmdb._get("/search/" + ("movie" if kind == "movie" else "tv"),
-                                  params={"query": title, "year": year or ""}) or {}
-            hits = results.get("results") or []
-            if hits:
-                tmdb_id = hits[0]["id"]
-                imdb_id = _tmdb.tmdb_to_imdb(tmdb_id, media_type=kind)
-                if imdb_id:
-                    db.update_virtual_item_imdb(item["token"], imdb_id)
-                    log.info("Catbox search: resolved imdb_id %s for %s via TMDB",
-                             imdb_id, title)
-        except Exception as exc:
-            log.warning("Catbox search: TMDB lookup failed for %s: %s", item.get("title"), exc)
-    if not imdb_id:
         log.warning("Catbox search: no imdb_id for %s  -  keeping .strm, will retry later",
                     item["title"])
         return _SEARCH_UNAVAILABLE
     try:
-        import concurrent.futures
-        import torrentio
-        import mediafusion as _mediafusion
-        import prowlarr as _prowlarr
-        import debrid
-        import blacklist
+        import release_sanity
+        import search_engine
         media_type = item["media_type"]
         season = item.get("season")
         episode = item.get("episode")
-        import zilean as _zilean
-
-        # Run all four scrapers in parallel so total latency caps at the
-        # slowest single scraper instead of summing them.
-        def _fetch_zilean():
-            if not _settings.get("ZILEAN_ENABLED", False):
-                return []
-            return _zilean.fetch_streams(imdb_id, season=season, episode=episode)
-
-        def _fetch_torrentio():
-            return torrentio.fetch_streams(
-                "movie" if media_type == "movie" else "series",
-                imdb_id, season=season, episode=episode,
-            )
-
-        def _fetch_mediafusion():
-            return _mediafusion.fetch_streams(
-                "movie" if media_type == "movie" else "series",
-                imdb_id, season=season, episode=episode,
-            )
-
-        def _fetch_prowlarr():
-            return _prowlarr.fetch_streams(
-                "movie" if media_type == "movie" else "series",
-                imdb_id, season=season, episode=episode,
-                title=item.get("title"),
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            f_zilean = ex.submit(_fetch_zilean)
-            f_torrentio = ex.submit(_fetch_torrentio)
-            f_mediafusion = ex.submit(_fetch_mediafusion)
-            f_prowlarr = ex.submit(_fetch_prowlarr)
-            zilean_streams = f_zilean.result()
-            torrentio_streams = f_torrentio.result()
-            mediafusion_streams = f_mediafusion.result()
-            prowlarr_streams = f_prowlarr.result()
-
-        log.info("Catbox search: Zilean=%d Torrentio=%d MediaFusion=%d Prowlarr=%d stream(s) for %s (%s)",
-                 len(zilean_streams), len(torrentio_streams),
-                 len(mediafusion_streams), len(prowlarr_streams),
-                 item.get("title"), imdb_id)
-        # Merge: dedup by info_hash across all four sources, preserve order
-        # (Zilean → Torrentio → MediaFusion → Prowlarr) so the more-trusted
-        # DMM caches come first.
-        seen_hashes: set = set()
-        streams: list = []
-        for src in (zilean_streams, torrentio_streams, mediafusion_streams, prowlarr_streams):
-            for s in src:
-                if s.info_hash not in seen_hashes:
-                    seen_hashes.add(s.info_hash)
-                    streams.append(s)
-        log.info("Catbox search: %d stream(s) total after merge for %s",
-                 len(streams), item.get("title"))
-        if not streams:
-            return None
-        ranked = torrentio.rank_streams(streams)
-        ranked = blacklist.filter_candidates(ranked)
-        log.info("Catbox search: %d candidate(s) after ranking/filter for %s",
-                 len(ranked), item.get("title"))
+        ranked = search_engine.search_candidates(
+            "movie" if media_type == "movie" else "series",
+            imdb_id, item.get("title") or "", season=season, episode=episode,
+            trigger="catbox_recovery")
         if not ranked:
             return None
-        hashes = [s.info_hash for s in ranked]
-        cache_results = debrid.check_cached_multi(hashes)
+        ckey = search_engine.content_key(imdb_id, season, episode)
+        cache_results = search_engine.cache_map(ckey, ranked)
         rd_cached = cache_results.get("realdebrid", set())
         tb_cached = cache_results.get("torbox", set())
         log.info("Catbox search: RD=%d TB=%d cached out of %d for %s",
                  len(rd_cached), len(tb_cached), len(ranked), item.get("title"))
-        # RD first, TorBox fallback
-        for s in ranked:
-            if s.info_hash in rd_cached:
-                return s.info_hash.lower(), s.magnet, "realdebrid"
-        for s in ranked:
-            if s.info_hash in tb_cached:
-                return s.info_hash.lower(), s.magnet, "torbox"
+
+        torbox_candidates = [s for s in ranked if s.info_hash in tb_cached]
+        if torbox_candidates:
+            kind = ("movie" if media_type == "movie" else
+                    "episode" if season is not None and episode is not None else
+                    "season_pack")
+            before_sanity = {s.info_hash for s in torbox_candidates}
+            torbox_candidates = release_sanity.filter_cached(
+                torbox_candidates, kind=kind, season=season, episode=episode,
+                imdb_id=imdb_id, label=item.get("title") or ckey)
+            after_sanity = {s.info_hash for s in torbox_candidates}
+            for rejected_hash in before_sanity - after_sanity:
+                search_engine.reject(ckey, rejected_hash, "SANITY_REJECTED")
+        if torbox_candidates:
+            selected = torbox_candidates[0]
+            search_engine.mark_selected(ckey, selected, "torbox")
+            return selected.info_hash.lower(), selected.magnet, "torbox"
+        for stream in ranked:
+            if stream.info_hash in rd_cached:
+                search_engine.mark_selected(ckey, stream, "realdebrid")
+                return stream.info_hash.lower(), stream.magnet, "realdebrid"
         return None
     except Exception as exc:
         log.warning("Catbox search: failed for %s: %s  -  keeping .strm", item["title"], exc)
@@ -922,16 +912,11 @@ def _search_best_cached_release(item: dict) -> tuple[str, str] | None | object:
 
 
 def _schedule_next_episode_preload(token: str) -> None:
-    """After a series episode materializes successfully, preload the next episode
-    in background so it is instant when the user gets there.
-
-    Lookup order: same season episode+1, then season+1 episode 1.
-    Only fires if CATBOX_PRELOAD is enabled and the next episode has a
-    registered virtual_item with info_hash + magnet."""
+    """Prepare one following episode without fetching any CDN media bytes."""
     try:
         import settings as _s
         import config as _cfg
-        if not _s.get("CATBOX_PRELOAD", _cfg.CATBOX_PRELOAD):
+        if not _s.get("SAFE_NEXT_EPISODE_PREPARE", _cfg.SAFE_NEXT_EPISODE_PREPARE):
             return
         item = db.get_virtual_item(token)
         if not item or item.get("media_type") != "series":
@@ -941,27 +926,77 @@ def _schedule_next_episode_preload(token: str) -> None:
         episode = item.get("episode")
         if not (imdb_id and season and episode):
             return
-        # Try next episode in same season, then first episode of the next season
-        nxt = db.get_virtual_item_by_episode(imdb_id, season, episode + 1)
-        if not nxt:
-            nxt = db.get_virtual_item_by_episode(imdb_id, season + 1, 1)
-        if not nxt:
-            return
-        next_hash = nxt.get("info_hash")
-        next_magnet = nxt.get("magnet")
-        next_title = nxt.get("title") or ""
-        if not (next_hash and next_magnet):
-            return
-        import strm_generator as _sg
-        import threading as _t
-        _t.Thread(
-            target=_sg._preload_torrent,
-            args=(next_hash, next_magnet, next_title),
-            daemon=True,
-        ).start()
-        log.debug("Catbox: scheduled preload for next episode %s", next_title)
+        prepare_key = f"{imdb_id}:{season}:{episode + 1}"
+        with _next_prepare_lock:
+            if prepare_key in _next_prepare_cache:
+                return
+            _next_prepare_cache[prepare_key] = True
+        worker = threading.Thread(
+            target=_prepare_next_episode,
+            args=(imdb_id, item.get("title") or "", season, episode),
+            name=f"next-episode-{imdb_id}-{season}-{episode}", daemon=True,
+        )
+        worker.start()
+        log.debug("Catbox: scheduled safe next-episode preparation for %s", item.get("title"))
     except Exception as exc:
-        log.debug("Catbox: next-episode preload scheduling failed: %s", exc)
+        log.debug("Catbox: next-episode preparation scheduling failed: %s", exc)
+
+
+def _prepare_next_episode(imdb_id: str, title: str,
+                          season: int, episode: int) -> None:
+    """Search, cache-check, and validate one next episode without media reads."""
+    try:
+        import release_sanity
+        import search_engine
+        import strm_generator
+
+        next_season, next_episode = season, episode + 1
+        wanted = db.get_wanted_episode(imdb_id, next_season, next_episode)
+        nxt = db.get_virtual_item_by_episode(imdb_id, next_season, next_episode)
+        if not wanted and not nxt:
+            next_season, next_episode = season + 1, 1
+            wanted = db.get_wanted_episode(imdb_id, next_season, next_episode)
+            nxt = db.get_virtual_item_by_episode(imdb_id, next_season, next_episode)
+        if not wanted and not nxt:
+            return
+
+        ckey = search_engine.content_key(imdb_id, next_season, next_episode)
+        if nxt and nxt.get("info_hash"):
+            cached_hashes = torbox.check_cached([nxt["info_hash"]])
+            if nxt["info_hash"].lower() in cached_hashes:
+                ok, reason = release_sanity.check_hash(
+                    nxt["info_hash"], "episode", season=next_season,
+                    episode=next_episode, imdb_id=imdb_id, label=ckey)
+                if ok:
+                    db.mark_candidate_cached(ckey, nxt["info_hash"], "torbox")
+                    log.info("Next episode prepared: %s metadata mapping already valid", ckey)
+                    return
+                search_engine.reject(ckey, nxt["info_hash"], reason)
+
+        streams = search_engine.search_candidates(
+            "series", imdb_id, title, season=next_season,
+            episode=next_episode, trigger="next_episode_prepare")
+        cache_results = search_engine.cache_map(ckey, streams)
+        cached = [stream for stream in streams
+                  if not stream.is_usenet and
+                  stream.info_hash in cache_results.get("torbox", set())]
+        cached = release_sanity.filter_cached(
+            cached, kind="episode", season=next_season,
+            episode=next_episode, imdb_id=imdb_id, label=ckey)
+        if not cached:
+            log.info("Next episode prepare: no valid cached release for %s", ckey)
+            return
+        best = cached[0]
+        written = strm_generator.create_lazy_episode_strm(
+            best.info_hash, best.magnet, title, next_season, next_episode,
+            imdb_id=imdb_id, quality=best.quality, source=best.source,
+            size_gb=best.size_gb, preload_first=False)
+        if written or db.get_virtual_item_by_episode(imdb_id, next_season, next_episode):
+            search_engine.mark_selected(ckey, best, "torbox")
+            db.mark_episode_status(imdb_id, next_season, next_episode, "found")
+            log.info("Next episode prepared: %s lazy item ready", ckey)
+    except Exception as exc:
+        log.warning("Next episode prepare failed for %s: %s", imdb_id, exc)
 
 
 def _sweep_caches() -> None:

@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.6.2",
+    "date": "2026-08-16",
+    "notes": [
+      "Added: 15-minute fresh-release episode searches and a durable library identity-repair cursor",
+      "Added: generic Stremio and self-hosted Comet hash-catalog search without sharing debrid credentials",
+      "Added: search traces, candidate history, rejection reasons, manual retries, and playback recovery controls",
+      "Added: Apple TV and web playback profiles plus metadata-only next-episode preparation",
+      "Improved: persistent TorBox cache results and adaptive Prowlarr source ordering reduce redundant requests",
+      "Fixed: NO_FILE failures now reject only the affected title or episode and try a cached alternate"
+    ]
+  },
+  {
     "version": "0.6.1",
     "date": "2026-07-05",
     "notes": [

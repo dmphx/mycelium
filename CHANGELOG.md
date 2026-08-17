@@ -2,9 +2,39 @@
 
 All notable changes to Mycelium are documented in this file.
 
-## Unreleased
+## [0.6.2] - 2026-08-16
+
+### Added
+
+- Generic Stremio addon search support for self-hosted Comet and compatible
+  hash catalogs without sharing debrid credentials
+- Durable search traces with per-source counts, ranked candidates, cache state,
+  selection history, rejection reasons, and operator actions in the Wanted UI
+- Conservative identity repair from paths, NFO files, local library references,
+  and exact unique TMDB matches, with ambiguous results held for review
+- A 15-minute fresh-release search lane alongside the hourly bounded backlog
+  search, plus original and alternative title queries for Prowlarr misses
+- Playback profiles for balanced, Apple TV, and web-compatible release ranking
+- Metadata-only next-episode preparation that performs no CDN media reads
+
+### Changed
+
+- TorBox cache checks now retain short-lived positive and negative results in
+  SQLite, deduplicating checks across episodes and scheduler runs
+- Prowlarr indexers are ordered by configured priority and observed reliability,
+  result yield, and latency while retaining full fallback coverage
+- Full-torrent Catbox preload now defaults off
+- Search sources are coordinated through one pipeline for request, wanted, and
+  playback-recovery paths
+- Fast cache catalogs are queried in parallel; the expensive Prowlarr fan-out
+  runs only when those sources do not expose a cached release
 
 ### Fixed
+
+- Catbox now rejects a bad release for only the affected movie or episode and
+  tries a prevalidated cached alternate before returning a playback failure
+- Transient search-source errors remain retryable after 30 seconds instead of
+  being cached as a six-hour content miss
 
 - Missing episodes no longer remain behind the never-tried back-catalog queue:
   searches run independently every hour, follow bounded retry delays, prioritize
@@ -17,11 +47,6 @@ All notable changes to Mycelium are documented in this file.
   written to logs
 - Catbox episode retries now use Prowlarr Usenet results when no cached torrent is
   available, and Prowlarr receives a title alongside IMDb and episode identifiers
-
-### Changed
-
-- Fast cache sources are queried in parallel; the expensive Prowlarr fan-out is
-  deferred until those sources miss
 
 ## [0.6.1] - 2026-07-05
 

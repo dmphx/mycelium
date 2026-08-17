@@ -409,6 +409,11 @@ Full reference: [`.env.example`](.env.example). Key variables:
 | `AUTO_UPGRADE_ENABLED` | `true` | Periodic upgrade scan |
 | `MULTI_DEBRID_ENABLED` | `false` | RealDebrid fallback when TorBox misses |
 | `WANTED_EPISODE_INTERVAL_MINUTES` | `60` | Interval for bounded missing-episode searches |
+| `WANTED_FRESH_INTERVAL_MINUTES` | `15` | Fast lane for newly aired missing episodes |
+| `STREMIO_ADDON_URLS` | *(empty)* | Comma-separated standard addon roots, including self-hosted Comet |
+| `PLAYBACK_PROFILE` | `balanced` | Compatibility ranking: `balanced`, `apple_tv`, or `web` |
+| `SAFE_NEXT_EPISODE_PREPARE` | `true` | Validate one following episode without CDN media reads |
+| `IDENTITY_REPAIR_INTERVAL_HOURS` | `24` | Conservative virtual-item identity repair interval |
 | `WEBDAV_ENABLED` | `false` | Serve library as virtual .mkv files (Plex) |
 | `DISCORD_WEBHOOK_URL` | *(empty)* | Optional notifications (also configurable in Settings > Notifications) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(empty)* | Optional notifications |

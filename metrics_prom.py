@@ -115,6 +115,36 @@ last_success_age_hours = Gauge(
     "mycelium_last_success_age_hours",
     "Hours since the last successful add (deadman-style)",
 )
+search_source_queries = Gauge(
+    "mycelium_search_source_queries",
+    "Durable search query count by source",
+    ["source"],
+)
+search_source_results = Gauge(
+    "mycelium_search_source_results",
+    "Durable search result count by source",
+    ["source"],
+)
+search_source_errors = Gauge(
+    "mycelium_search_source_errors",
+    "Durable search error count by source",
+    ["source"],
+)
+search_source_avg_latency_seconds = Gauge(
+    "mycelium_search_source_avg_latency_seconds",
+    "Average search latency by source",
+    ["source"],
+)
+identity_gaps = Gauge(
+    "mycelium_identity_gaps",
+    "Virtual item identity gaps by field",
+    ["field"],
+)
+release_candidate_states = Gauge(
+    "mycelium_release_candidate_states",
+    "Durable release candidates by state",
+    ["state"],
+)
 
 
 def refresh_gauges() -> None:
@@ -180,6 +210,30 @@ def refresh_gauges() -> None:
         import health_cache
         service_up.labels(service="zilean").set(1 if health_cache.is_up("zilean") else 0)
         service_up.labels(service="torrentio").set(1 if health_cache.is_up("torrentio") else 0)
+    except Exception:
+        pass
+
+    # Search source effectiveness
+    try:
+        for row in db.get_source_query_stats():
+            source = row["source"]
+            search_source_queries.labels(source=source).set(row["query_count"])
+            search_source_results.labels(source=source).set(row["result_count"])
+            search_source_errors.labels(source=source).set(row["error_count"])
+            search_source_avg_latency_seconds.labels(source=source).set(row["avg_latency"])
+    except Exception:
+        pass
+
+    # Identity health and release recovery state
+    try:
+        for field, count in db.get_identity_gap_counts().items():
+            identity_gaps.labels(field=field).set(count)
+        with db._connect() as conn:
+            states = conn.execute(
+                "SELECT state, COUNT(*) AS count FROM release_candidates GROUP BY state"
+            ).fetchall()
+        for row in states:
+            release_candidate_states.labels(state=row["state"]).set(row["count"])
     except Exception:
         pass
 

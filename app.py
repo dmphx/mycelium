@@ -18,6 +18,7 @@ import config as cfg
 import continue_watching
 import db
 import health
+import identity_repair
 import jellyfin
 import library_sync
 import log_buffer
@@ -64,6 +65,7 @@ from config import (
     TRENDING_CHECK_INTERVAL_HOURS,
     TRENDING_PRECACHE_COUNT,
     WANTED_EPISODE_INTERVAL_MINUTES,
+    WANTED_FRESH_INTERVAL_MINUTES,
     WEBHOOK_SECRET,
     configure_logging,
 )
@@ -87,7 +89,7 @@ if not (cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH or cfg.IN
     )
     _sys.exit(1)
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 
 with open(_path.join(_path.dirname(__file__), "releases.json"), encoding="utf-8") as _f:
     RELEASES: list[dict] = _json.load(_f)
@@ -492,6 +494,24 @@ def _start_scheduler() -> BackgroundScheduler:
         log.info("Scheduled wanted episode search every %dm",
                  WANTED_EPISODE_INTERVAL_MINUTES)
 
+    if WANTED_FRESH_INTERVAL_MINUTES > 0:
+        scheduler.add_job(
+            lambda: monitor.search_wanted_episodes(fresh_only=True),
+            trigger="interval", minutes=WANTED_FRESH_INTERVAL_MINUTES,
+            id="wanted_fresh_search", next_run_time=None,
+        )
+        log.info("Scheduled fresh-release episode search every %dm",
+                 WANTED_FRESH_INTERVAL_MINUTES)
+
+    if cfg.IDENTITY_REPAIR_INTERVAL_HOURS > 0:
+        scheduler.add_job(
+            lambda: identity_repair.run(batch=cfg.IDENTITY_REPAIR_BATCH),
+            trigger="interval", hours=cfg.IDENTITY_REPAIR_INTERVAL_HOURS,
+            id="identity_repair", next_run_time=None,
+        )
+        log.info("Scheduled identity repair every %dh",
+                 cfg.IDENTITY_REPAIR_INTERVAL_HOURS)
+
     import seerr as _seerr
     if MOVIE_SYNC_INTERVAL_MINUTES > 0 and _seerr.is_configured():
         scheduler.add_job(
@@ -688,7 +708,8 @@ def _start_scheduler() -> BackgroundScheduler:
 
     # Apply max_instances=1 to all overlap-sensitive jobs already added
     for jid in ("strm_generator", "strm_cleanup", "series_monitor",
-                 "wanted_episode_search", "movie_sync",
+                 "wanted_episode_search", "wanted_fresh_search", "movie_sync",
+                 "identity_repair",
                  "retry_queue", "auto_upgrade", "pack_consolidation",
                  "trending_precache", "continue_watching", "db_backup",
                  "catbox_gc", "merge_versions", "quota_warn"):
@@ -3236,7 +3257,61 @@ def ui_search_all_wanted():
 @app.get("/ui/api/wanted-episodes")
 def ui_api_wanted_episodes():
     db.reconcile_wanted_episodes()
-    return jsonify(items=db.get_all_wanted_episodes())
+    return jsonify(items=db.get_wanted_episodes_with_search())
+
+
+@app.post("/ui/api/wanted-episodes/<int:episode_id>/search")
+@_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
+def ui_api_wanted_episode_search(episode_id: int):
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+    episode = next(
+        (row for row in db.get_all_wanted_episodes() if row["id"] == episode_id),
+        None,
+    )
+    if not episode:
+        return jsonify(error="unknown wanted episode"), 404
+
+    def _run():
+        try:
+            monitor._retry_episode(episode)
+        except Exception as exc:
+            log.error("manual episode search failed for id=%s: %s", episode_id, exc)
+
+    threading.Thread(
+        target=_run, name=f"wanted-episode-{episode_id}", daemon=True).start()
+    return jsonify(ok=True, message="episode search started")
+
+
+@app.get("/ui/api/search-trace/<path:content_key>")
+def ui_api_search_trace(content_key: str):
+    return jsonify(db.get_search_trace(content_key))
+
+
+@app.get("/ui/api/identity-repair")
+@auth.require_role("admin")
+def ui_api_identity_repair_status():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+    return jsonify(gaps=db.get_identity_gap_counts(),
+                   history=db.get_identity_repair_summary())
+
+
+@app.post("/ui/api/identity-repair")
+@_csrf.exempt
+@_browser_csrf
+@auth.require_role("admin")
+def ui_api_identity_repair_run():
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+
+    def _run():
+        identity_repair.run(batch=cfg.IDENTITY_REPAIR_BATCH)
+
+    threading.Thread(target=_run, name="identity-repair-manual", daemon=True).start()
+    return jsonify(ok=True, message="identity repair started")
 
 
 @app.get("/ui/api/library/status-map")

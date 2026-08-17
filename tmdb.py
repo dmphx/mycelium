@@ -1,5 +1,6 @@
 import logging
 import re
+from functools import lru_cache
 
 import requests as req_lib
 
@@ -78,6 +79,37 @@ def find_by_imdb(imdb_id: str, kind: str = "tv") -> int | None:
         log.info("TMDB find %s → tmdb_id=%s", imdb_id, tmdb_id)
         return tmdb_id
     return None
+
+
+@lru_cache(maxsize=4096)
+def search_aliases(imdb_id: str, media_type: str,
+                   canonical_title: str = "") -> tuple[str, ...]:
+    """Return a small stable set of original and alternative search titles."""
+    kind = "movie" if media_type == "movie" else "tv"
+    tmdb_id = find_by_imdb(imdb_id, kind=kind)
+    if not tmdb_id:
+        return tuple()
+    detail = _get(f"/{kind}/{tmdb_id}") or {}
+    alternatives = _get(f"/{kind}/{tmdb_id}/alternative_titles") or {}
+    values = [
+        canonical_title,
+        detail.get("original_title") or detail.get("original_name") or "",
+        detail.get("title") or detail.get("name") or "",
+    ]
+    rows = alternatives.get("titles") if kind == "movie" else alternatives.get("results")
+    values.extend(str(row.get("title") or "") for row in (rows or [])[:20])
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        value = str(value or "").strip()
+        key = re.sub(r"[^a-z0-9]+", "", value.lower())
+        if not value or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+        if len(out) >= 4:
+            break
+    return tuple(out)
 
 
 def get_show_info(tmdb_id: int) -> dict | None:

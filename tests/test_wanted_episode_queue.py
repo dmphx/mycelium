@@ -84,3 +84,59 @@ def test_reconcile_uses_virtual_episode_identity():
 
     assert db.reconcile_wanted_episodes() == 1
     assert db.get_all_wanted_episodes()[0]["status"] == "found"
+
+
+def test_fresh_lane_retries_new_releases_without_touching_old_backlog():
+    _insert_episode(1, recent=True, attempts=2, attempted_ago_hours=1)
+    _insert_episode(2, recent=True, attempts=2, attempted_ago_hours=0.1)
+    _insert_episode(3, recent=False, attempts=0)
+
+    rows = db.get_fresh_wanted_episodes(limit=10, window_days=3)
+
+    assert {row["imdb_id"] for row in rows} == {"tt0000001"}
+
+
+def test_release_candidate_rejection_is_scoped_to_content_key():
+    key_one = "tt1234567:S01E01"
+    key_two = "tt1234567:S01E02"
+    candidate = {
+        "info_hash": "a" * 40,
+        "protocol": "torrent",
+        "magnet": "magnet:?xt=urn:btih:" + "a" * 40,
+        "source": "test",
+        "title": "Show.S01E01",
+        "rank_order": 1,
+    }
+    db.upsert_release_candidates(key_one, [candidate])
+    db.upsert_release_candidates(key_two, [candidate])
+    db.reject_release_candidate(key_one, "a" * 40, "NO_FILE")
+
+    assert db.get_rejected_candidate_hashes(key_one) == {"a" * 40}
+    assert db.get_rejected_candidate_hashes(key_two) == set()
+    assert db.get_alternate_candidates(key_one) == []
+    assert len(db.get_alternate_candidates(key_two)) == 1
+
+
+def test_provider_cache_status_keeps_positive_and_negative_results():
+    hashes = ["a" * 40, "b" * 40]
+    db.set_provider_cache_status("torbox", {hashes[0]}, hashes)
+
+    cached, uncached = db.get_provider_cache_status("torbox", hashes)
+
+    assert cached == {hashes[0]}
+    assert uncached == {hashes[1]}
+
+
+def test_identity_repair_cursor_rotates_unresolved_items():
+    for index in range(2):
+        db.insert_virtual_item(
+            token=f"identity-{index}", info_hash=str(index) * 40,
+            magnet=f"magnet:?xt=urn:btih:{str(index) * 40}",
+            title=f"Unknown {index}", media_type="series",
+        )
+
+    first = db.get_virtual_items_missing_identity(limit=1)[0]
+    db.touch_virtual_identity_check(first["token"])
+    second = db.get_virtual_items_missing_identity(limit=1)[0]
+
+    assert second["token"] != first["token"]

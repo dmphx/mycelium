@@ -136,3 +136,15 @@ def test_configured_url_only_results_fall_back_to_plain_endpoint(monkeypatch, ca
     assert "private-option" in calls[0]
     assert "private-option" not in calls[1]
     assert "private-option" not in caplog.text
+
+
+def test_web_playback_profile_prefers_h264_aac_over_hevc_truehd():
+    _settings.set("PLAYBACK_PROFILE", "web")
+    hevc = _stream("Show.1080p.WEB-DL.HEVC.TrueHD", "1080p", 2.0, seeders=50)
+    hevc.info_hash = "a" * 40
+    h264 = _stream("Show.1080p.WEB-DL.H264.AAC.MP4", "1080p", 2.0, seeders=10)
+    h264.info_hash = "b" * 40
+
+    ranked = torrentio.rank_streams([hevc, h264])
+
+    assert ranked[0].info_hash == "b" * 40

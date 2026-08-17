@@ -61,6 +61,18 @@ TORRENTIO_OPTS = _env("TORRENTIO_OPTS", "")
 MEDIAFUSION_BASE_URL = _env("MEDIAFUSION_BASE_URL", "")
 MEDIAFUSION_ENABLED  = _env("MEDIAFUSION_ENABLED", "false").lower() in ("1", "true", "yes")
 
+# Generic Stremio stream addons, including self-hosted Comet. Multiple addon
+# roots may be supplied as a comma-separated list. Each root must expose the
+# standard /stream/{type}/{id}.json endpoint. This stays separate from
+# MediaFusion so operators can add or remove search catalogs without a code
+# change or a debrid subscription.
+STREMIO_ADDON_URLS = [
+    value.strip().rstrip("/")
+    for value in _env("STREMIO_ADDON_URLS", "").split(",")
+    if value.strip()
+]
+STREMIO_ADDON_TIMEOUT_SEC = _env_int("STREMIO_ADDON_TIMEOUT_SEC", 20)
+
 # Prowlarr (https://prowlarr.com). Direct Newznab-style search across every
 # configured indexer (Nyaa for anime, YTS, EZTV, TorrentGalaxy, Pirate Bay,
 # Knaben, Internet Archive, LimeTorrents, MixtapeTorrent, Zilean, ...).
@@ -195,8 +207,27 @@ MEDIA_PATH = _env("MEDIA_PATH", "/data/media")
 STRM_GENERATOR_INTERVAL_HOURS = _env_int("STRM_GENERATOR_INTERVAL_HOURS", 1)
 MONITOR_INTERVAL_HOURS = _env_int("MONITOR_INTERVAL_HOURS", 6)
 WANTED_EPISODE_INTERVAL_MINUTES = _env_int("WANTED_EPISODE_INTERVAL_MINUTES", 60)
+WANTED_FRESH_INTERVAL_MINUTES = _env_int("WANTED_FRESH_INTERVAL_MINUTES", 15)
+WANTED_FRESH_WINDOW_DAYS = _env_int("WANTED_FRESH_WINDOW_DAYS", 3)
+WANTED_FRESH_BATCH = _env_int("WANTED_FRESH_BATCH", 12)
 MOVIE_SYNC_INTERVAL_MINUTES = _env_int("MOVIE_SYNC_INTERVAL_MINUTES", 30)
 MAX_RETRY_ATTEMPTS = _env_int("MAX_RETRY_ATTEMPTS", 10)
+
+# Identity recovery is deliberately conservative. It repairs deterministic
+# path/NFO/library mappings automatically and records ambiguous TMDB matches
+# for operator review.
+IDENTITY_REPAIR_INTERVAL_HOURS = _env_int("IDENTITY_REPAIR_INTERVAL_HOURS", 24)
+IDENTITY_REPAIR_BATCH = _env_int("IDENTITY_REPAIR_BATCH", 500)
+
+# Candidate ranking can be tuned for the dominant client family. "balanced"
+# preserves the normal quality-first ordering, while apple_tv and web add
+# compatibility preferences based on release-name metadata.
+PLAYBACK_PROFILE = _env("PLAYBACK_PROFILE", "balanced").strip().lower()
+
+# Prepare exactly one following episode after playback starts. Preparation
+# searches metadata, batch-checks debrid availability, and validates the file
+# mapping. It never fetches CDN media bytes or preloads a whole torrent.
+SAFE_NEXT_EPISODE_PREPARE = _env("SAFE_NEXT_EPISODE_PREPARE", "true").lower() in ("1", "true", "yes")
 
 # Automatic Jellyfin merge of duplicate movie versions (every N hours; 0 disables).
 MERGE_VERSIONS_INTERVAL_HOURS = _env_int("MERGE_VERSIONS_INTERVAL_HOURS", 6)
@@ -243,7 +274,7 @@ CATBOX_LAZY_ADD = _env("CATBOX_LAZY_ADD", "false").lower() in ("1", "true", "yes
 # Pre-add the torrent to TorBox in the background when a .strm is created,
 # so first playback is instant instead of waiting for createtorrent.
 # Only fires for cached torrents (no slot cost). Falls back to catbox on failure.
-CATBOX_PRELOAD = _env("CATBOX_PRELOAD", "true").lower() in ("1", "true", "yes")
+CATBOX_PRELOAD = _env("CATBOX_PRELOAD", "false").lower() in ("1", "true", "yes")
 
 # ── DB backup ─────────────────────────────────────────────────────────────────
 BACKUP_INTERVAL_HOURS = _env_int("BACKUP_INTERVAL_HOURS", 24)
