@@ -668,6 +668,26 @@ def backfill_nfo_streamdetails() -> dict:
     return {"updated": updated, "skipped": skipped, "errors": errors}
 
 
+def _movie_folder_name(title: str, year: str | int | None,
+                       imdb_id: str | None = None) -> str:
+    """Build a Plex movie folder name, adding an ID hint when needed.
+
+    A title can contain a different four-digit year, such as
+    ``Breakdown 1975`` released in 2025. Plex may interpret the title's number
+    as the release year even when the canonical year is present in parentheses.
+    In that narrow case, include Plex's external-ID match hint so the scanner
+    does not create a local, unmatched item.
+    """
+    safe = _safe(title)
+    year_text = str(year).strip() if year else ""
+    folder = f"{safe} ({year_text})" if year_text else safe
+    embedded_years = _YEAR_RE.findall(safe)
+    if (year_text and imdb_id
+            and any(candidate != year_text for candidate in embedded_years)):
+        return f"{folder} {{imdb-{imdb_id}}}"
+    return folder
+
+
 def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
                              fallback_year: int | None = None) -> str:
     """Return the canonical 'Title (Year)' folder name from TMDB for this imdb_id.
@@ -683,9 +703,8 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
                                  params={"external_source": "imdb_id"}) or {}
             hits = results.get("movie_results") or []
             if hits and hits[0].get("title"):
-                safe = _safe(hits[0]["title"])
                 year = (hits[0].get("release_date") or "")[:4]
-                return f"{safe} ({year})" if year else safe
+                return _movie_folder_name(hits[0]["title"], year, imdb_id)
         except Exception as exc:
             log.debug("_canonical_movie_folder TMDB lookup failed for %s (attempt %d): %s",
                       imdb_id, _attempt + 1, exc)
@@ -695,7 +714,7 @@ def _canonical_movie_folder(imdb_id: str, fallback_title: str | None = None,
         # Strip a trailing "(YYYY)" already in the fallback title so we never emit a
         # double-year folder like "Articulo 53 (1937) (1937)".
         safe = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", safe)
-        return f"{safe} ({fallback_year})" if fallback_year else safe
+        return _movie_folder_name(safe, fallback_year, imdb_id)
     return ""
 
 

@@ -119,6 +119,28 @@ class TestStrmPath:
         assert "S01E10" in str(p)
 
 
+class TestMovieFolderName:
+    def test_adds_imdb_hint_when_title_contains_different_year(self):
+        assert sg._movie_folder_name(
+            "Breakdown 1975", 2025, "tt38985973"
+        ) == "Breakdown 1975 (2025) {imdb-tt38985973}"
+
+    def test_normal_title_keeps_standard_plex_name(self):
+        assert sg._movie_folder_name(
+            "Civil War", 2024, "tt17279496"
+        ) == "Civil War (2024)"
+
+    def test_title_containing_release_year_needs_no_hint(self):
+        assert sg._movie_folder_name(
+            "Summer of 84", 2018, "tt5774450"
+        ) == "Summer of 84 (2018)"
+
+    def test_same_four_digit_year_needs_no_hint(self):
+        assert sg._movie_folder_name(
+            "Class of 1984", 1984, "tt0083739"
+        ) == "Class of 1984 (1984)"
+
+
 class TestScanTorboxLibrary:
     """scan_torbox_library() backfills .strm files for torrents TorBox already
     has cached that we have no virtual_item record of (e.g. after a DB reset)."""

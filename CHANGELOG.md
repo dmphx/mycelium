@@ -31,6 +31,9 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Plex movie folders now include an IMDb match hint when the title contains a
+  misleading four-digit year, preventing a local unmatched item with the wrong
+  release year
 - Plex legacy phantom episodes can now be identified against a double-confirmed
   TMDB season boundary and safely quarantined with playback and maintenance
   gates. This cleans up bogus tail episodes left by older fixed-size season
