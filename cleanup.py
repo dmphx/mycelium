@@ -690,6 +690,19 @@ def _movie_nfo_info(folder: Path) -> tuple[str | None, int | None, str | None]:
         return None, None, None
 
 
+def _movie_folder_identity_matches(folder: Path, nfo_imdb_id: str) -> bool:
+    """Fail closed when a folder's NFO and virtual items name different films."""
+    virtual_ids = db.get_virtual_item_imdb_ids_under_path(str(folder))
+    if virtual_ids and virtual_ids != {nfo_imdb_id}:
+        log.warning(
+            "Movie folder identity conflict: %s has NFO %s but virtual items %s; "
+            "skipping automatic rename or merge",
+            folder, nfo_imdb_id, sorted(virtual_ids),
+        )
+        return False
+    return True
+
+
 def merge_movie_duplicates() -> int:
     """Merge movie folders that resolve to the same IMDb ID into one canonical
     folder. Reads IMDb from .nfo; falls back to virtual_items. Returns count removed."""
@@ -713,6 +726,8 @@ def merge_movie_duplicates() -> int:
             continue
         title, year, imdb_id = _movie_nfo_info(folder)
         if not imdb_id:
+            continue
+        if not _movie_folder_identity_matches(folder, imdb_id):
             continue
         groups.setdefault(imdb_id, []).append(folder)
 
@@ -772,6 +787,8 @@ def rename_messy_movie_folders() -> int:
             continue
         title, year, imdb_id = _movie_nfo_info(folder)
         if not title or not year:
+            continue
+        if imdb_id and not _movie_folder_identity_matches(folder, imdb_id):
             continue
         import strm_generator as _sg
         canonical_name = _sg._safe(f"{title} ({year})")

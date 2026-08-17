@@ -1415,6 +1415,18 @@ def update_virtual_item_strm_path(old_path: str, new_path: str) -> int:
         return cur.rowcount
 
 
+def get_virtual_item_imdb_ids_under_path(directory: str) -> set[str]:
+    """Return the distinct IMDb identities stored below one media directory."""
+    prefix = directory.rstrip("/") + "/"
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT imdb_id FROM virtual_items "
+            "WHERE strm_path LIKE ? ESCAPE '\\' AND imdb_id IS NOT NULL AND imdb_id != ''",
+            (_escape_like(prefix) + "%",),
+        ).fetchall()
+    return {str(row["imdb_id"]) for row in rows}
+
+
 def save_spore_tracks(token: str, tracks: dict) -> None:
     """Persist audio/subtitle track info from ffprobe so stub regeneration can reuse it."""
     import json as _json

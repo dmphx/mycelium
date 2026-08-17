@@ -35,6 +35,9 @@ All notable changes to Mycelium are documented in this file.
   TMDB season boundary and safely quarantined with playback and maintenance
   gates. This cleans up bogus tail episodes left by older fixed-size season
   registration without risking legitimate numbering mismatches.
+- Movie-folder cleanup now refuses to rename or merge a folder when its NFO
+  IMDb identity disagrees with the virtual items inside it, preventing one
+  title from being filed beneath another title's Plex metadata.
 
 - Plex Spore season-pack entries now advertise the selected episode file's
   exact byte size instead of the pack's largest file or aggregate size,
