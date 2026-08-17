@@ -3,6 +3,7 @@
 import glob
 import logging
 import os
+import re
 import threading
 from datetime import date
 
@@ -23,6 +24,7 @@ log = logging.getLogger(__name__)
 
 _TODAY = lambda: date.today().isoformat()  # noqa: E731
 _wanted_search_lock = threading.Lock()
+_PLACEHOLDER_TITLE_RE = re.compile(r"^(?:tt\d{6,10}|tmdb[:_ -]?\d+)$", re.IGNORECASE)
 
 
 # ── Filesystem helpers ────────────────────────────────────────────────────────
@@ -73,6 +75,14 @@ def strm_exists_movie(title: str) -> bool:
 
 def add_series(imdb_id: str, title: str, seasons: list[int]) -> None:
     """Call this after a series is processed to start monitoring it."""
+    if _PLACEHOLDER_TITLE_RE.fullmatch(str(title or "").strip()):
+        try:
+            import strm_generator
+            canonical = strm_generator._canonical_series_folder(imdb_id)
+            if canonical:
+                title = canonical
+        except Exception as exc:
+            log.debug("Monitor: canonical title lookup failed for %s: %s", imdb_id, exc)
     tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
     db.upsert_monitored_series(imdb_id, tmdb_id, title, seasons)
     if tmdb_id:
