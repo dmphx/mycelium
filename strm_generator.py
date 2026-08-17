@@ -731,6 +731,23 @@ def _looks_like_placeholder_title(title: str | None) -> bool:
     return bool(_PLACEHOLDER_TITLE_RE.match(title.strip()))
 
 
+def _series_folder_imdb(folder: Path) -> str | None:
+    """Return a series folder's confirmed IMDb identity, when present."""
+    nfo = folder / "tvshow.nfo"
+    if not nfo.is_file():
+        return None
+    try:
+        text = nfo.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = re.search(
+        r"<uniqueid[^>]*type=['\"]imdb['\"][^>]*>(tt\d+)</uniqueid>",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
 def _canonical_series_folder(imdb_id: str | None,
                               fallback_title: str | None = None) -> str:
     """Return the canonical show-folder name from TMDB for this imdb_id (TV).
@@ -745,7 +762,14 @@ def _canonical_series_folder(imdb_id: str | None,
                                  params={"external_source": "imdb_id"}) or {}
             hits = results.get("tv_results") or []
             if hits and hits[0].get("name"):
-                return _safe(hits[0]["name"])
+                title = _safe(hits[0]["name"])
+                existing = Path(MEDIA_PATH) / "series" / title
+                existing_imdb = _series_folder_imdb(existing)
+                if existing_imdb and existing_imdb != imdb_id:
+                    year = str(hits[0].get("first_air_date") or "")[:4]
+                    suffix = year if re.fullmatch(r"\d{4}", year) else imdb_id
+                    return _safe(f"{title} ({suffix})")
+                return title
         except Exception as exc:
             log.debug("_canonical_series_folder TMDB lookup failed for %s: %s", imdb_id, exc)
     return _safe(fallback_title) if fallback_title else ""

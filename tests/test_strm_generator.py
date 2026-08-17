@@ -48,6 +48,27 @@ class TestParseInfo:
         assert info.get("year") == 2023
 
 
+def test_canonical_series_folder_adds_year_for_existing_different_identity(tmp_path, monkeypatch):
+    existing = tmp_path / "series" / "Criminal Minds"
+    existing.mkdir(parents=True)
+    (existing / "tvshow.nfo").write_text(
+        '<tvshow><uniqueid type="imdb" default="true">tt0452046</uniqueid></tvshow>',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        "tmdb._get",
+        lambda *_args, **_kwargs: {
+            "tv_results": [{
+                "name": "Criminal Minds",
+                "first_air_date": "2017-07-26",
+            }],
+        },
+    )
+
+    assert sg._canonical_series_folder("tt6568694") == "Criminal Minds (2017)"
+
+
 class TestSporeItemSize:
     files = [
         {"id": 11, "name": "Show S06E10.mkv", "size": 1_950_621_122},
