@@ -924,6 +924,19 @@ def mark_episode_status(imdb_id: str, season: int, episode: int, status: str) ->
         conn.commit()
 
 
+def requeue_wanted_episode(imdb_id: str, season: int, episode: int) -> bool:
+    """Make a previously found episode immediately eligible for another search."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE wanted_episodes
+               SET status='wanted', attempt_count=0, last_attempted=NULL
+               WHERE imdb_id=? AND season=? AND episode=? AND status='found'""",
+            (imdb_id, season, episode),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
 def get_wanted_episode(imdb_id: str, season: int, episode: int) -> dict | None:
     with _connect() as conn:
         row = conn.execute(

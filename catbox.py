@@ -695,6 +695,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                     token, item, ckey, f"sanity:{_bad}", alternate_attempts)
                 if alternate:
                     return alternate
+                _requeue_unplayable_episode(item, f"sanity:{_bad}")
                 _fail_put(token, _FAIL_COOLDOWN_SEC)
                 if ckey:
                     db.update_playability_fail(ckey, REASON_NO_FILE)
@@ -749,6 +750,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
             token, item, ckey, REASON_NO_FILE, alternate_attempts)
         if alternate:
             return alternate
+        _requeue_unplayable_episode(item, REASON_NO_FILE)
         _fail_put(token, _FAIL_COOLDOWN_SEC)
         if ckey:
             db.update_playability_fail(ckey, REASON_NO_FILE)
@@ -764,6 +766,22 @@ def _materialize_locked(token: str, allow_readd: bool = True,
     else:
         _metrics_inc("failed")
     return url
+
+
+def _requeue_unplayable_episode(item: dict, reason: str) -> None:
+    """Return a found episode to the wanted queue after deterministic failure."""
+    if item.get("media_type") != "series":
+        return
+    imdb_id = item.get("imdb_id")
+    season = item.get("season")
+    episode = item.get("episode")
+    if not imdb_id or season is None or episode is None:
+        return
+    if db.requeue_wanted_episode(imdb_id, int(season), int(episode)):
+        log.warning(
+            "Catbox: requeued %s S%02dE%02d after %s",
+            item.get("title") or imdb_id, int(season), int(episode), reason,
+        )
 
 
 def _try_alternate_release(token: str, item: dict, ckey: str | None,

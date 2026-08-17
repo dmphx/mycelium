@@ -86,6 +86,20 @@ def test_reconcile_uses_virtual_episode_identity():
     assert db.get_all_wanted_episodes()[0]["status"] == "found"
 
 
+def test_unplayable_found_episode_is_requeued_immediately():
+    _insert_episode(1, attempts=4, attempted_ago_hours=1)
+    db.mark_episode_status("tt0000001", 1, 1, "found")
+
+    assert db.requeue_wanted_episode("tt0000001", 1, 1) is True
+
+    row = db.get_wanted_episode("tt0000001", 1, 1)
+    assert row["status"] == "wanted"
+    assert row["attempt_count"] == 0
+    assert row["last_attempted"] is None
+    assert db.get_wanted_episodes(max_attempts=10, limit=10)[0]["id"] == row["id"]
+    assert db.requeue_wanted_episode("tt0000001", 1, 1) is False
+
+
 def test_fresh_lane_retries_new_releases_without_touching_old_backlog():
     _insert_episode(1, recent=True, attempts=2, attempted_ago_hours=1)
     _insert_episode(2, recent=True, attempts=2, attempted_ago_hours=0.1)
