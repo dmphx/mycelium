@@ -65,7 +65,8 @@ def _official_last(tmdb_id: int | None, show_info: dict | None, season_number: i
 
 def discover(imdb_ids: set[str] | None = None, items: list[dict] | None = None,
              tmdb_client=None, orphan_show_ids: dict[str, str] | None = None,
-             spore_root: str | Path | None = None) -> dict:
+             spore_root: str | Path | None = None,
+             media_root: str | Path | None = None) -> dict:
     """Return never-played episodes beyond a double-confirmed TMDB boundary.
 
     A season is authoritative only when the show's declared episode count and
@@ -132,15 +133,74 @@ def discover(imdb_ids: set[str] | None = None, items: list[dict] | None = None,
                 })
 
     known_tokens = {str(item.get("token") or "") for item in rows}
+    source_root = Path(media_root or MEDIA_PATH)
     root = Path(spore_root or SPORE_MEDIA_PATH)
+    seen_orphans: set[tuple[str, int, int]] = set()
     for show_folder, imdb_id in sorted((orphan_show_ids or {}).items()):
         if wanted_ids and imdb_id not in wanted_ids:
             continue
+        tmdb_id = tmdb_client.find_by_imdb(imdb_id, kind="tv")
+        show_info = tmdb_client.get_show_info(tmdb_id) if tmdb_id else None
+
+        # A legacy source file can outlive its virtual row and Spore stub. Scan
+        # the canonical .strm tree too, using the same double-confirmed TMDB
+        # boundary. When a matching orphan stub exists, _files_for() will move
+        # both exact files from this one candidate.
+        source_folder = source_root / "series" / show_folder
+        if source_folder.is_dir() and _under(source_folder, source_root):
+            for season_folder in sorted(path for path in source_folder.iterdir() if path.is_dir()):
+                season_match = _SEASON_FOLDER_RE.match(season_folder.name)
+                if not season_match:
+                    continue
+                season_number = int(season_match.group(1))
+                official_last = _official_last(
+                    tmdb_id, show_info, season_number, tmdb_client
+                )
+                if official_last is None:
+                    skipped.append({
+                        "imdb_id": imdb_id,
+                        "season": season_number,
+                        "reason": "TMDB season boundary not authoritative",
+                    })
+                    continue
+                for strm in sorted(season_folder.glob("*.strm")):
+                    episode_match = _EPISODE_FILE_RE.search(strm.stem)
+                    if not episode_match:
+                        continue
+                    parsed_season = int(episode_match.group(1))
+                    episode = int(episode_match.group(2))
+                    if parsed_season != season_number or episode <= official_last:
+                        continue
+                    token = ""
+                    try:
+                        match = re.search(r"/stream/([A-Za-z0-9]+)", strm.read_text(encoding="utf-8"))
+                        token = match.group(1) if match else ""
+                    except Exception:
+                        pass
+                    if token and token in known_tokens:
+                        skipped.append({
+                            "imdb_id": imdb_id,
+                            "season": season_number,
+                            "episode": episode,
+                            "reason": "source token still has a virtual item",
+                        })
+                        continue
+                    key = (show_folder, season_number, episode)
+                    seen_orphans.add(key)
+                    candidates.append({
+                        "token": None,
+                        "imdb_id": imdb_id,
+                        "title": show_folder,
+                        "season": season_number,
+                        "episode": episode,
+                        "official_last": official_last,
+                        "strm_path": str(strm),
+                        "orphan_source": True,
+                    })
+
         folder = root / "series" / show_folder
         if not folder.is_dir() or not _under(folder, root):
             continue
-        tmdb_id = tmdb_client.find_by_imdb(imdb_id, kind="tv")
-        show_info = tmdb_client.get_show_info(tmdb_id) if tmdb_id else None
         for season_folder in sorted(path for path in folder.iterdir() if path.is_dir()):
             season_match = _SEASON_FOLDER_RE.match(season_folder.name)
             if not season_match:
@@ -163,6 +223,8 @@ def discover(imdb_ids: set[str] | None = None, items: list[dict] | None = None,
                 parsed_season = int(episode_match.group(1))
                 episode = int(episode_match.group(2))
                 if parsed_season != season_number or episode <= official_last:
+                    continue
+                if (show_folder, season_number, episode) in seen_orphans:
                     continue
                 minfo = stub.with_suffix(".minfo")
                 token = ""

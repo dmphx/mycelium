@@ -74,6 +74,48 @@ def test_discover_finds_explicit_orphan_spore_stubs(monkeypatch, tmp_path):
     assert result["candidates"][0]["token"] is None
 
 
+def test_discover_finds_orphan_source_beyond_boundary(tmp_path):
+    strm = (tmp_path / "media" / "series" / "Short Season" / "Season 01" /
+            "Short Season S01E09.strm")
+    strm.parent.mkdir(parents=True)
+    strm.write_text("http://mycelium/stream/orphan", encoding="utf-8")
+
+    result = phantom_cleanup.discover(
+        items=[],
+        tmdb_client=FakeTmdb(),
+        orphan_show_ids={"Short Season": "tt1234567"},
+        media_root=tmp_path / "media",
+        spore_root=tmp_path / "spore",
+    )
+
+    assert len(result["candidates"]) == 1
+    assert result["candidates"][0]["episode"] == 9
+    assert result["candidates"][0]["orphan_source"] is True
+    assert result["candidates"][0]["token"] is None
+
+
+def test_source_candidate_deduplicates_matching_orphan_stub(tmp_path):
+    strm = (tmp_path / "media" / "series" / "Short Season" / "Season 01" /
+            "Short Season S01E09.strm")
+    stub = (tmp_path / "spore" / "series" / "Short Season" / "Season 01" /
+            "Short Season S01E09.mkv")
+    for path in (strm, stub):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("orphan", encoding="utf-8")
+    stub.with_suffix(".minfo").write_text("token=orphan\n", encoding="utf-8")
+
+    result = phantom_cleanup.discover(
+        items=[],
+        tmdb_client=FakeTmdb(),
+        orphan_show_ids={"Short Season": "tt1234567"},
+        media_root=tmp_path / "media",
+        spore_root=tmp_path / "spore",
+    )
+
+    assert len(result["candidates"]) == 1
+    assert result["candidates"][0]["orphan_source"] is True
+
+
 def test_cleanup_quarantines_exact_files_and_deletes_row(monkeypatch, tmp_path):
     media_root = tmp_path / "media"
     spore_root = tmp_path / "spore"

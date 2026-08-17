@@ -40,7 +40,8 @@ All notable changes to Mycelium are documented in this file.
 - Plex legacy phantom episodes can now be identified against a double-confirmed
   TMDB season boundary and safely quarantined with playback and maintenance
   gates. This cleans up bogus tail episodes left by older fixed-size season
-  registration without risking legitimate numbering mismatches.
+  registration, including orphan source files whose database row and Plex stub
+  were already gone, without risking legitimate numbering mismatches.
 - Movie-folder cleanup now refuses to rename or merge a folder when its NFO
   IMDb identity disagrees with the virtual items inside it, preventing one
   title from being filed beneath another title's Plex metadata.
