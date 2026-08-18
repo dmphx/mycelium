@@ -382,6 +382,7 @@ flowchart LR
 - **Webhook secret** auto-generated on first start, shown in Admin > Integration Endpoints. Preferred: header `X-Webhook-Secret`. Seerr/Jellyseerr don't support custom headers in their webhook config, so append it to the URL instead: `http://<mycelium-url>/webhook?secret=<secret>`. Override the secret with `WEBHOOK_SECRET` in `.env`.
 - `/setup` locked after first run - admin only via Settings > Re-run wizard.
 - `/metrics` requires admin session or `X-Metrics-Token` header (`METRICS_TOKEN` in `.env`).
+- `/health/discord/v1/*` requires `Authorization: Bearer <MYCELIUM_BOT_TOKEN>` and returns only sanitized, read-only operational data.
 - WebDAV (`/dav`) uses HTTP Basic Auth against the Mycelium user database.
 
 ---
@@ -423,6 +424,7 @@ Full reference: [`.env.example`](.env.example). Key variables:
 | `AUTO_APPROVE_DAILY_LIMIT` / `AUTO_APPROVE_ACTOR_DAILY_LIMIT` | `5` | Daily budget for genre-rule fill / favorite-actor fill |
 | `EXCLUDE_UNDERSIZED_RELEASES` | `true` | Reject releases too small to be real for their claimed quality + runtime |
 | `METRICS_TOKEN` | *(empty)* | Bearer token for `/metrics` scraping |
+| `MYCELIUM_BOT_TOKEN` | *(empty)* | Bearer token for the sanitized Discord status integration |
 
 Supported debrid services are TorBox and optional RealDebrid. Premiumize is not
 currently integrated.
@@ -436,6 +438,8 @@ currently integrated.
 | `GET /health` | Liveness probe - wired to Docker `HEALTHCHECK` |
 | `GET /healthz` | Deep readiness - 503 if scrapers down |
 | `GET /metrics` | Prometheus, ~20 metrics. Requires auth (see Security) |
+| `GET /health/discord/v1/summary` | Sanitized health, request, playability, dependency, and TorBox counts |
+| `GET /health/discord/v1/events` | Cursor-based activity without paths, hashes, URLs, or requester identity |
 
 A ready-made Grafana dashboard lives at [`assets/grafana-dashboard.json`](assets/grafana-dashboard.json).
 

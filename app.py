@@ -17,6 +17,7 @@ import cleanup
 import config as cfg
 import continue_watching
 import db
+import discord_integration
 import health
 import identity_repair
 import jellyfin
@@ -923,6 +924,35 @@ def health_deep():
     code = 200 if status == "ok" else 503
     return jsonify(status=status, failures=failures,
                     zilean=zilean_ok, torrentio=torrentio_ok), code
+
+
+def _discord_integration_auth_error(exc: discord_integration.IntegrationAuthError):
+    return jsonify(error=str(exc)), exc.status_code
+
+
+@app.get("/health/discord/v1/summary")
+def discord_integration_summary():
+    """Sanitized operational snapshot for the internal Onyx Discord bot."""
+    try:
+        discord_integration.authorize(request.headers.get("Authorization"))
+    except discord_integration.IntegrationAuthError as exc:
+        return _discord_integration_auth_error(exc)
+    return jsonify(discord_integration.get_summary(APP_VERSION))
+
+
+@app.get("/health/discord/v1/events")
+def discord_integration_events():
+    """Cursor-based, sanitized Mycelium activity for Discord feeds."""
+    try:
+        discord_integration.authorize(request.headers.get("Authorization"))
+    except discord_integration.IntegrationAuthError as exc:
+        return _discord_integration_auth_error(exc)
+    try:
+        after_id = int(request.args.get("after_id", "0"))
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        return jsonify(error="after_id and limit must be integers"), 400
+    return jsonify(discord_integration.get_events(after_id=after_id, limit=limit))
 
 
 @app.post("/webhook")

@@ -2,6 +2,14 @@
 
 All notable changes to Mycelium are documented in this file.
 
+## Unreleased
+
+### Added
+
+- A versioned, read-only Discord integration API protected by a dedicated bearer token
+- Sanitized health, request, playability, dependency, and TorBox summaries
+- Cursor-based activity events that omit paths, hashes, URLs, and requester identity
+
 ## [0.6.2] - 2026-08-16
 
 ### Added
