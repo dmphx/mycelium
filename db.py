@@ -1625,6 +1625,22 @@ def get_enrichment_recovery_items() -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def reset_interrupted_enrichment() -> int:
+    """Requeue work left in an in-flight state by a stopped worker."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE media_enrichment_queue
+            SET state='queued',
+                last_error='resuming after interrupted worker',
+                updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+            WHERE state IN ('downloading', 'analyzing')
+            """
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
 def set_enrichment_state(tokens: list[str], state: str,
                          error: str | None = None) -> None:
     if not tokens:

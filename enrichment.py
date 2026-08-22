@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import xml.etree.ElementTree as ET
+import fcntl
 from pathlib import Path
 
 import requests
@@ -27,6 +28,7 @@ import strm_generator
 log = logging.getLogger(__name__)
 
 _run_lock = threading.Lock()
+_PROCESS_LOCK_PATH = "/data/media-enrichment.lock"
 _EPISODE_SUFFIX = re.compile(r"\s+S\d{1,2}E\d{1,3}.*$", re.IGNORECASE)
 _ANALYSIS_SETTINGS = (
     "GenerateBIFBehavior",
@@ -355,8 +357,17 @@ def run_once() -> dict:
     batch: list[dict] = []
     overlays: list[tuple[Path, Path]] = []
     tokens: list[str] = []
+    process_lock = None
     try:
+        process_lock = open(_PROCESS_LOCK_PATH, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(process_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "already-running"}
         recover_overlays()
+        resumed = db.reset_interrupted_enrichment()
+        if resumed:
+            log.warning("Enrichment requeued %d interrupted item(s)", resumed)
         if playback_guard.defer("media_enrichment"):
             return {"status": "deferred-playback"}
         batch = db.get_enrichment_batch()
@@ -412,4 +423,9 @@ def run_once() -> dict:
                 _restore_overlay(stub, backup)
             except Exception as exc:
                 log.critical("Enrichment stub restore failed for %s: %s", stub, exc)
+        if process_lock is not None:
+            try:
+                fcntl.flock(process_lock.fileno(), fcntl.LOCK_UN)
+            finally:
+                process_lock.close()
         _run_lock.release()

@@ -94,3 +94,16 @@ def test_recovery_candidates_are_limited_to_incomplete_queue_items():
     assert [(item["token"], item["state"]) for item in candidates] == [
         (queued, "queued")
     ]
+
+
+def test_interrupted_states_are_requeued():
+    downloading = _episode(1, 1)
+    analyzing = _episode(1, 2)
+    for token, state in ((downloading, "downloading"), (analyzing, "analyzing")):
+        item = db.get_virtual_item(token)
+        item["enrichment_priority"] = 0
+        db.queue_media_enrichment([item])
+        db.set_enrichment_state([token], state)
+
+    assert db.reset_interrupted_enrichment() == 2
+    assert db.enrichment_counts() == {"queued": 2}
