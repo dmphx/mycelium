@@ -89,6 +89,17 @@ def _cache_path(token: str) -> Path:
     return _cache_dir() / f"{token}.media"
 
 
+def local_stream_path(token: str) -> Path | None:
+    """Return staged media only while Plex is analyzing this queue item."""
+    if db.get_enrichment_state(token) != "analyzing":
+        return None
+    path = _cache_path(token)
+    try:
+        return path if path.is_file() and path.stat().st_size >= 1024 * 1024 else None
+    except OSError:
+        return None
+
+
 def _stub_path(item: dict) -> Path:
     strm_path = Path(item["strm_path"])
     return strm_generator._spore_stub_dir(strm_path) / (strm_path.stem + ".mkv")

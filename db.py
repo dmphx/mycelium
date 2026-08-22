@@ -1641,6 +1641,14 @@ def reset_interrupted_enrichment() -> int:
         return cursor.rowcount
 
 
+def get_enrichment_state(token: str) -> str | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state FROM media_enrichment_queue WHERE token=?", (token,)
+        ).fetchone()
+        return str(row["state"]) if row else None
+
+
 def set_enrichment_state(tokens: list[str], state: str,
                          error: str | None = None) -> None:
     if not tokens:

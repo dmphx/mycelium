@@ -6,7 +6,7 @@ import re
 import threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, stream_with_context, url_for
+from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, send_file, stream_with_context, url_for
 
 import auto_approve
 import backup
@@ -1999,6 +1999,18 @@ def spore_stream_proxy(token: str):
     started = _t.monotonic()
     ua  = request.headers.get("User-Agent", "?")[:80]
     rng = request.headers.get("Range", "-")
+
+    # Native Plex analysis reaches media through the active Spore NFS library.
+    # Serve the already-validated staged file for an analyzing queue item so
+    # analyzer reads do not touch watch history or re-fetch the CDN object.
+    local_media = enrichment.local_stream_path(token)
+    if local_media is not None:
+        log.info("spore-stream: local enrichment token=%s range=%s", token, rng)
+        return send_file(
+            str(local_media),
+            mimetype="application/octet-stream",
+            conditional=True,
+        )
 
     url = catbox.materialize(token)
     if not url:

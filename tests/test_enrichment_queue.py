@@ -107,3 +107,13 @@ def test_interrupted_states_are_requeued():
 
     assert db.reset_interrupted_enrichment() == 2
     assert db.enrichment_counts() == {"queued": 2}
+
+
+def test_enrichment_state_lookup():
+    token = _episode(1, 1)
+    item = db.get_virtual_item(token)
+    item["enrichment_priority"] = 0
+    db.queue_media_enrichment([item])
+
+    assert db.get_enrichment_state(token) == "queued"
+    assert db.get_enrichment_state("missing") is None
