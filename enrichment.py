@@ -98,13 +98,19 @@ def _backup_path(stub: Path) -> Path:
 
 def recover_overlays() -> int:
     """Restore stubs left swapped by a killed worker."""
-    root = Path(config.SPORE_MEDIA_PATH)
     restored = 0
-    if not root.exists():
-        return 0
-    for backup in root.rglob(".*.mkv.enrichment-stub"):
-        original_name = backup.name[1:-len(".enrichment-stub")]
-        stub = backup.with_name(original_name)
+    # Do not recursively walk the virtual library here. Large libraries can
+    # make that scan take minutes and it also crosses paths served by Spore.
+    # Every overlay originates from a virtual item, so derive the exact paths
+    # from the database instead.
+    for item in db.get_all_virtual_items():
+        try:
+            stub = _stub_path(item)
+        except (KeyError, TypeError, ValueError):
+            continue
+        backup = _backup_path(stub)
+        if not backup.exists():
+            continue
         try:
             if stub.is_symlink() or stub.exists():
                 stub.unlink()
