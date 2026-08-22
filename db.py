@@ -1611,6 +1611,20 @@ def get_enrichment_batch() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_enrichment_recovery_items() -> list[dict]:
+    """Return only queue items that could own an interrupted stub overlay."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT q.token, q.state, v.strm_path
+            FROM media_enrichment_queue q
+            JOIN virtual_items v ON v.token=q.token
+            WHERE q.state != 'complete'
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def set_enrichment_state(tokens: list[str], state: str,
                          error: str | None = None) -> None:
     if not tokens:

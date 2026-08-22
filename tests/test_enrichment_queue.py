@@ -78,3 +78,19 @@ def test_same_release_stays_complete_but_new_hash_requeues():
     changed["info_hash"] = "b" * 40
     db.queue_media_enrichment([changed])
     assert db.enrichment_counts() == {"queued": 1}
+
+
+def test_recovery_candidates_are_limited_to_incomplete_queue_items():
+    queued = _episode(1, 1)
+    complete = _episode(1, 2)
+    for token in (queued, complete):
+        item = db.get_virtual_item(token)
+        item["enrichment_priority"] = 0
+        db.queue_media_enrichment([item])
+    db.set_enrichment_state([complete], "complete")
+
+    candidates = db.get_enrichment_recovery_items()
+
+    assert [(item["token"], item["state"]) for item in candidates] == [
+        (queued, "queued")
+    ]

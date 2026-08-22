@@ -101,9 +101,9 @@ def recover_overlays() -> int:
     restored = 0
     # Do not recursively walk the virtual library here. Large libraries can
     # make that scan take minutes and it also crosses paths served by Spore.
-    # Every overlay originates from a virtual item, so derive the exact paths
-    # from the database instead.
-    for item in db.get_all_virtual_items():
+    # Every overlay originates from an incomplete enrichment queue item, so
+    # derive only those exact paths from the database instead.
+    for item in db.get_enrichment_recovery_items():
         try:
             stub = _stub_path(item)
         except (KeyError, TypeError, ValueError):
