@@ -24,8 +24,10 @@ import catbox  # noqa: E402
 @pytest.fixture(autouse=True)
 def _clear_touch_cache():
     catbox._touch_cache.clear()
+    catbox.invalidate_url_cache()
     yield
     catbox._touch_cache.clear()
+    catbox.invalidate_url_cache()
 
 
 @pytest.fixture
@@ -53,3 +55,10 @@ def test_writes_again_after_window(writes):
     catbox._touch_cache.clear()  # stands in for the 60s TTL expiring
     catbox._touch_debounced("tok1")
     assert writes == ["tok1", "tok1"]
+
+
+def test_background_materialize_does_not_record_playback(writes):
+    catbox.cache_url("tok1", "https://cdn.example.invalid/media")
+
+    assert catbox.materialize("tok1", record_playback=False)
+    assert writes == []

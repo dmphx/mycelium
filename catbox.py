@@ -167,6 +167,7 @@ _touch_cache: "cachetools.TTLCache[str, bool]" = cachetools.TTLCache(
     maxsize=10000, ttl=_TOUCH_DEBOUNCE_SEC
 )
 _touch_cache_lock = threading.Lock()
+_materialize_context = threading.local()
 
 
 def _touch_debounced(token: str) -> None:
@@ -180,6 +181,18 @@ def _touch_debounced(token: str) -> None:
             return
         _touch_cache[token] = True
     db.touch_virtual_item(token)
+    try:
+        import enrichment
+        enrichment.queue_from_playback(token)
+    except Exception as exc:
+        log.debug("Enrichment playback queue failed for %s: %s", token, exc)
+
+
+def _record_playback_touch(token: str) -> None:
+    """Touch real playback, but not background preparation reads."""
+    if getattr(_materialize_context, "background", False):
+        return
+    _touch_debounced(token)
 
 
 def _cache_get(token: str) -> str | None:
@@ -237,7 +250,8 @@ def register(info_hash: str, magnet: str, title: str, media_type: str,
     return token
 
 
-def materialize(token: str, allow_readd: bool | None = None) -> str | None:
+def materialize(token: str, allow_readd: bool | None = None,
+                record_playback: bool = True) -> str | None:
     """Ensure the torrent is in TorBox and return a fresh stream URL.
     Cached URLs are served for up to 30 minutes to absorb Jellyfin's probe/seek
     bursts without spending TorBox createtorrent rate-limit slots.
@@ -246,9 +260,18 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
     can block ~45s waiting for it to become ready). When None (default), it is
     auto-decided: during a scan-burst we skip the re-add so the scan stays fast.
     """
+    previous_background = getattr(_materialize_context, "background", False)
+    _materialize_context.background = previous_background or not record_playback
+    try:
+        return _materialize_inner(token, allow_readd)
+    finally:
+        _materialize_context.background = previous_background
+
+
+def _materialize_inner(token: str, allow_readd: bool | None = None) -> str | None:
     cached = _cache_get(token)
     if cached:
-        _touch_debounced(token)
+        _record_playback_touch(token)
         return cached
 
     # Respect failure cooldown  -  don't spam TorBox after a recent failed attempt.
@@ -262,14 +285,15 @@ def materialize(token: str, allow_readd: bool | None = None) -> str | None:
         # Re-check inside the lock: another thread may have succeeded or set cooldown.
         cached = _cache_get(token)
         if cached:
-            _touch_debounced(token)
+            _record_playback_touch(token)
             return cached
         if _fail_get(token):
             return None
         url = _materialize_locked(token, allow_readd=allow_readd)
         if url:
             _cache_put(token, url)
-            _schedule_next_episode_preload(token)
+            if not getattr(_materialize_context, "background", False):
+                _schedule_next_episode_preload(token)
         else:
             # Do not clobber a more specific cooldown that _materialize_locked
             # already set (the short readying window, or a long 429 / no-cached
@@ -417,7 +441,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
     if protocol == "usenet":
         url = _materialize_usenet(token, item)
         if url:
-            db.touch_virtual_item(token)
+            _record_playback_touch(token)
             if ckey:
                 db.update_playability_ok(ckey, "torbox-usenet")
         return url
@@ -433,7 +457,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
             if info and info.get("status") == "downloaded":
                 url = _rd_get_url(item, rd_id)
                 if url:
-                    db.touch_virtual_item(token)
+                    _record_playback_touch(token)
                     if ckey:
                         db.update_playability_ok(ckey, "realdebrid")
                     _metrics_inc("ok" if not rematerialized else "rematerialized")
@@ -486,7 +510,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                 db.update_virtual_rd_id(token, rd_id)
                 url = _rd_get_url(item, rd_id)
                 if url:
-                    db.touch_virtual_item(token)
+                    _record_playback_touch(token)
                     if ckey:
                         db.update_playability_ok(ckey, "realdebrid")
                     _metrics_inc("rematerialized")
@@ -570,7 +594,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                         db.update_virtual_rd_id(token, rd_id)
                         url = _rd_get_url(item, rd_id)
                         if url:
-                            db.touch_virtual_item(token)
+                            _record_playback_touch(token)
                             if ckey:
                                 db.update_playability_ok(ckey, "realdebrid")
                             _metrics_inc("rematerialized")
@@ -623,7 +647,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                 item["rd_id"] = rd_id
                 url = _rd_get_url(item, rd_id)
                 if url:
-                    db.touch_virtual_item(token)
+                    _record_playback_touch(token)
                     if ckey:
                         db.update_playability_ok(ckey, "realdebrid")
                     _metrics_inc("rematerialized")
@@ -759,7 +783,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
     import strm_generator
     url = strm_generator._get_stream_url(torbox_id, file_id)
     if url:
-        db.touch_virtual_item(token)
+        _record_playback_touch(token)
         if ckey:
             db.update_playability_ok(ckey, "torbox")
         _metrics_inc("rematerialized" if rematerialized else "ok")

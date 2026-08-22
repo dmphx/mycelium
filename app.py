@@ -18,6 +18,7 @@ import config as cfg
 import continue_watching
 import db
 import discord_integration
+import enrichment
 import health
 import identity_repair
 import jellyfin
@@ -605,6 +606,19 @@ def _start_scheduler() -> BackgroundScheduler:
         threading.Thread(target=_spore_flip_worker, name="spore-flip-worker",
                          daemon=True).start()
         log.info("Scheduled spore-nfs cache-status refresh every %dm", _spore_refresh_min)
+
+        if enrichment.enabled():
+            scheduler.add_job(
+                enrichment.run_once,
+                trigger="interval", minutes=cfg.ENRICHMENT_INTERVAL_MINUTES,
+                id="media_enrichment", next_run_time=None,
+                max_instances=1, coalesce=True,
+            )
+            log.info(
+                "Scheduled media enrichment every %dm (season cap=%d, next=%d)",
+                cfg.ENRICHMENT_INTERVAL_MINUTES, cfg.ENRICHMENT_SEASON_CAP,
+                cfg.ENRICHMENT_NEXT_SEASON_EPISODES,
+            )
 
     if not LITE_MODE:
         if AUTO_UPGRADE_ENABLED and AUTO_UPGRADE_INTERVAL_HOURS > 0:

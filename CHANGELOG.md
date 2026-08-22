@@ -9,6 +9,9 @@ All notable changes to Mycelium are documented in this file.
 - A versioned, read-only Discord integration API protected by a dedicated bearer token
 - Sanitized health, request, playability, dependency, and TorBox summaries
 - Cursor-based activity events that omit paths, hashes, URLs, and requester identity
+- Progression-aware native Plex enrichment that stages real media only while
+  playback is idle, restores the original Spore stubs after analysis, caps a
+  played season at 40 episodes, and prepares four episodes from the next season
 
 ## [0.6.2] - 2026-08-16
 

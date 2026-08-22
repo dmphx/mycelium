@@ -143,6 +143,25 @@ CREATE TABLE IF NOT EXISTS virtual_items (
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS media_enrichment_queue (
+    token             TEXT PRIMARY KEY,
+    info_hash         TEXT NOT NULL,
+    imdb_id           TEXT,
+    title             TEXT NOT NULL,
+    media_type        TEXT NOT NULL,
+    season            INTEGER,
+    episode           INTEGER,
+    priority          INTEGER NOT NULL DEFAULT 100,
+    reason            TEXT NOT NULL DEFAULT 'playback',
+    state             TEXT NOT NULL DEFAULT 'queued',
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    queued_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    started_at        TEXT,
+    completed_at      TEXT,
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS failed_hashes (
     info_hash      TEXT    PRIMARY KEY,
     fail_count     INTEGER NOT NULL DEFAULT 1,
@@ -214,6 +233,8 @@ CREATE INDEX IF NOT EXISTS idx_media_items_status         ON media_items(status)
 CREATE INDEX IF NOT EXISTS idx_failed_hashes_failcount    ON failed_hashes(fail_count);
 CREATE INDEX IF NOT EXISTS idx_virtual_items_torbox       ON virtual_items(torbox_id);
 CREATE INDEX IF NOT EXISTS idx_virtual_items_lastplayed   ON virtual_items(last_played);
+CREATE INDEX IF NOT EXISTS idx_enrichment_state_priority  ON media_enrichment_queue(state, priority, queued_at);
+CREATE INDEX IF NOT EXISTS idx_enrichment_series_season   ON media_enrichment_queue(imdb_id, season, state);
 CREATE INDEX IF NOT EXISTS idx_metric_events_metric_time  ON metric_events(metric, created_at);
 CREATE INDEX IF NOT EXISTS idx_metric_events_created      ON metric_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_activity_log_created       ON activity_log(created_at DESC);
@@ -1483,6 +1504,196 @@ def touch_virtual_item(token: str) -> None:
             (token,),
         )
         conn.commit()
+
+
+def queue_media_enrichment(items: list[dict], reason: str = "playback") -> int:
+    """Idempotently queue media for release-specific analysis.
+
+    Completed work remains valid while the token still resolves to the same
+    info hash. A re-resolve changes the hash and queues the new release because
+    its marker timestamps and preview frames may differ.
+    """
+    if not items:
+        return 0
+    changed = 0
+    with _connect() as conn:
+        for item in items:
+            token = item.get("token")
+            info_hash = item.get("info_hash")
+            title = item.get("title")
+            if not (token and info_hash and title):
+                continue
+            priority = int(item.get("enrichment_priority", 100))
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT INTO media_enrichment_queue
+                    (token, info_hash, imdb_id, title, media_type, season, episode,
+                     priority, reason, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+                ON CONFLICT(token) DO UPDATE SET
+                    info_hash=excluded.info_hash,
+                    imdb_id=excluded.imdb_id,
+                    title=excluded.title,
+                    media_type=excluded.media_type,
+                    season=excluded.season,
+                    episode=excluded.episode,
+                    priority=MIN(media_enrichment_queue.priority, excluded.priority),
+                    reason=excluded.reason,
+                    state=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN 'queued' ELSE media_enrichment_queue.state END,
+                    attempts=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN 0 ELSE media_enrichment_queue.attempts END,
+                    last_error=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.last_error END,
+                    completed_at=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.completed_at END,
+                    updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+                WHERE media_enrichment_queue.info_hash != excluded.info_hash
+                   OR excluded.priority < media_enrichment_queue.priority
+                """,
+                (token, info_hash, item.get("imdb_id"), title,
+                 item.get("media_type") or "series", item.get("season"),
+                 item.get("episode"), priority, reason),
+            )
+            if conn.total_changes > before:
+                changed += 1
+        conn.commit()
+    return changed
+
+
+def get_enrichment_batch() -> list[dict]:
+    """Return the highest-priority queued season, or one queued movie."""
+    with _connect() as conn:
+        first = conn.execute(
+            """
+            SELECT * FROM media_enrichment_queue
+            WHERE state IN ('queued', 'staged', 'failed') AND attempts < 5
+            ORDER BY priority, queued_at LIMIT 1
+            """
+        ).fetchone()
+        if not first:
+            return []
+        if first["media_type"] == "series" and first["season"] is not None:
+            selector = "q.imdb_id=?"
+            selector_params: list = [first["imdb_id"]]
+            if not first["imdb_id"]:
+                base = (first["title"] or "").split(" S", 1)[0]
+                selector = "q.imdb_id IS NULL AND q.title LIKE ?"
+                selector_params = [base + " S%"]
+            rows = conn.execute(
+                f"""
+                SELECT q.*, v.strm_path, v.file_id, v.torbox_id, v.protocol,
+                       v.debrid_provider, v.size_gb
+                FROM media_enrichment_queue q
+                JOIN virtual_items v ON v.token=q.token
+                WHERE {selector} AND q.season=?
+                  AND q.state IN ('queued', 'staged', 'failed') AND q.attempts < 5
+                ORDER BY q.episode, q.priority
+                """,
+                (*selector_params, first["season"]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT q.*, v.strm_path, v.file_id, v.torbox_id, v.protocol,
+                       v.debrid_provider, v.size_gb
+                FROM media_enrichment_queue q
+                JOIN virtual_items v ON v.token=q.token
+                WHERE q.token=?
+                """,
+                (first["token"],),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_enrichment_state(tokens: list[str], state: str,
+                         error: str | None = None) -> None:
+    if not tokens:
+        return
+    placeholders = ",".join("?" for _ in tokens)
+    with _connect() as conn:
+        fields = ["state=?", "updated_at=strftime('%Y-%m-%d %H:%M:%S','now')"]
+        params: list = [state]
+        if state in ("downloading", "analyzing"):
+            fields.extend([
+                "started_at=COALESCE(started_at, strftime('%Y-%m-%d %H:%M:%S','now'))",
+            ])
+        if state == "downloading":
+            fields.append("attempts=attempts+1")
+        if state == "complete":
+            fields.extend([
+                "completed_at=strftime('%Y-%m-%d %H:%M:%S','now')",
+                "last_error=NULL",
+            ])
+        elif error is not None:
+            fields.append("last_error=?")
+            params.append(error[:500])
+        params.extend(tokens)
+        conn.execute(
+            f"UPDATE media_enrichment_queue SET {', '.join(fields)} "
+            f"WHERE token IN ({placeholders})",
+            params,
+        )
+        conn.commit()
+
+
+def get_series_enrichment_items(token: str, season_cap: int = 40,
+                                next_count: int = 4) -> list[dict]:
+    """Build the progression queue for a played episode."""
+    item = get_virtual_item(token)
+    if not item or item.get("media_type") != "series" or item.get("season") is None:
+        return [item] if item else []
+    imdb_id = item.get("imdb_id")
+    with _connect() as conn:
+        if imdb_id:
+            rows = conn.execute(
+                """SELECT * FROM virtual_items
+                   WHERE media_type='series' AND imdb_id=? AND season IS NOT NULL
+                   ORDER BY season, episode""",
+                (imdb_id,),
+            ).fetchall()
+        else:
+            base = (item.get("title") or "").split(" S", 1)[0]
+            rows = conn.execute(
+                """SELECT * FROM virtual_items
+                   WHERE media_type='series' AND title LIKE ? AND season IS NOT NULL
+                   ORDER BY season, episode""",
+                (base + " S%",),
+            ).fetchall()
+    current_season = int(item["season"])
+    current_episode = int(item.get("episode") or 0)
+    current = [dict(r) for r in rows if int(r["season"]) == current_season]
+    current = current[:max(1, min(int(season_cap), 40))]
+    later_seasons = sorted({int(r["season"]) for r in rows if int(r["season"]) > current_season})
+    next_items: list[dict] = []
+    if later_seasons:
+        next_season = later_seasons[0]
+        next_items = [dict(r) for r in rows if int(r["season"]) == next_season]
+        next_items = next_items[:max(0, int(next_count))]
+    for row in current:
+        ep = int(row.get("episode") or 0)
+        if ep == current_episode + 1:
+            row["enrichment_priority"] = 0
+        elif ep == current_episode + 2:
+            row["enrichment_priority"] = 1
+        else:
+            row["enrichment_priority"] = 10 + abs(ep - current_episode)
+    for row in next_items:
+        row["enrichment_priority"] = 100 + int(row.get("episode") or 0)
+    return current + next_items
+
+
+def enrichment_counts() -> dict[str, int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT state, COUNT(*) AS n FROM media_enrichment_queue GROUP BY state"
+        ).fetchall()
+    return {r["state"]: r["n"] for r in rows}
 
 
 def get_idle_virtual_items(cutoff_iso: str) -> list[dict]:

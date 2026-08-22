@@ -277,6 +277,32 @@ volumes:
   - ./spore-cache:/mnt/spore-cache       # optional bounded playback cache
 ```
 
+### Progression enrichment
+
+Plex marker and preview generation needs real media bytes, not the small Spore
+stub. Optional progression enrichment stages a bounded local copy only while
+Plex is idle, runs native targeted analysis, and then restores the exact stub.
+Watching an episode queues up to 40 episodes from its season plus four episodes
+from the next populated season. Completed work is invalidated if Mycelium
+changes the release hash.
+
+```yaml
+environment:
+  - ENRICHMENT_ENABLED=true
+  - ENRICHMENT_SEASON_CAP=40
+  - ENRICHMENT_NEXT_SEASON_EPISODES=4
+  - ENRICHMENT_CACHE_DIR=/mnt/spore-cache/analysis
+  - ENRICHMENT_MAX_BATCH_GB=160
+volumes:
+  # Mount the same absolute path into both Mycelium (read-write) and Plex
+  # (read-only), because the temporary stub symlink uses this exact path.
+  - ./spore-cache/analysis:/mnt/spore-cache/analysis
+```
+
+The Plex container also needs the analysis directory mounted read-only. Set
+`PLEX_URL` and `PLEX_TOKEN` in Mycelium, keep Plex Butler deep-analysis tasks
+disabled, and never use the Plex `asap` analysis mode with a virtual library.
+
 In your Plex container, add an entrypoint that installs the wrapper once:
 
 ```yaml
