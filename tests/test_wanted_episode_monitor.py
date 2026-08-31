@@ -1,4 +1,37 @@
 import monitor
+from torrentio import TorrentioStream
+
+
+def _stream(title, *, usenet=True):
+    return TorrentioStream(
+        name=title,
+        title=title,
+        info_hash=("a" if usenet else "b") * 40,
+        quality="1080p",
+        seeders=1,
+        size_gb=1.0,
+        is_season_pack=False,
+        source="test",
+        protocol="usenet" if usenet else "torrent",
+        nzb_url="https://example.invalid/item.nzb" if usenet else None,
+    )
+
+
+def test_ambiguous_nzb_requires_current_episode_title_after_sanity_failure():
+    classic = _stream("Bleach S02E01 1080p BluRay")
+    current = _stream("Bleach S02E01 The Blood Warfare 1080p WEB-DL")
+
+    assert monitor._safe_episode_nzbs(
+        [classic, current], "The Blood Warfare", True, "Bleach S02E01"
+    ) == [current]
+
+
+def test_nzb_numbering_remains_available_without_a_sanity_conflict():
+    numbered = _stream("Example Show S03E04 1080p WEB-DL")
+
+    assert monitor._safe_episode_nzbs(
+        [numbered], "An Episode Title", False, "Example Show S03E04"
+    ) == [numbered]
 
 
 def test_episode_exists_in_zero_padded_season_folder(tmp_path, monkeypatch):

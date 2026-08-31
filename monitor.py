@@ -295,6 +295,31 @@ def run_series_backfill() -> dict:
     return summary
 
 
+def _safe_episode_nzbs(candidates: list, expected_title: str,
+                       require_title: bool, label: str) -> list:
+    """Keep unverifiable NZBs out after every cached torrent failed file sanity.
+
+    A numbered NZB cannot be inspected before TorBox fetches it. If cached
+    torrents for the same lookup all proved to be the wrong episode, the shared
+    SxxEyy label is ambiguous and the NZB must also carry the current metadata
+    title before it is safe to add.
+    """
+    nzbs = [item for item in candidates if item.is_usenet and item.nzb_url]
+    if not require_title:
+        return nzbs
+    verified = [
+        item for item in nzbs
+        if expected_title and torrentio._episode_title_match(item, expected_title)
+    ]
+    if len(verified) != len(nzbs):
+        log.warning(
+            "Monitor: rejected %d unverifiable NZB candidate(s) for %s after "
+            "cached torrent file-sanity failures",
+            len(nzbs) - len(verified), label,
+        )
+    return verified
+
+
 def _retry_episode(ep: dict) -> bool:
     """Search + add one episode. Returns True if added. Raises processor.RateLimited
     when the TorBox createtorrent budget is gone (so the caller can pause)."""
@@ -303,9 +328,10 @@ def _retry_episode(ep: dict) -> bool:
     log.info("Monitor: searching %s S%02dE%02d (attempt %d)", title, season, episode, ep["attempt_count"] + 1)
     db.increment_episode_attempt(ep["id"])
 
+    search_override = processor._episode_search_override(imdb_id, season, episode)
     candidates = search_engine.search_candidates(
         "series", imdb_id, title, season=season, episode=episode,
-        override=processor._episode_search_override(imdb_id, season, episode),
+        override=search_override,
         trigger="wanted_episode", prowlarr_on_cache_miss=True)
     ckey = search_engine.content_key(imdb_id, season, episode)
 
@@ -314,14 +340,19 @@ def _retry_episode(ep: dict) -> bool:
     if _settings.get("CATBOX_MODE", False):
         import release_sanity
 
+        sanity_rejected_cached = False
+
         def _cached_torrents(items: list) -> list:
+            nonlocal sanity_rejected_cached
             torrents = [s for s in items if not s.is_usenet]
             cache_results = search_engine.cache_map(ckey, torrents)
             hashes = cache_results.get("torbox", set())
-            cached = [s for s in torrents if s.info_hash in hashes]
-            return release_sanity.filter_cached(
-                cached, kind="episode", season=season, episode=episode,
+            cached_before_sanity = [s for s in torrents if s.info_hash in hashes]
+            cached = release_sanity.filter_cached(
+                cached_before_sanity, kind="episode", season=season, episode=episode,
                 imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
+            sanity_rejected_cached = bool(cached_before_sanity and not cached)
+            return cached
 
         cached = _cached_torrents(candidates)
         best = cached[0] if cached else None
@@ -345,7 +376,12 @@ def _retry_episode(ep: dict) -> bool:
                 log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
                 return True
 
-        nzbs = [s for s in candidates if s.is_usenet and s.nzb_url]
+        nzbs = _safe_episode_nzbs(
+            candidates,
+            expected_title=str(search_override.get("episode_title") or ""),
+            require_title=sanity_rejected_cached,
+            label=f"{title} S{season:02d}E{episode:02d}",
+        )
         if nzbs:
             best_nzb = nzbs[0]
             try:
@@ -394,19 +430,35 @@ def _retry_episode(ep: dict) -> bool:
     torrent_hashes = [s.info_hash for s in candidates if not s.is_usenet]
     cached_hashes = search_engine.cache_map(ckey, candidates).get("torbox", set()) \
         if torrent_hashes else set()
-    cached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes]
+    cached_before_sanity = [
+        s for s in candidates if not s.is_usenet and s.info_hash in cached_hashes
+    ]
     # Drop any cached torrent whose real TorBox files aren't this episode (e.g. a
     # full-season/complete-series pack with no identifiable SxxEyy file), so we
     # don't add a hash that can never materialise this episode.
     import release_sanity
     cached_torrents = release_sanity.filter_cached(
-        cached_torrents, kind="episode", season=season, episode=episode,
+        cached_before_sanity, kind="episode", season=season, episode=episode,
         imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
-    nzbs = [s for s in candidates if s.is_usenet]
+    require_title = bool(cached_before_sanity and not cached_torrents)
+    nzbs = _safe_episode_nzbs(
+        candidates,
+        expected_title=str(search_override.get("episode_title") or ""),
+        require_title=require_title,
+        label=f"{title} S{season:02d}E{episode:02d}",
+    )
     uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
+    if require_title:
+        expected_title = str(search_override.get("episode_title") or "")
+        uncached_torrents = [
+            item for item in uncached_torrents
+            if expected_title and torrentio._episode_title_match(item, expected_title)
+        ]
     ordered = cached_torrents + nzbs + uncached_torrents
     if not ordered:
-        ordered = candidates[:1]
+        log.info("Monitor: no identity-verifiable candidates for %s S%02dE%02d",
+                 title, season, episode)
+        return False
     for stream in ordered:
         if stream.is_usenet:
             if not stream.nzb_url:
