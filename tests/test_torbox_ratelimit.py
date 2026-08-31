@@ -68,3 +68,46 @@ def test_released_slot_is_available_again(monkeypatch):
     torbox._reserve_createtorrent_slot("test")
     with pytest.raises(torbox.RateLimited):
         torbox._reserve_createtorrent_slot("test")
+
+
+class _Response:
+    def __init__(self, payload=None, content=b"", status_code=200):
+        self._payload = payload or {}
+        self.content = content
+        self.status_code = status_code
+        self.headers = {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise torbox.requests.HTTPError(str(self.status_code))
+
+    def json(self):
+        return self._payload
+
+
+def test_add_nzb_uses_shared_atomic_reservation(monkeypatch):
+    monkeypatch.setattr(
+        torbox.requests, "get", lambda *_args, **_kwargs: _Response(content=b"nzb"))
+    monkeypatch.setattr(
+        torbox.requests,
+        "post",
+        lambda *_args, **_kwargs: _Response(
+            payload={"success": True, "data": {"usenet_download_id": 42}}),
+    )
+
+    result = torbox.add_nzb("https://indexer.invalid/item", name="Episode")
+
+    assert result["id"] == 42
+    assert len(torbox._CREATETORRENT_LOG) == 1
+
+
+def test_add_nzb_releases_reservation_when_post_fails(monkeypatch):
+    monkeypatch.setattr(
+        torbox.requests, "get", lambda *_args, **_kwargs: _Response(content=b"nzb"))
+    monkeypatch.setattr(
+        torbox.requests, "post", lambda *_args, **_kwargs: _Response(status_code=500))
+
+    with pytest.raises(torbox.requests.HTTPError):
+        torbox.add_nzb("https://indexer.invalid/item", name="Episode")
+
+    assert len(torbox._CREATETORRENT_LOG) == 0

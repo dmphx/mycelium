@@ -177,48 +177,38 @@ def add_nzb(nzb_url: str, name: str | None = None, timeout: int = 30,
     NZB cannot be fetched locally.
     """
     url = f"{_base_url().rstrip('/')}/usenet/createusenetdownload"
-    usage_hour = createtorrent_usage(window_sec=3600)
-    usage_min  = createtorrent_usage(window_sec=60)
-    if usage_hour["count"] >= _CREATETORRENT_LIMIT_HOUR - 2:
-        log.warning("createusenetdownload [%s] SKIPPED  -  hourly quota %d/%d reached (resets ~%ds)",
-                    reason, usage_hour["count"], _CREATETORRENT_LIMIT_HOUR,
-                    usage_hour["resets_in_sec"])
-        raise RateLimited()
-    if usage_min["count"] >= _CREATETORRENT_LIMIT_MIN - 1:
-        log.warning("createusenetdownload [%s] SKIPPED  -  per-minute burst %d/%d reached",
-                    reason, usage_min["count"], _CREATETORRENT_LIMIT_MIN)
-        raise RateLimited()
-    _record_createtorrent(reason)
-    log.info("createusenetdownload [%s] (%d/60h, %d/10m): %s",
-             reason, usage_hour["count"] + 1, usage_min["count"] + 1, nzb_url[:80])
-    # Prefer uploading the NZB *content* over passing a link. Indexer download
-    # URLs are frequently internal (e.g. http://prowlarr:9696/...) and therefore
-    # unreachable from TorBox's cloud, which makes the link-based add fail with a
-    # 500. We are on the same network as the indexer, so fetch the NZB ourselves
-    # and upload the file; fall back to the link only if the fetch fails.
-    data = {"name": name} if name else {}
-    nzb_bytes = None
+    entry = _reserve_createtorrent_slot(reason)
+    log.info("createusenetdownload [%s]: %s", reason, name or "unnamed NZB")
     try:
-        nzb_resp = requests.get(nzb_url, timeout=timeout)
-        nzb_resp.raise_for_status()
-        nzb_bytes = nzb_resp.content or None
-    except requests.RequestException as exc:
-        log.warning("createusenetdownload [%s] could not fetch NZB (%s)  -  falling back to link",
-                    reason, exc)
-    if nzb_bytes:
-        fname = (name or "download").replace("/", "_")[:80] + ".nzb"
-        resp = requests.post(url, headers=_headers(),
-                             files={"file": (fname, nzb_bytes, "application/x-nzb")},
-                             data=data, timeout=timeout)
-    else:
-        data["link"] = nzb_url
-        resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
-    if resp.status_code == 429:
-        retry_after = int(resp.headers.get("Retry-After", 60))
-        log.warning("createusenetdownload [%s] got 429 from TorBox (Retry-After=%ds)",
-                    reason, retry_after)
-        raise RateLimited()
-    resp.raise_for_status()
+        # Prefer uploading the NZB content. Internal indexer URLs are not
+        # reachable from TorBox, so the link form is only a fallback.
+        data = {"name": name} if name else {}
+        nzb_bytes = None
+        try:
+            nzb_resp = requests.get(nzb_url, timeout=timeout)
+            nzb_resp.raise_for_status()
+            nzb_bytes = nzb_resp.content or None
+        except requests.RequestException as exc:
+            log.warning("createusenetdownload [%s] could not fetch NZB (%s)  -  falling back to link",
+                        reason, exc)
+        if nzb_bytes:
+            fname = (name or "download").replace("/", "_")[:80] + ".nzb"
+            resp = requests.post(url, headers=_headers(),
+                                 files={"file": (fname, nzb_bytes, "application/x-nzb")},
+                                 data=data, timeout=timeout)
+        else:
+            data["link"] = nzb_url
+            resp = requests.post(url, headers=_headers(), data=data, timeout=timeout)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            log.warning("createusenetdownload [%s] got 429 from TorBox (Retry-After=%ds)",
+                        reason, retry_after)
+            raise RateLimited()
+        resp.raise_for_status()
+    except Exception:
+        _release_createtorrent_slot(entry)
+        raise
+    _persist_createtorrent(*entry)
     payload = resp.json() or {}
     if not payload.get("success", False):
         if payload.get("error") == "DUPLICATE_ITEM":
