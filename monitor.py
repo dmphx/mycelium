@@ -293,6 +293,7 @@ def _retry_episode(ep: dict) -> bool:
 
     candidates = search_engine.search_candidates(
         "series", imdb_id, title, season=season, episode=episode,
+        override=processor._episode_search_override(imdb_id, season, episode),
         trigger="wanted_episode", prowlarr_on_cache_miss=True)
     ckey = search_engine.content_key(imdb_id, season, episode)
 

@@ -148,3 +148,46 @@ def test_web_playback_profile_prefers_h264_aac_over_hevc_truehd():
     ranked = torrentio.rank_streams([hevc, h264])
 
     assert ranked[0].info_hash == "b" * 40
+
+
+def test_episode_title_match_rejects_reused_season_number():
+    old = _stream(
+        "Futurama.S11E01.The.Impossible.Stream.1080p.WEB-DL",
+        "1080p", 0.42, seeders=500,
+    )
+    old.info_hash = "a" * 40
+    current = _stream(
+        "Futurama.S11E01.Beef.1080p.WEB-DL",
+        "1080p", 0.75, seeders=15,
+    )
+    current.info_hash = "b" * 40
+
+    ranked = torrentio.rank_streams(
+        [old, current], override={"episode_title": "Beef"})
+
+    assert [stream.info_hash for stream in ranked] == ["b" * 40]
+
+
+def test_episode_title_match_normalizes_punctuation():
+    matching = _stream(
+        "Show.S03E04.Our.Flag-Means_Medical.Coverage.1080p.WEB-DL",
+        "1080p", 0.75,
+    )
+    other = _stream("Show.S03E04.1080p.WEB-DL", "1080p", 0.70)
+    other.info_hash = "b" * 40
+
+    ranked = torrentio.rank_streams(
+        [other, matching],
+        override={"episode_title": "Our Flag Means Medical Coverage"},
+    )
+
+    assert ranked == [matching]
+
+
+def test_episode_title_filter_fails_open_when_releases_omit_title():
+    generic = _stream("Show.S03E04.1080p.WEB-DL", "1080p", 0.70)
+
+    ranked = torrentio.rank_streams(
+        [generic], override={"episode_title": "A Very Specific Title"})
+
+    assert ranked == [generic]

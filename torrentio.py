@@ -1,5 +1,6 @@
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 
 import requests
@@ -79,6 +80,19 @@ def _min_plausible_size_gb(quality: str, runtime_minutes: float | None) -> float
     if not floor or not runtime_minutes or runtime_minutes <= 0:
         return 0.0
     return floor * (runtime_minutes / 90.0)
+
+
+def _normalized_words(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _episode_title_match(stream: "TorrentioStream", expected_title: str) -> bool:
+    expected = _normalized_words(expected_title)
+    if len(expected) < 3:
+        return False
+    blob = _normalized_words(f"{stream.name} {stream.title}")
+    return f" {expected} " in f" {blob} "
 
 # Language / audio markers in release titles
 _LANG_PATTERNS = {
@@ -403,6 +417,17 @@ def rank_streams(
             candidates = filtered
         else:
             log.warning("All candidates match EXCLUDE_LANGUAGES; allowing all")
+
+    expected_episode_title = str(override.get("episode_title") or "").strip()
+    if expected_episode_title:
+        title_matches = [
+            stream for stream in candidates
+            if _episode_title_match(stream, expected_episode_title)
+        ]
+        if title_matches:
+            log.info("Episode identity: kept %d/%d candidate(s) matching %r",
+                     len(title_matches), len(candidates), expected_episode_title)
+            candidates = title_matches
 
     if media_kind == "movie":
         # Mislabeled-pack guard: a single-movie request must never keep a

@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import date
 from typing import Optional
 
 import blacklist
@@ -58,6 +59,28 @@ def _episode_runtime_minutes(imdb_id: str, season: int, episode: int) -> float |
         return None
 
 
+def _episode_search_override(imdb_id: str, season: int, episode: int) -> dict:
+    """Return ranking hints that bind a release to the requested episode.
+
+    Some long-running shows reuse the same SxxEyy labels under broadcast and
+    production ordering.  Runtime alone cannot distinguish those releases, so
+    include TMDB's current episode title whenever it is available.
+    """
+    import tmdb
+
+    override = dict(db.get_show_override(imdb_id) or {})
+    override["runtime_minutes"] = _episode_runtime_minutes(imdb_id, season, episode)
+    try:
+        tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
+        details = tmdb.get_episode_details(tmdb_id, season, episode) if tmdb_id else None
+        episode_title = (details or {}).get("title")
+        if episode_title:
+            override["episode_title"] = episode_title
+    except Exception:
+        pass
+    return override
+
+
 def _fetch_movie_candidates(req: MediaRequest) -> list:
     override = dict(db.get_show_override(req.imdb_id) or {})
     override["runtime_minutes"] = _movie_runtime_minutes(req.imdb_id)
@@ -67,8 +90,7 @@ def _fetch_movie_candidates(req: MediaRequest) -> list:
 
 
 def _fetch_season_candidates(req: MediaRequest, season: int, episode: int, prefer_season_pack: bool = False) -> list:
-    override = dict(db.get_show_override(req.imdb_id) or {})
-    override["runtime_minutes"] = _episode_runtime_minutes(req.imdb_id, season, episode)
+    override = _episode_search_override(req.imdb_id, season, episode)
     return search_engine.search_candidates(
         "series", req.imdb_id, req.title,
         season=season, episode=episode,
@@ -404,17 +426,32 @@ def _try_realdebrid_fallback(title: str, candidates: list,
     return None
 
 
-def _get_season_episode_count(imdb_id: str, season: int) -> int:
-    """Ask TMDB how many episodes a season has. Returns 0 on failure."""
+def _season_release_state(imdb_id: str, season: int) -> tuple[list[int], bool]:
+    """Return released episode numbers and whether the season is complete.
+
+    A season pack is safe only after every dated episode has aired.  Before
+    then, registering the whole pack can expose future slots and can collide
+    with an older broadcast season that reused the same season number.
+    """
     try:
         import tmdb
+
         tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
         if not tmdb_id:
-            return 0
+            return [], False
         episodes = tmdb.get_season_episodes(tmdb_id, season)
-        return len(episodes)
+        if not episodes:
+            return [], False
+        today = date.today().isoformat()
+        numbered = [ep for ep in episodes if ep.get("episode_number")]
+        released = [
+            int(ep["episode_number"])
+            for ep in numbered
+            if ep.get("air_date") and ep["air_date"] <= today
+        ]
+        return released, bool(numbered) and len(released) == len(numbered)
     except Exception:
-        return 0
+        return [], False
 
 
 def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optional[TorrentioStream]]:
@@ -434,6 +471,14 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
         log.info("Lazy series: no candidates for %s S%02d  -  marking wanted", req.title, season)
         return False, None
 
+    released_episodes, season_complete = _season_release_state(req.imdb_id, season)
+    if not released_episodes:
+        reason = "no released episodes confirmed by TMDB  -  deferring season"
+        log.info("Lazy: %s for %s S%02d", reason, req.title, season)
+        _LAST_FAIL_REASON[req.imdb_id] = reason
+        _WANTED[req.imdb_id] = reason
+        return False, None
+
     hashes = [s.info_hash for s in pack_candidates]
     try:
         cached_hashes = debrid.check_cached_multi(hashes).get("torbox", set())
@@ -443,13 +488,19 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
 
     # --- Try season pack first ---
     packs = [s for s in pack_candidates if s.is_season_pack and s.info_hash in cached_hashes]
+    if packs and not season_complete:
+        log.info("Lazy: %s S%02d is still airing  -  skipping season packs and "
+                 "registering only %d released episode(s)",
+                 req.title, season, len(released_episodes))
+        packs = []
+        pack_candidates = [s for s in pack_candidates if not s.is_season_pack]
     if packs:
         import release_sanity
         packs = release_sanity.filter_cached(
             packs, kind="season_pack", season=season, label=f"{req.title} S{season:02d} pack")
     if packs:
         pack = packs[0]
-        ep_count = _get_season_episode_count(req.imdb_id, season)
+        ep_count = len(released_episodes)
         if ep_count == 0:
             # TMDB couldn't tell us how many episodes this season has (missing or
             # invalid key, rate-limit, transient error, or no imdb->tmdb match).
@@ -470,7 +521,7 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
                  req.title, season, ep_count, ep_count)
         written = 0
         preload_done = False
-        for ep in range(1, ep_count + 1):
+        for ep in released_episodes:
             if strm_generator.create_lazy_episode_strm(
                 pack.info_hash, pack.magnet, req.title, season, ep,
                 imdb_id=req.imdb_id,
@@ -492,9 +543,9 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
     added = 0
     first_winner: Optional[TorrentioStream] = None
     preload_done = False
-    episode = 1
-    while True:
-        if episode == 1:
+    first_episode = released_episodes[0]
+    for episode in released_episodes:
+        if episode == first_episode:
             ep_candidates = [s for s in pack_candidates if s.info_hash in cached_hashes]
         else:
             try:
@@ -504,16 +555,16 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
                 # season here rather than letting the error abort the whole
                 # multi-season request.
                 log.warning("Lazy fetch failed for %s S%02dE%02d: %s", req.title, season, episode, exc)
-                break
+                continue
             ep_cands_raw = blacklist.filter_candidates(ep_cands_raw)
             if not ep_cands_raw:
-                break
+                continue
             ep_hashes = [s.info_hash for s in ep_cands_raw]
             try:
                 ep_cached = debrid.check_cached_multi(ep_hashes).get("torbox", set())
             except Exception as exc:
                 log.warning("Lazy cache-check failed for %s S%02dE%02d: %s", req.title, season, episode, exc)
-                break
+                continue
             ep_candidates = [s for s in ep_cands_raw if s.info_hash in ep_cached]
 
         if ep_candidates:
@@ -523,9 +574,9 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
                 imdb_id=req.imdb_id, label=f"{req.title} S{season:02d}E{episode:02d}")
 
         if not ep_candidates:
-            if episode == 1:
+            if episode == first_episode:
                 log.info("Lazy: no cached per-episode for %s S%02dE%02d  -  stopping", req.title, season, episode)
-            break
+            continue
 
         winner = ep_candidates[0]
         if strm_generator.create_lazy_episode_strm(
@@ -539,11 +590,6 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
             added += 1
             first_winner = first_winner or winner
             preload_done = True
-
-        episode += 1
-        if episode > 50:
-            log.warning("Episode cap (50) reached for %s S%02d", req.title, season)
-            break
 
     if added:
         log.info("Lazy per-episode: %d .strm(s) registered for %s S%02d", added, req.title, season)

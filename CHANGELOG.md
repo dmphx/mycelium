@@ -4,6 +4,12 @@ All notable changes to Mycelium are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Currently airing TV seasons register only episodes whose TMDB air date has
+  arrived, and episode-title identity ranking rejects older broadcast-order
+  releases when they reuse the same season and episode numbers
+
 ### Added
 
 - A versioned, read-only Discord integration API protected by a dedicated bearer token
