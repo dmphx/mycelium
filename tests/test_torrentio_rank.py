@@ -191,3 +191,16 @@ def test_episode_title_filter_fails_open_when_releases_omit_title():
         [generic], override={"episode_title": "A Very Specific Title"})
 
     assert ranked == [generic]
+
+
+def test_episode_title_match_presence_detects_identity_miss():
+    generic = _stream("Show.S03E04.1080p.WEB-DL", "1080p", 0.70)
+    matching = _stream(
+        "Show.S03E04.A.Very.Specific.Title.1080p.WEB-DL",
+        "1080p", 0.75,
+    )
+
+    assert not torrentio.has_episode_title_match(
+        [generic], "A Very Specific Title")
+    assert torrentio.has_episode_title_match(
+        [generic, matching], "A Very Specific Title")

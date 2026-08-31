@@ -112,13 +112,22 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
         torrent_hashes = list(dict.fromkeys(
             stream.info_hash.lower() for stream in fast_streams
             if not stream.is_usenet))
-        cached = any(stream.is_usenet for stream in fast_streams)
-        if torrent_hashes:
+        expected_title = str((override or {}).get("episode_title") or "").strip()
+        identity_miss = bool(
+            expected_title
+            and not torrentio.has_episode_title_match(fast_streams, expected_title)
+        )
+        cached = False if identity_miss else any(
+            stream.is_usenet for stream in fast_streams)
+        if torrent_hashes and not identity_miss:
             try:
                 import debrid
                 cached = any(debrid.check_cached_multi(torrent_hashes).values())
             except Exception as exc:
                 log.warning("Fast-source cache gate failed for %s: %s", ckey, exc)
+        if identity_miss:
+            log.info("Fast sources lack episode title %r for %s; querying Prowlarr",
+                     expected_title, ckey)
         if not cached:
             deep_jobs = [job for job in _source_jobs(
                 media_type, imdb_id, title, season, episode, True)

@@ -94,6 +94,12 @@ def _episode_title_match(stream: "TorrentioStream", expected_title: str) -> bool
     blob = _normalized_words(f"{stream.name} {stream.title}")
     return f" {expected} " in f" {blob} "
 
+
+def has_episode_title_match(
+        candidates: list["TorrentioStream"], expected_title: str) -> bool:
+    """Return whether any candidate carries the requested episode title."""
+    return any(_episode_title_match(stream, expected_title) for stream in candidates)
+
 # Language / audio markers in release titles
 _LANG_PATTERNS = {
     "nl":     re.compile(r"\b(dutch|nederlands?|nl[. -]?(?:nlt?[. -]?)?(?:dubbed|sub|audio|subs)|nl(?:nlt)?\b|nlsubs?)\b", re.IGNORECASE),
