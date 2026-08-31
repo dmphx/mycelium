@@ -34,6 +34,22 @@ def test_nzb_numbering_remains_available_without_a_sanity_conflict():
     ) == [numbered]
 
 
+def test_number_collision_requires_title_when_no_candidate_has_current_title():
+    classic = _stream("Bleach S02E01 1080p BluRay")
+
+    assert monitor._episode_requires_title_verification(
+        [classic], "The Blood Warfare", False
+    )
+
+
+def test_matching_current_title_resolves_number_collision_without_sanity_failure():
+    current = _stream("Bleach S02E01 The Blood Warfare 1080p WEB-DL")
+
+    assert not monitor._episode_requires_title_verification(
+        [current], "The Blood Warfare", False
+    )
+
+
 def test_episode_exists_in_zero_padded_season_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "MEDIA_PATH", str(tmp_path))
     monitor.db.get_virtual_item_by_episode.return_value = None

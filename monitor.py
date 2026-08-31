@@ -320,6 +320,17 @@ def _safe_episode_nzbs(candidates: list, expected_title: str,
     return verified
 
 
+def _episode_requires_title_verification(candidates: list, expected_title: str,
+                                         sanity_rejected: bool) -> bool:
+    """Return true when a numbered fallback is not enough to prove identity."""
+    if sanity_rejected:
+        return True
+    return bool(
+        expected_title
+        and not torrentio.has_episode_title_match(candidates, expected_title)
+    )
+
+
 def _retry_episode(ep: dict) -> bool:
     """Search + add one episode. Returns True if added. Raises processor.RateLimited
     when the TorBox createtorrent budget is gone (so the caller can pause)."""
@@ -351,7 +362,7 @@ def _retry_episode(ep: dict) -> bool:
             cached = release_sanity.filter_cached(
                 cached_before_sanity, kind="episode", season=season, episode=episode,
                 imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
-            sanity_rejected_cached = bool(cached_before_sanity and not cached)
+            sanity_rejected_cached = len(cached) < len(cached_before_sanity)
             return cached
 
         cached = _cached_torrents(candidates)
@@ -376,10 +387,14 @@ def _retry_episode(ep: dict) -> bool:
                 log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
                 return True
 
+        expected_title = str(search_override.get("episode_title") or "")
+        require_title = _episode_requires_title_verification(
+            candidates, expected_title, sanity_rejected_cached
+        )
         nzbs = _safe_episode_nzbs(
             candidates,
-            expected_title=str(search_override.get("episode_title") or ""),
-            require_title=sanity_rejected_cached,
+            expected_title=expected_title,
+            require_title=require_title,
             label=f"{title} S{season:02d}E{episode:02d}",
         )
         if nzbs:
@@ -440,16 +455,20 @@ def _retry_episode(ep: dict) -> bool:
     cached_torrents = release_sanity.filter_cached(
         cached_before_sanity, kind="episode", season=season, episode=episode,
         imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
-    require_title = bool(cached_before_sanity and not cached_torrents)
+    expected_title = str(search_override.get("episode_title") or "")
+    require_title = _episode_requires_title_verification(
+        candidates,
+        expected_title,
+        len(cached_torrents) < len(cached_before_sanity),
+    )
     nzbs = _safe_episode_nzbs(
         candidates,
-        expected_title=str(search_override.get("episode_title") or ""),
+        expected_title=expected_title,
         require_title=require_title,
         label=f"{title} S{season:02d}E{episode:02d}",
     )
     uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
     if require_title:
-        expected_title = str(search_override.get("episode_title") or "")
         uncached_torrents = [
             item for item in uncached_torrents
             if expected_title and torrentio._episode_title_match(item, expected_title)
