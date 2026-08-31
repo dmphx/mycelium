@@ -497,7 +497,8 @@ def _lazy_register_season(req: MediaRequest, season: int) -> tuple[bool, Optiona
     if packs:
         import release_sanity
         packs = release_sanity.filter_cached(
-            packs, kind="season_pack", season=season, label=f"{req.title} S{season:02d} pack")
+            packs, kind="season_pack", season=season, episodes=released_episodes,
+            imdb_id=req.imdb_id, label=f"{req.title} S{season:02d} pack")
     if packs:
         pack = packs[0]
         ep_count = len(released_episodes)

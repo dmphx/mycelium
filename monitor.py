@@ -104,6 +104,11 @@ def _sync_wanted(imdb_id: str, tmdb_id: int, title: str, seasons: list[int],
     cutoff = since or today
     for season in seasons:
         episodes = tmdb.get_season_episodes(tmdb_id, season)
+        valid_episodes = [
+            int(ep["episode_number"])
+            for ep in episodes
+            if ep.get("episode_number")
+        ]
         for ep in episodes:
             ep_num = ep.get("episode_number")
             air_date = ep.get("air_date") or None
@@ -123,6 +128,13 @@ def _sync_wanted(imdb_id: str, tmdb_id: int, title: str, seasons: list[int],
             else:
                 db.upsert_wanted_episode(imdb_id, tmdb_id, title, season, ep_num, air_date)
                 db.mark_episode_status(imdb_id, season, ep_num, "wanted")
+        if valid_episodes:
+            removed = db.mark_metadata_removed_episodes(imdb_id, season, valid_episodes)
+            if removed:
+                log.warning(
+                    "Monitor: marked %d stale metadata episode row(s) for %s S%02d",
+                    removed, title, season,
+                )
 
 
 def _check_one_series(series: dict) -> None:

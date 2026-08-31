@@ -42,3 +42,23 @@ def test_add_series_canonicalizes_placeholder_title_before_wanted_sync(monkeypat
         "tt6568694", 71795, "Criminal Minds (2017)", [1]
     )
     assert sync_calls == [("tt6568694", 71795, "Criminal Minds (2017)", [1])]
+
+
+def test_sync_marks_episode_rows_removed_from_current_metadata(monkeypatch):
+    monitor.db.reset_mock()
+    monkeypatch.setattr(
+        monitor.tmdb,
+        "get_season_episodes",
+        lambda *_args, **_kwargs: [
+            {"episode_number": 1, "air_date": "2024-01-01"},
+            {"episode_number": 2, "air_date": "2024-01-08"},
+        ],
+    )
+    monkeypatch.setattr(monitor, "strm_exists_episode", lambda *_args, **_kwargs: False)
+    monitor.db.mark_metadata_removed_episodes.return_value = 2
+
+    monitor._sync_wanted("tt15599734", 291212, "Murder Drones", [1])
+
+    monitor.db.mark_metadata_removed_episodes.assert_called_once_with(
+        "tt15599734", 1, [1, 2]
+    )

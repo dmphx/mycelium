@@ -235,7 +235,8 @@ def _entry_files(entry: dict) -> list[dict]:
 
 
 def verify_entry(entry: dict, kind: str, *, season: int | None = None,
-                 episode: int | None = None, imdb_id: str | None = None) -> str | None:
+                 episode: int | None = None, imdb_id: str | None = None,
+                 episodes: list[int] | None = None) -> str | None:
     """Reason a cached torrent listing can't be the requested item, or None if it
     passes. `entry` is one hash's value from torbox.check_cached_files().
 
@@ -248,7 +249,7 @@ def verify_entry(entry: dict, kind: str, *, season: int | None = None,
     if kind == "episode":
         return _verify_episode(entry, season, episode, imdb_id)
     if kind == "season_pack":
-        return _verify_season_pack(entry)
+        return _verify_season_pack(entry, season, episodes, imdb_id)
     return None
 
 
@@ -342,7 +343,9 @@ def _verify_episode(entry: dict, season: int | None, episode: int | None,
     return None
 
 
-def _verify_season_pack(entry: dict) -> str | None:
+def _verify_season_pack(entry: dict, season: int | None = None,
+                        episodes: list[int] | None = None,
+                        imdb_id: str | None = None) -> str | None:
     """A season pack is MEANT to be large and multi-file, so size/pack-name are
     not disqualifying here; only reject a pack whose file listing exists AND
     contains no playable video. When checkcached returns no file listing
@@ -356,6 +359,20 @@ def _verify_season_pack(entry: dict) -> str | None:
               if strm_generator._is_video(f["name"]) and not strm_generator._is_trailer(f)]
     if not videos:
         return "cached season pack file listing has no playable video file"
+    if season is None or not episodes:
+        return None
+    missing = []
+    for wanted in episodes:
+        absolute = _absolute_episode(imdb_id, int(season), int(wanted))
+        if not strm_generator._pick_episode_file(
+            videos, int(season), int(wanted), absolute=absolute
+        ):
+            missing.append(int(wanted))
+    if missing:
+        preview = ", ".join(f"E{ep:02d}" for ep in missing[:5])
+        suffix = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
+        return (f"cached season pack cannot identify {preview}{suffix} "
+                f"among {len(videos)} video files")
     return None
 
 
@@ -363,6 +380,7 @@ def _verify_season_pack(entry: dict) -> str | None:
 
 def filter_cached(candidates: list, kind: str, *, season: int | None = None,
                   episode: int | None = None, imdb_id: str | None = None,
+                  episodes: list[int] | None = None,
                   label: str = "") -> list:
     """Drop cached candidates whose actual TorBox files fail the sanity check.
 
@@ -385,7 +403,10 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
         if not entry:
             kept.append(c)
             continue
-        reason = verify_entry(entry, kind, season=season, episode=episode, imdb_id=imdb_id)
+        reason = verify_entry(
+            entry, kind, season=season, episode=episode, imdb_id=imdb_id,
+            episodes=episodes,
+        )
         if reason:
             log.warning("Release sanity: rejected %s cached candidate %s  -  %s",
                         label or kind, c.info_hash, reason)

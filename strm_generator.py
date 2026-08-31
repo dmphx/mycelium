@@ -27,9 +27,11 @@ _EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
 # Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
 # Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
 _EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')
-# Standalone absolute episode tag with no season, e.g. "E0052", "E283".
+# Loose season/episode naming used by anime packs, e.g. "S4 - 01".
+_EP_LOOSE_RE = re.compile(r'(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(?:[Ee][Pp]?[\s._-]*)?(\d{1,3})(?![A-Za-z0-9])')
+# Standalone absolute episode tag with no season, e.g. "E0052", "EP283".
 # The lookbehind rejects the E of a seasonal "S01E05" (preceded by a digit).
-_ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(\d{2,4})(?![0-9])', re.IGNORECASE)
+_ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(?:P(?:ISODE)?)?[\s._-]*(\d{2,4})(?![A-Za-z0-9])', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -85,9 +87,9 @@ def _pick_main_movie_file(files: list[dict]) -> dict | None:
 
 
 def _file_episode(name: str) -> tuple[int, int] | None:
-    """Parse (season, episode) from a file name. Handles SxxExx and NNxNN. None if absent."""
+    """Parse (season, episode) from common compact and loose file names."""
     s = _clean(name)
-    m = _EP_RE.search(s) or _EP_ALT_RE.search(s)
+    m = _EP_RE.search(s) or _EP_ALT_RE.search(s) or _EP_LOOSE_RE.search(s)
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 

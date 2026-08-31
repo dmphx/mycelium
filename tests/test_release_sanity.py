@@ -205,6 +205,58 @@ def test_season_pack_rejected_only_when_no_video():
     assert release_sanity.verify_entry(empty, "season_pack", season=1)
 
 
+def test_partial_season_pack_rejected_before_registering_missing_episodes(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: None))
+    entry = {
+        "name": "Dr. Stone S04 1080p",
+        "size": 12 * GB,
+        "files": [
+            {"name": f"Dr. Stone S4 - {ep:02d}.mkv", "size": GB}
+            for ep in range(1, 13)
+        ],
+    }
+    reason = release_sanity.verify_entry(
+        entry, "season_pack", season=4, episodes=list(range(1, 38)),
+        imdb_id="tt9679542",
+    )
+    assert reason and "E13" in reason and "12 video files" in reason
+
+
+def test_complete_loose_named_season_pack_is_accepted(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: None))
+    entry = {
+        "name": "Show S04 1080p",
+        "size": 3 * GB,
+        "files": [
+            {"name": f"Show S4 - {ep:02d}.mkv", "size": GB}
+            for ep in range(1, 4)
+        ],
+    }
+    assert release_sanity.verify_entry(
+        entry, "season_pack", season=4, episodes=[1, 2, 3], imdb_id="tt1234567"
+    ) is None
+
+
+def test_absolute_ep_named_partial_pack_is_rejected(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: None))
+    entry = {
+        "name": "Frieren EP01-12",
+        "size": 12 * GB,
+        "files": [
+            {"name": f"Frieren EP{ep:02d}.mkv", "size": GB}
+            for ep in range(1, 13)
+        ],
+    }
+    reason = release_sanity.verify_entry(
+        entry, "season_pack", season=1, episodes=list(range(1, 39)),
+        imdb_id="tt22248376",
+    )
+    assert reason and "E13" in reason
+
+
 def test_uncached_or_empty_entry_fails_open():
     # No listing -> nothing to verify -> pass (rank-time name/size is the guard).
     assert release_sanity.verify_entry(None, "movie") is None

@@ -777,10 +777,39 @@ def upsert_wanted_episode(imdb_id: str, tmdb_id: int | None, title: str,
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(imdb_id, season, episode) DO UPDATE SET
                  air_date=COALESCE(excluded.air_date, air_date),
-                 status=CASE WHEN status='found' THEN 'found' ELSE status END""",
+                 status=CASE
+                   WHEN status='found' THEN 'found'
+                   WHEN status='metadata_removed' THEN 'wanted'
+                   ELSE status
+                 END""",
             (imdb_id, tmdb_id, title, season, episode, air_date),
         )
         conn.commit()
+
+
+def mark_metadata_removed_episodes(imdb_id: str, season: int,
+                                   valid_episodes: list[int]) -> int:
+    """Stop retrying episode rows no longer present in current TMDB metadata.
+
+    Virtual items and files are deliberately left untouched for review. The
+    library repair path can quarantine them after confirming the metadata
+    change, while the monitor no longer resurrects or retries the stale rows.
+    """
+    valid = sorted({int(ep) for ep in valid_episodes if int(ep) > 0})
+    if not valid:
+        return 0
+    placeholders = ",".join("?" for _ in valid)
+    with _connect() as conn:
+        cur = conn.execute(
+            f"""UPDATE wanted_episodes
+                SET status='metadata_removed'
+                WHERE imdb_id=? AND season=?
+                  AND episode NOT IN ({placeholders})
+                  AND status<>'metadata_removed'""",
+            (imdb_id, int(season), *valid),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def get_wanted_episodes(max_attempts: int = 10, limit: int | None = None,
