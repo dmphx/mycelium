@@ -156,7 +156,7 @@ def _usenet_stream(item: ET.Element, season: int | None,
     # endpoint, so prefer <link>; fall back to <guid> if link is missing.
     nzb_url = (item.findtext("link") or item.findtext("guid") or "").strip()
     enclosure = item.find("enclosure")
-    if enclosure is not None:
+    if not nzb_url and enclosure is not None:
         url_attr = enclosure.get("url")
         if url_attr and url_attr.startswith("http"):
             nzb_url = url_attr
