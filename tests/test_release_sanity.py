@@ -396,3 +396,44 @@ def test_span_reject_survives_unavailable_numbering(monkeypatch):
     entry = {"name": _RU_PARTIAL, "size": 5 * GB, "files": []}
     assert release_sanity.verify_entry(entry, "episode", season=22, episode=10,
                                        imdb_id="tt0397306")
+
+
+def test_broad_absolute_span_does_not_accept_tmdb_within_season_collision(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: 412))
+
+    reason = release_sanity._span_reject(
+        (1, 167),
+        "[ENTE] Bleach (2004) S01-S08 (E001-E167)",
+        season=2,
+        episode=46,
+        imdb_id="tt0434665",
+    )
+
+    assert reason is not None
+    assert "episodes 1-167" in reason
+
+
+def test_cached_name_span_rejected_even_when_torbox_listing_is_absent(monkeypatch):
+    import torbox
+
+    monkeypatch.setattr(release_sanity, "enabled", lambda: True)
+    monkeypatch.setattr(torbox, "check_cached_files", lambda hashes: {})
+    monkeypatch.setitem(sys.modules, "numbering",
+                        types.SimpleNamespace(to_absolute=lambda *a, **k: 412))
+    candidate = _stream(
+        "[ENTE] Bleach (2004) S01-S08 (E001-E167)",
+        "1080p",
+        100.0,
+        "e" * 40,
+    )
+
+    kept = release_sanity.filter_cached(
+        [candidate],
+        "episode",
+        season=2,
+        episode=46,
+        imdb_id="tt0434665",
+    )
+
+    assert kept == []

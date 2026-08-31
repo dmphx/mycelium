@@ -192,7 +192,17 @@ def _span_reject(span: tuple[int, int], top_name: str, season: int, episode: int
     wanted = [int(episode)]
     absolute = _absolute_episode(imdb_id, season, episode)
     if absolute:
-        wanted.append(int(absolute))
+        # A broad E001-E167 or multi-season span is absolute numbering. Do not
+        # let the raw within-season episode (for example TMDB Bleach S02E46)
+        # collide with classic absolute E046 when the true TMDB absolute is 412.
+        multi_season = bool(re.search(
+            r"\bs(?:eason)?[ ._-]*\d{1,2}\s*[-–—~]\s*s?(?:eason)?[ ._-]*\d{1,2}\b",
+            top_name or "", re.IGNORECASE,
+        ))
+        if int(absolute) != int(episode) and (hi >= 100 or multi_season):
+            wanted = [int(absolute)]
+        else:
+            wanted.append(int(absolute))
     if any(lo <= n <= hi for n in wanted):
         return None
     declared = f"episode {lo}" if lo == hi else f"episodes {lo}-{hi}"
@@ -399,6 +409,17 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
         return candidates
     kept = []
     for c in candidates:
+        if kind == "episode" and season is not None and episode is not None:
+            candidate_name = f"{c.name or ''} {c.title or ''}".strip()
+            span = _declared_episode_span(candidate_name)
+            reason = (_span_reject(
+                span, candidate_name, int(season), int(episode), imdb_id
+            ) if span else None)
+            if reason:
+                log.warning("Release sanity: rejected %s cached candidate %s  -  %s",
+                            label or kind, c.info_hash, reason)
+                _record_reject(kind, reason)
+                continue
         entry = entries.get((c.info_hash or "").lower())
         if not entry:
             kept.append(c)
