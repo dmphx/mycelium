@@ -27,13 +27,26 @@ def test_cached_generic_fast_result_still_runs_episode_identity_fallback(monkeyp
         "b" * 40,
         "prowlarr/drunkenslug",
     )
+    unusable_exact = _stream(
+        "Futurama.S11E06.Late.Bloomers.2160p.WEB-DL",
+        "c" * 40,
+        "mediafusion",
+    )
     calls = []
 
     def source_jobs(_media_type, _imdb_id, _title, _season, _episode,
                     include_prowlarr):
         if include_prowlarr:
             return [("prowlarr", lambda: calls.append("prowlarr") or [exact])]
-        return [("mediafusion", lambda: [generic])]
+        return [("mediafusion", lambda: [generic, unusable_exact])]
+
+    def rank_streams(rows, **_kwargs):
+        acceptable = [row for row in rows if "2160p" not in row.name]
+        matches = [
+            row for row in acceptable
+            if search_engine.torrentio._episode_title_match(row, "Late Bloomers")
+        ]
+        return matches or acceptable
 
     monkeypatch.setattr(search_engine, "_source_jobs", source_jobs)
     monkeypatch.setattr(debrid, "check_cached_multi",
@@ -41,10 +54,7 @@ def test_cached_generic_fast_result_still_runs_episode_identity_fallback(monkeyp
     monkeypatch.setattr(
         search_engine.torrentio,
         "rank_streams",
-        lambda rows, **_kwargs: [
-            row for row in rows
-            if search_engine.torrentio._episode_title_match(row, "Late Bloomers")
-        ],
+        rank_streams,
     )
     monkeypatch.setattr(search_engine.blacklist, "filter_candidates", lambda rows: rows)
     monkeypatch.setattr(search_engine.db, "start_search_run", lambda *args: 1)

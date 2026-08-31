@@ -109,16 +109,26 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
         # out of the common path when a fast catalog already exposes a cached
         # release, but retain it as a deep fallback for actual misses.
         fast_streams = [stream for streams in groups.values() for stream in streams]
-        torrent_hashes = list(dict.fromkeys(
-            stream.info_hash.lower() for stream in fast_streams
-            if not stream.is_usenet))
+        cache_gate_streams = fast_streams
         expected_title = str((override or {}).get("episode_title") or "").strip()
-        identity_miss = bool(
-            expected_title
-            and not torrentio.has_episode_title_match(fast_streams, expected_title)
-        )
+        identity_miss = False
+        if expected_title:
+            acceptable_fast = torrentio.rank_streams(
+                blacklist.filter_candidates(fast_streams),
+                override=override,
+                media_kind="movie" if media_type == "movie" else None,
+            )
+            identity_matches = [
+                stream for stream in acceptable_fast
+                if torrentio._episode_title_match(stream, expected_title)
+            ]
+            identity_miss = not identity_matches
+            cache_gate_streams = identity_matches
+        torrent_hashes = list(dict.fromkeys(
+            stream.info_hash.lower() for stream in cache_gate_streams
+            if not stream.is_usenet))
         cached = False if identity_miss else any(
-            stream.is_usenet for stream in fast_streams)
+            stream.is_usenet for stream in cache_gate_streams)
         if torrent_hashes and not identity_miss:
             try:
                 import debrid
