@@ -26,3 +26,39 @@ def test_index_keeps_tvdb_absolute_only():
 def test_index_handles_empty():
     assert numbering._index(None) == {}
     assert numbering._index([]) == {}
+
+
+def test_tmdb_absolute_uses_tmdb_season_counts(monkeypatch):
+    numbering._tmdb_absolute.cache_clear()
+
+    class FakeTmdb:
+        @staticmethod
+        def find_by_imdb(_imdb_id, kind="tv"):
+            assert kind == "tv"
+            return 30984
+
+        @staticmethod
+        def get_season_episodes(_tmdb_id, season):
+            count = {1: 366, 2: 53}[season]
+            return [{"episode_number": number} for number in range(1, count + 1)]
+
+    monkeypatch.setitem(sys.modules, "tmdb", FakeTmdb)
+
+    assert numbering._tmdb_absolute("tt0434665", 2, 46) == 412
+
+
+def test_tmdb_absolute_rejects_episode_missing_from_current_metadata(monkeypatch):
+    numbering._tmdb_absolute.cache_clear()
+
+    class FakeTmdb:
+        @staticmethod
+        def find_by_imdb(_imdb_id, kind="tv"):
+            return 1
+
+        @staticmethod
+        def get_season_episodes(_tmdb_id, _season):
+            return [{"episode_number": 1}, {"episode_number": 2}]
+
+    monkeypatch.setitem(sys.modules, "tmdb", FakeTmdb)
+
+    assert numbering._tmdb_absolute("tt0000001", 1, 3) is None

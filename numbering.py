@@ -2,16 +2,17 @@
 Cross-scheme episode numbering via TheXEM (thexem.info, free, no auth).
 
 Some releases (anime especially) number episodes by a single absolute count
-("Naruto Shippuden - 154") while requests arrive in TVDB season/episode order.
-TheXEM maps tvdb <-> scene <-> absolute per show. This resolves a request's
-(season, episode) to an absolute number so the file matcher can find the right
-file regardless of the release's scheme.
+("Naruto Shippuden - 154") while requests arrive in TMDB season/episode order.
+TMDB season lengths are therefore the primary absolute mapping. TheXEM maps
+tvdb <-> scene <-> absolute per show and remains a fallback when TMDB metadata
+is unavailable.
 
 Design: best-effort and fail-safe. Any miss (no tvdb id, no map, uncovered
 show, network error) returns None and the caller falls back to normal matching.
 Results are cached in SQLite, including negative results, so a show is fetched
 from TheXEM at most once per TTL.
 """
+import functools
 import json
 import logging
 import sqlite3
@@ -123,13 +124,58 @@ def _load_map(tvdb_id):
     return _index(data)
 
 
-def to_absolute(imdb_id, season, episode, tmdb_id=None):
-    """Resolve a TVDB (season, episode) to an absolute episode number.
+@functools.lru_cache(maxsize=4096)
+def _tmdb_absolute(imdb_id, season, episode, tmdb_id=None):
+    """Resolve Mycelium's TMDB season order to a series-absolute number.
 
-    Returns None when there is no mapping (normal Western shows, uncovered
-    shows, or any failure), so the caller keeps its default behaviour.
+    Wanted episodes originate from TMDB, so applying a TVDB season directly to
+    TheXEM can silently map a rebooted or split season onto an older broadcast
+    season. Bleach is the canonical failure: TMDB S02 is Thousand-Year Blood
+    War, while TVDB S02 is classic episode 21 onward.
     """
     try:
+        import tmdb as _tmdb
+
+        tmdb_id = tmdb_id or _tmdb.find_by_imdb(imdb_id, kind="tv")
+        if not tmdb_id:
+            return None
+        season = int(season)
+        episode = int(episode)
+        if season < 1 or episode < 1:
+            return None
+        previous = 0
+        for season_no in range(1, season + 1):
+            rows = _tmdb.get_season_episodes(tmdb_id, season_no) or []
+            numbers = sorted({
+                int(row["episode_number"])
+                for row in rows
+                if row.get("episode_number") is not None
+                and int(row["episode_number"]) > 0
+            })
+            if not numbers:
+                return None
+            if season_no == season:
+                if episode not in numbers:
+                    return None
+                return previous + episode
+            previous += len(numbers)
+    except Exception as exc:
+        log.debug("TMDB absolute mapping failed (%s S%sE%s): %s",
+                  imdb_id, season, episode, exc)
+        return None
+
+
+def to_absolute(imdb_id, season, episode, tmdb_id=None):
+    """Resolve Mycelium's TMDB (season, episode) to an absolute episode number.
+
+    TMDB is authoritative because it owns the wanted-episode rows. TheXEM's
+    TVDB map remains a best-effort fallback only when TMDB metadata is
+    unavailable.
+    """
+    try:
+        tmdb_absolute = _tmdb_absolute(imdb_id, season, episode, tmdb_id)
+        if tmdb_absolute is not None:
+            return tmdb_absolute
         tvdb_id = resolve_tvdb_id(imdb_id, tmdb_id)
         if not tvdb_id:
             return None
