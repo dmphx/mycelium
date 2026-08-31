@@ -50,6 +50,23 @@ def test_matching_current_title_resolves_number_collision_without_sanity_failure
     )
 
 
+def test_cached_fallback_without_current_title_is_removed_after_sanity_failure():
+    generic = _stream("Bleach S02E20 1080p WEB-DL", usenet=False)
+    current = _stream("Bleach S02E20 I AM THE EDGE 1080p WEB-DL", usenet=False)
+
+    assert monitor._episode_title_verified_candidates(
+        [generic, current], "I AM THE EDGE", True
+    ) == [current]
+
+
+def test_cached_fallbacks_remain_available_without_identity_ambiguity():
+    generic = _stream("Example Show S03E04 1080p WEB-DL", usenet=False)
+
+    assert monitor._episode_title_verified_candidates(
+        [generic], "An Episode Title", False
+    ) == [generic]
+
+
 def test_episode_exists_in_zero_padded_season_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "MEDIA_PATH", str(tmp_path))
     monitor.db.get_virtual_item_by_episode.return_value = None

@@ -331,6 +331,19 @@ def _episode_requires_title_verification(candidates: list, expected_title: str,
     )
 
 
+def _episode_title_verified_candidates(candidates: list, expected_title: str,
+                                       required: bool) -> list:
+    """Keep only candidates that prove the current episode title when required."""
+    if not required:
+        return candidates
+    if not expected_title:
+        return []
+    return [
+        item for item in candidates
+        if torrentio._episode_title_match(item, expected_title)
+    ]
+
+
 def _retry_episode(ep: dict) -> bool:
     """Search + add one episode. Returns True if added. Raises processor.RateLimited
     when the TorBox createtorrent budget is gone (so the caller can pause)."""
@@ -366,6 +379,13 @@ def _retry_episode(ep: dict) -> bool:
             return cached
 
         cached = _cached_torrents(candidates)
+        expected_title = str(search_override.get("episode_title") or "")
+        require_title = _episode_requires_title_verification(
+            candidates, expected_title, sanity_rejected_cached
+        )
+        cached = _episode_title_verified_candidates(
+            cached, expected_title, require_title
+        )
         best = cached[0] if cached else None
         if best:
             import strm_generator
@@ -387,10 +407,6 @@ def _retry_episode(ep: dict) -> bool:
                 log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
                 return True
 
-        expected_title = str(search_override.get("episode_title") or "")
-        require_title = _episode_requires_title_verification(
-            candidates, expected_title, sanity_rejected_cached
-        )
         nzbs = _safe_episode_nzbs(
             candidates,
             expected_title=expected_title,
@@ -468,11 +484,9 @@ def _retry_episode(ep: dict) -> bool:
         label=f"{title} S{season:02d}E{episode:02d}",
     )
     uncached_torrents = [s for s in candidates if not s.is_usenet and s.info_hash not in cached_hashes]
-    if require_title:
-        uncached_torrents = [
-            item for item in uncached_torrents
-            if expected_title and torrentio._episode_title_match(item, expected_title)
-        ]
+    uncached_torrents = _episode_title_verified_candidates(
+        uncached_torrents, expected_title, require_title
+    )
     ordered = cached_torrents + nzbs + uncached_torrents
     if not ordered:
         log.info("Monitor: no identity-verifiable candidates for %s S%02dE%02d",
