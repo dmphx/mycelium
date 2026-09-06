@@ -181,11 +181,6 @@ def _touch_debounced(token: str) -> None:
             return
         _touch_cache[token] = True
     db.touch_virtual_item(token)
-    try:
-        import enrichment
-        enrichment.queue_from_playback(token)
-    except Exception as exc:
-        log.debug("Enrichment playback queue failed for %s: %s", token, exc)
 
 
 def _record_playback_touch(token: str) -> None:

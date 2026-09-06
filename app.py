@@ -608,16 +608,30 @@ def _start_scheduler() -> BackgroundScheduler:
         log.info("Scheduled spore-nfs cache-status refresh every %dm", _spore_refresh_min)
 
         if enrichment.enabled():
+            enrichment_safe = enrichment.initialize()
+            scheduler.add_job(
+                enrichment.poll_plex_sessions,
+                trigger="interval", seconds=cfg.ENRICHMENT_SESSION_POLL_SECONDS,
+                id="media_enrichment_sessions", next_run_time=None,
+                max_instances=1, coalesce=True,
+            )
             scheduler.add_job(
                 enrichment.run_once,
                 trigger="interval", minutes=cfg.ENRICHMENT_INTERVAL_MINUTES,
                 id="media_enrichment", next_run_time=None,
                 max_instances=1, coalesce=True,
             )
+            if not enrichment_safe:
+                log.critical(
+                    "Media enrichment starts fail-closed until Plex safety "
+                    "initialization succeeds"
+                )
             log.info(
-                "Scheduled media enrichment every %dm (season cap=%d, next=%d)",
+                "Scheduled media enrichment session poll every %ds and worker "
+                "every %dm (season cap=%d, next=%d, worker_safe=%s)",
+                cfg.ENRICHMENT_SESSION_POLL_SECONDS,
                 cfg.ENRICHMENT_INTERVAL_MINUTES, cfg.ENRICHMENT_SEASON_CAP,
-                cfg.ENRICHMENT_NEXT_SEASON_EPISODES,
+                cfg.ENRICHMENT_NEXT_SEASON_EPISODES, enrichment_safe,
             )
 
     if not LITE_MODE:
@@ -726,7 +740,8 @@ def _start_scheduler() -> BackgroundScheduler:
                  "identity_repair",
                  "retry_queue", "auto_upgrade", "pack_consolidation",
                  "trending_precache", "continue_watching", "db_backup",
-                 "catbox_gc", "merge_versions", "quota_warn"):
+                 "catbox_gc", "merge_versions", "quota_warn",
+                 "media_enrichment", "media_enrichment_sessions"):
         try:
             scheduler.modify_job(jid, max_instances=1)
         except Exception as exc:

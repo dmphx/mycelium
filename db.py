@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 # the lifetime of the thread. Eliminates the open/close churn on every query
 # under heavy load (dashboard polling + scheduler + webhooks running together).
 _tls = threading.local()
+_MAX_ENRICHMENT_ATTEMPTS = 5
 
 
 def _raw_connect() -> sqlite3.Connection:
@@ -147,19 +148,41 @@ CREATE TABLE IF NOT EXISTS media_enrichment_queue (
     token             TEXT PRIMARY KEY,
     info_hash         TEXT NOT NULL,
     imdb_id           TEXT,
+    tmdb_id           INTEGER,
     title             TEXT NOT NULL,
     media_type        TEXT NOT NULL,
     season            INTEGER,
     episode           INTEGER,
+    year              INTEGER,
     priority          INTEGER NOT NULL DEFAULT 100,
     reason            TEXT NOT NULL DEFAULT 'playback',
     state             TEXT NOT NULL DEFAULT 'queued',
     attempts          INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
+    next_attempt_at   TEXT,
+    lease_id          TEXT,
+    lease_expires_at  TEXT,
+    plex_rating_key   TEXT,
+    evidence_json     TEXT,
+    quarantine_batch  TEXT,
+    quarantine_previous_state TEXT,
+    quarantined_at    TEXT,
+    dead_lettered_at  TEXT,
     queued_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
     started_at        TEXT,
     completed_at      TEXT,
     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS plex_playback_events (
+    event_id        TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    rating_key      TEXT NOT NULL,
+    player_id       TEXT,
+    token           TEXT,
+    first_seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    last_seen_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    queued_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS failed_hashes (
@@ -235,6 +258,7 @@ CREATE INDEX IF NOT EXISTS idx_virtual_items_torbox       ON virtual_items(torbo
 CREATE INDEX IF NOT EXISTS idx_virtual_items_lastplayed   ON virtual_items(last_played);
 CREATE INDEX IF NOT EXISTS idx_enrichment_state_priority  ON media_enrichment_queue(state, priority, queued_at);
 CREATE INDEX IF NOT EXISTS idx_enrichment_series_season   ON media_enrichment_queue(imdb_id, season, state);
+CREATE INDEX IF NOT EXISTS idx_plex_playback_last_seen     ON plex_playback_events(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_metric_events_metric_time  ON metric_events(metric, created_at);
 CREATE INDEX IF NOT EXISTS idx_metric_events_created      ON metric_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_activity_log_created       ON activity_log(created_at DESC);
@@ -495,6 +519,36 @@ def _migrate() -> None:
             "ON virtual_items(media_type, imdb_id, season, episode)"
         )
 
+        enrichment_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(media_enrichment_queue)")
+        }
+        for col, typedef in [
+            ("tmdb_id", "INTEGER"),
+            ("year", "INTEGER"),
+            ("next_attempt_at", "TEXT"),
+            ("lease_id", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+            ("plex_rating_key", "TEXT"),
+            ("evidence_json", "TEXT"),
+            ("quarantine_batch", "TEXT"),
+            ("quarantine_previous_state", "TEXT"),
+            ("quarantined_at", "TEXT"),
+            ("dead_lettered_at", "TEXT"),
+        ]:
+            if col not in enrichment_cols:
+                conn.execute(
+                    f"ALTER TABLE media_enrichment_queue ADD COLUMN {col} {typedef}"
+                )
+                log.info("Migration: added media_enrichment_queue.%s", col)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_ready "
+            "ON media_enrichment_queue(state, next_attempt_at, priority, queued_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_lease "
+            "ON media_enrichment_queue(lease_expires_at)"
+        )
+
         req_cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
         if "tmdb_id" not in req_cols:
             conn.execute("ALTER TABLE requests ADD COLUMN tmdb_id INTEGER")
@@ -593,6 +647,7 @@ _PRUNE_TARGETS: dict[str, str] = {
     "release_candidates": "last_seen",
     "identity_repairs":  "created_at",
     "provider_cache_status": "expires_at",
+    "plex_playback_events": "last_seen_at",
 }
 
 
@@ -1553,41 +1608,93 @@ def queue_media_enrichment(items: list[dict], reason: str = "playback") -> int:
             if not (token and info_hash and title):
                 continue
             priority = int(item.get("enrichment_priority", 100))
+            imdb_id = item.get("imdb_id")
+            tmdb_id = item.get("tmdb_id") or get_tmdb_id_for_imdb(imdb_id, conn=conn)
             before = conn.total_changes
             conn.execute(
                 """
                 INSERT INTO media_enrichment_queue
-                    (token, info_hash, imdb_id, title, media_type, season, episode,
-                     priority, reason, state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+                    (token, info_hash, imdb_id, tmdb_id, title, media_type,
+                     season, episode, year, priority, reason, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
                 ON CONFLICT(token) DO UPDATE SET
                     info_hash=excluded.info_hash,
-                    imdb_id=excluded.imdb_id,
+                    imdb_id=COALESCE(excluded.imdb_id, media_enrichment_queue.imdb_id),
+                    tmdb_id=COALESCE(excluded.tmdb_id, media_enrichment_queue.tmdb_id),
                     title=excluded.title,
                     media_type=excluded.media_type,
                     season=excluded.season,
                     episode=excluded.episode,
+                    year=COALESCE(excluded.year, media_enrichment_queue.year),
                     priority=MIN(media_enrichment_queue.priority, excluded.priority),
                     reason=excluded.reason,
                     state=CASE
                         WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                          OR (media_enrichment_queue.state='quarantined'
+                              AND excluded.reason='plex-session')
                         THEN 'queued' ELSE media_enrichment_queue.state END,
                     attempts=CASE
                         WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                          OR (media_enrichment_queue.state='quarantined'
+                              AND excluded.reason='plex-session')
                         THEN 0 ELSE media_enrichment_queue.attempts END,
                     last_error=CASE
                         WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                          OR (media_enrichment_queue.state='quarantined'
+                              AND excluded.reason='plex-session')
                         THEN NULL ELSE media_enrichment_queue.last_error END,
                     completed_at=CASE
                         WHEN media_enrichment_queue.info_hash != excluded.info_hash
                         THEN NULL ELSE media_enrichment_queue.completed_at END,
+                    next_attempt_at=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                          OR (media_enrichment_queue.state='quarantined'
+                              AND excluded.reason='plex-session')
+                        THEN NULL ELSE media_enrichment_queue.next_attempt_at END,
+                    lease_id=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.lease_id END,
+                    lease_expires_at=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.lease_expires_at END,
+                    plex_rating_key=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.plex_rating_key END,
+                    evidence_json=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                        THEN NULL ELSE media_enrichment_queue.evidence_json END,
+                    dead_lettered_at=CASE
+                        WHEN media_enrichment_queue.info_hash != excluded.info_hash
+                          OR (media_enrichment_queue.state='quarantined'
+                              AND excluded.reason='plex-session')
+                        THEN NULL ELSE media_enrichment_queue.dead_lettered_at END,
+                    quarantine_batch=CASE
+                        WHEN media_enrichment_queue.state='quarantined'
+                             AND excluded.reason='plex-session'
+                        THEN NULL ELSE media_enrichment_queue.quarantine_batch END,
+                    quarantine_previous_state=CASE
+                        WHEN media_enrichment_queue.state='quarantined'
+                             AND excluded.reason='plex-session'
+                        THEN NULL ELSE media_enrichment_queue.quarantine_previous_state END,
+                    quarantined_at=CASE
+                        WHEN media_enrichment_queue.state='quarantined'
+                             AND excluded.reason='plex-session'
+                        THEN NULL ELSE media_enrichment_queue.quarantined_at END,
                     updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
                 WHERE media_enrichment_queue.info_hash != excluded.info_hash
                    OR excluded.priority < media_enrichment_queue.priority
+                   OR (media_enrichment_queue.imdb_id IS NULL
+                       AND excluded.imdb_id IS NOT NULL)
+                   OR (media_enrichment_queue.tmdb_id IS NULL
+                       AND excluded.tmdb_id IS NOT NULL)
+                   OR (media_enrichment_queue.year IS NULL
+                       AND excluded.year IS NOT NULL)
+                   OR (media_enrichment_queue.state='quarantined'
+                       AND excluded.reason='plex-session')
                 """,
-                (token, info_hash, item.get("imdb_id"), title,
+                (token, info_hash, imdb_id, tmdb_id, title,
                  item.get("media_type") or "series", item.get("season"),
-                 item.get("episode"), priority, reason),
+                 item.get("episode"), item.get("year"), priority, reason),
             )
             if conn.total_changes > before:
                 changed += 1
@@ -1595,15 +1702,140 @@ def queue_media_enrichment(items: list[dict], reason: str = "playback") -> int:
     return changed
 
 
+def get_tmdb_id_for_imdb(imdb_id: str | None, conn=None) -> int | None:
+    """Return a TMDB identity only when durable sources agree on it."""
+    if not imdb_id:
+        return None
+    if conn is None:
+        conn = _thread_conn()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT tmdb_id FROM (
+            SELECT tmdb_id FROM requests
+             WHERE imdb_id=? AND tmdb_id IS NOT NULL
+            UNION ALL
+            SELECT tmdb_id FROM monitored_series
+             WHERE imdb_id=? AND tmdb_id IS NOT NULL
+            UNION ALL
+            SELECT tmdb_id FROM wanted_episodes
+             WHERE imdb_id=? AND tmdb_id IS NOT NULL
+            UNION ALL
+            SELECT tmdb_id FROM watchlist
+             WHERE imdb_id=? AND tmdb_id IS NOT NULL
+            UNION ALL
+            SELECT tmdb_id FROM user_requests
+             WHERE imdb_id=? AND tmdb_id IS NOT NULL
+        ) ORDER BY tmdb_id
+        """,
+        (imdb_id, imdb_id, imdb_id, imdb_id, imdb_id),
+    ).fetchall()
+    return int(rows[0]["tmdb_id"]) if len(rows) == 1 else None
+
+
+def _enrichment_eligible_sql(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{prefix}state IN ('queued', 'staged', 'retry', 'failed') "
+        f"AND {prefix}attempts < ? "
+        f"AND ({prefix}next_attempt_at IS NULL "
+        f"OR {prefix}next_attempt_at <= strftime('%Y-%m-%d %H:%M:%S','now')) "
+        f"AND {prefix}lease_id IS NULL"
+    )
+
+
+def _release_expired_enrichment_claims(conn, max_attempts: int,
+                                        retry_base_seconds: int,
+                                        error: str,
+                                        release_all: bool = False) -> int:
+    rows = conn.execute(
+        """
+        SELECT token, attempts
+          FROM media_enrichment_queue
+         WHERE (
+                 lease_id IS NOT NULL
+                 AND state IN ('claimed', 'downloading', 'staged', 'analyzing')
+                 AND (?=1 OR lease_expires_at IS NULL
+                      OR lease_expires_at <= strftime('%Y-%m-%d %H:%M:%S','now'))
+               )
+            OR (
+                 lease_id IS NULL
+                 AND state IN ('claimed', 'downloading', 'analyzing')
+               )
+        """,
+        (int(bool(release_all)),),
+    ).fetchall()
+    for row in rows:
+        attempts = int(row["attempts"] or 0)
+        if attempts >= max_attempts:
+            state = "dead_letter"
+            modifier = None
+        else:
+            state = "retry"
+            delay = min(
+                86400,
+                retry_base_seconds * (2 ** max(0, attempts - 1)),
+            )
+            modifier = f"+{delay} seconds"
+        conn.execute(
+            """
+            UPDATE media_enrichment_queue
+               SET state=?, last_error=?,
+                   next_attempt_at=CASE WHEN ? IS NULL
+                       THEN NULL ELSE datetime('now', ?) END,
+                   dead_lettered_at=CASE WHEN ?='dead_letter'
+                       THEN strftime('%Y-%m-%d %H:%M:%S','now') ELSE NULL END,
+                   lease_id=NULL, lease_expires_at=NULL,
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE token=?
+            """,
+            (state, error[:500], modifier, modifier, state, row["token"]),
+        )
+    return len(rows)
+
+
+def _dead_letter_exhausted_or_orphaned(conn, max_attempts: int) -> int:
+    exhausted = conn.execute(
+        """
+        UPDATE media_enrichment_queue
+           SET state='dead_letter', next_attempt_at=NULL,
+               last_error=COALESCE(last_error, 'maximum enrichment attempts reached'),
+               dead_lettered_at=COALESCE(
+                   dead_lettered_at, strftime('%Y-%m-%d %H:%M:%S','now')
+               ),
+               updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+         WHERE state IN ('queued', 'staged', 'retry', 'failed')
+           AND attempts >= ? AND lease_id IS NULL
+        """,
+        (max_attempts,),
+    ).rowcount
+    orphaned = conn.execute(
+        """
+        UPDATE media_enrichment_queue
+           SET state='dead_letter', next_attempt_at=NULL,
+               last_error='virtual media item no longer exists',
+               dead_lettered_at=COALESCE(
+                   dead_lettered_at, strftime('%Y-%m-%d %H:%M:%S','now')
+               ),
+               updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+         WHERE state IN ('queued', 'staged', 'retry', 'failed')
+           AND lease_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM virtual_items v
+                WHERE v.token=media_enrichment_queue.token
+           )
+        """
+    ).rowcount
+    return exhausted + orphaned
+
+
 def get_enrichment_batch() -> list[dict]:
-    """Return the highest-priority queued season, or one queued movie."""
+    """Preview the next eligible batch without claiming it."""
     with _connect() as conn:
         first = conn.execute(
-            """
-            SELECT * FROM media_enrichment_queue
-            WHERE state IN ('queued', 'staged', 'failed') AND attempts < 5
-            ORDER BY priority, queued_at LIMIT 1
-            """
+            f"SELECT * FROM media_enrichment_queue WHERE {_enrichment_eligible_sql()} "
+            "ORDER BY CASE state WHEN 'staged' THEN 0 ELSE 1 END, "
+            "priority, queued_at LIMIT 1",
+            (5,),
         ).fetchone()
         if not first:
             return []
@@ -1611,26 +1843,26 @@ def get_enrichment_batch() -> list[dict]:
             selector = "q.imdb_id=?"
             selector_params: list = [first["imdb_id"]]
             if not first["imdb_id"]:
-                base = (first["title"] or "").split(" S", 1)[0]
-                selector = "q.imdb_id IS NULL AND q.title LIKE ?"
-                selector_params = [base + " S%"]
+                base = (first["title"] or "").rsplit(" S", 1)[0]
+                selector = "q.imdb_id IS NULL AND q.title LIKE ? ESCAPE '\\'"
+                selector_params = [_escape_like(base) + " S%"]
             rows = conn.execute(
                 f"""
                 SELECT q.*, v.strm_path, v.file_id, v.torbox_id, v.protocol,
-                       v.debrid_provider, v.size_gb
+                       v.debrid_provider, v.size_gb, COALESCE(q.year, v.year) AS year
                 FROM media_enrichment_queue q
                 JOIN virtual_items v ON v.token=q.token
                 WHERE {selector} AND q.season=?
-                  AND q.state IN ('queued', 'staged', 'failed') AND q.attempts < 5
+                  AND {_enrichment_eligible_sql('q')}
                 ORDER BY q.episode, q.priority
                 """,
-                (*selector_params, first["season"]),
+                (*selector_params, first["season"], 5),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
                 SELECT q.*, v.strm_path, v.file_id, v.torbox_id, v.protocol,
-                       v.debrid_provider, v.size_gb
+                       v.debrid_provider, v.size_gb, COALESCE(q.year, v.year) AS year
                 FROM media_enrichment_queue q
                 JOIN virtual_items v ON v.token=q.token
                 WHERE q.token=?
@@ -1638,6 +1870,254 @@ def get_enrichment_batch() -> list[dict]:
                 (first["token"],),
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def claim_enrichment_batch(lease_id: str, lease_seconds: int = 28800,
+                           max_attempts: int = 5,
+                           retry_base_seconds: int = 900,
+                           max_items: int = 14) -> list[dict]:
+    """Atomically claim one eligible movie or series-season batch.
+
+    Attempts increment in the same transaction as the lease. A failed batch is
+    assigned a future retry time, so another title can progress immediately.
+    """
+    if not lease_id:
+        raise ValueError("lease_id is required")
+    lease_seconds = max(60, int(lease_seconds))
+    max_attempts = min(_MAX_ENRICHMENT_ATTEMPTS, max(1, int(max_attempts)))
+    retry_base_seconds = max(1, int(retry_base_seconds))
+    max_items = max(1, int(max_items))
+    conn = _thread_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _release_expired_enrichment_claims(
+            conn, max_attempts, retry_base_seconds,
+            "lease expired before completion",
+        )
+        _dead_letter_exhausted_or_orphaned(conn, max_attempts)
+        first = conn.execute(
+            f"SELECT * FROM media_enrichment_queue WHERE {_enrichment_eligible_sql()} "
+            "ORDER BY CASE state WHEN 'staged' THEN 0 ELSE 1 END, "
+            "priority, queued_at LIMIT 1",
+            (max_attempts,),
+        ).fetchone()
+        if not first:
+            conn.execute("COMMIT")
+            return []
+
+        params: list = []
+        if first["media_type"] == "series" and first["season"] is not None:
+            if first["imdb_id"]:
+                group_sql = "imdb_id=? AND season=?"
+                params.extend([first["imdb_id"], first["season"]])
+            else:
+                base = (first["title"] or "").rsplit(" S", 1)[0]
+                group_sql = (
+                    "imdb_id IS NULL AND title LIKE ? ESCAPE '\\' AND season=?"
+                )
+                params.extend([_escape_like(base) + " S%", first["season"]])
+        else:
+            group_sql = "token=?"
+            params.append(first["token"])
+        rows = conn.execute(
+            f"SELECT token FROM media_enrichment_queue WHERE {group_sql} "
+            f"AND {_enrichment_eligible_sql()} "
+            "ORDER BY CASE state WHEN 'staged' THEN 0 ELSE 1 END, "
+            "priority, episode, queued_at LIMIT ?",
+            (*params, max_attempts, max_items),
+        ).fetchall()
+        tokens = [str(row["token"]) for row in rows]
+        if not tokens:
+            conn.execute("COMMIT")
+            return []
+        placeholders = ",".join("?" for _ in tokens)
+        conn.execute(
+            f"""
+            UPDATE media_enrichment_queue
+               SET state='claimed', attempts=attempts+1, lease_id=?,
+                   lease_expires_at=datetime('now', ?),
+                   started_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                   next_attempt_at=NULL,
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE token IN ({placeholders}) AND lease_id IS NULL
+            """,
+            (lease_id, f"+{lease_seconds} seconds", *tokens),
+        )
+        claimed = conn.execute(
+            f"""
+            SELECT q.*, v.strm_path, v.file_id, v.torbox_id, v.protocol,
+                   v.debrid_provider, v.size_gb,
+                   COALESCE(q.year, v.year) AS year
+              FROM media_enrichment_queue q
+              JOIN virtual_items v ON v.token=q.token
+             WHERE q.token IN ({placeholders}) AND q.lease_id=?
+             ORDER BY q.episode, q.priority
+            """,
+            (*tokens, lease_id),
+        ).fetchall()
+        conn.execute("COMMIT")
+        return [dict(row) for row in claimed]
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def set_enrichment_claim_state(lease_id: str, tokens: list[str], state: str,
+                               error: str | None = None) -> int:
+    if not tokens:
+        return 0
+    placeholders = ",".join("?" for _ in tokens)
+    fields = ["state=?", "updated_at=strftime('%Y-%m-%d %H:%M:%S','now')"]
+    params: list = [state]
+    if error is not None:
+        fields.append("last_error=?")
+        params.append(error[:500])
+    params.extend(tokens)
+    params.append(lease_id)
+    with _connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE media_enrichment_queue SET {', '.join(fields)} "
+            f"WHERE token IN ({placeholders}) AND lease_id=? "
+            "AND lease_expires_at > strftime('%Y-%m-%d %H:%M:%S','now')",
+            params,
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def renew_enrichment_claim(lease_id: str,
+                           lease_seconds: int = 28800) -> int:
+    """Extend every still-owned row in a live enrichment lease."""
+    if not lease_id:
+        return 0
+    lease_seconds = max(60, int(lease_seconds))
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE media_enrichment_queue
+               SET lease_expires_at=datetime('now', ?),
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE lease_id=?
+               AND lease_expires_at > strftime('%Y-%m-%d %H:%M:%S','now')
+               AND state IN ('claimed', 'downloading', 'staged', 'analyzing')
+            """,
+            (f"+{lease_seconds} seconds", lease_id),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def complete_enrichment_claim(lease_id: str, token: str, rating_key: str,
+                              evidence: dict) -> bool:
+    import json
+    artifact = evidence.get("artifact") if isinstance(evidence, dict) else None
+    if not (
+        evidence.get("activity_completed") is True
+        and evidence.get("metadata_changed") is True
+        and evidence.get("stub_restored") is True
+        and int(evidence.get("downloaded_bytes") or 0) > 0
+        and isinstance(artifact, dict)
+        and int(artifact.get("part_count") or 0) > 0
+        and int(artifact.get("stream_count") or 0) > 0
+    ):
+        raise ValueError("positive Plex analysis completion evidence is required")
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE media_enrichment_queue
+               SET state='complete', completed_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                   last_error=NULL, next_attempt_at=NULL,
+                   lease_id=NULL, lease_expires_at=NULL,
+                   plex_rating_key=?, evidence_json=?, dead_lettered_at=NULL
+             WHERE token=? AND lease_id=?
+               AND lease_expires_at > strftime('%Y-%m-%d %H:%M:%S','now')
+            """,
+            (str(rating_key), json.dumps(evidence, sort_keys=True), token, lease_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+def fail_enrichment_claim(lease_id: str, tokens: list[str], error: str,
+                          max_attempts: int = 5,
+                          retry_base_seconds: int = 900) -> dict[str, int]:
+    """Release failed claimed items with bounded backoff or dead letter them."""
+    result = {"retry": 0, "dead_letter": 0}
+    if not tokens:
+        return result
+    max_attempts = min(_MAX_ENRICHMENT_ATTEMPTS, max(1, int(max_attempts)))
+    retry_base_seconds = max(1, int(retry_base_seconds))
+    conn = _thread_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in tokens)
+        rows = conn.execute(
+            f"SELECT token, attempts FROM media_enrichment_queue "
+            f"WHERE token IN ({placeholders}) AND lease_id=?",
+            (*tokens, lease_id),
+        ).fetchall()
+        for row in rows:
+            attempts = int(row["attempts"])
+            if attempts >= max_attempts:
+                state = "dead_letter"
+                modifier = None
+                result[state] += 1
+            else:
+                state = "retry"
+                delay = min(86400, retry_base_seconds * (2 ** max(0, attempts - 1)))
+                modifier = f"+{delay} seconds"
+                result[state] += 1
+            conn.execute(
+                """
+                UPDATE media_enrichment_queue
+                   SET state=?, last_error=?,
+                       next_attempt_at=CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', ?) END,
+                       dead_lettered_at=CASE WHEN ?='dead_letter'
+                           THEN strftime('%Y-%m-%d %H:%M:%S','now') ELSE NULL END,
+                       lease_id=NULL, lease_expires_at=NULL,
+                       updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+                 WHERE token=? AND lease_id=?
+                """,
+                (state, error[:500], modifier, modifier, state, row["token"], lease_id),
+            )
+        conn.execute("COMMIT")
+        return result
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def defer_enrichment_claim(lease_id: str, tokens: list[str], reason: str,
+                            staged_tokens: set[str] | None = None,
+                            delay_seconds: int = 300) -> int:
+    """Release work that lost an idle window without consuming a failure attempt."""
+    staged_tokens = staged_tokens or set()
+    changed = 0
+    with _connect() as conn:
+        for token in tokens:
+            state = "staged" if token in staged_tokens else "queued"
+            cursor = conn.execute(
+                """
+                UPDATE media_enrichment_queue
+                   SET state=?, attempts=MAX(0, attempts-1), last_error=?,
+                       next_attempt_at=datetime('now', ?),
+                       lease_id=NULL, lease_expires_at=NULL,
+                       updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+                 WHERE token=? AND lease_id=?
+                """,
+                (state, reason[:500], f"+{max(1, int(delay_seconds))} seconds",
+                 token, lease_id),
+            )
+            changed += cursor.rowcount
+        conn.commit()
+    return changed
 
 
 def get_enrichment_recovery_items() -> list[dict]:
@@ -1654,20 +2134,32 @@ def get_enrichment_recovery_items() -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def reset_interrupted_enrichment() -> int:
-    """Requeue work left in an in-flight state by a stopped worker."""
-    with _connect() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE media_enrichment_queue
-            SET state='queued',
-                last_error='resuming after interrupted worker',
-                updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
-            WHERE state IN ('downloading', 'analyzing')
-            """
+def reset_interrupted_enrichment(max_attempts: int = 5,
+                                 retry_base_seconds: int = 900,
+                                 release_all: bool = False) -> int:
+    """Release abandoned in-flight claims with normal backoff.
+
+    Callers may release unexpired claims only while holding the shared worker
+    process lock, which proves the former owner is no longer running.
+    """
+    max_attempts = min(_MAX_ENRICHMENT_ATTEMPTS, max(1, int(max_attempts)))
+    retry_base_seconds = max(1, int(retry_base_seconds))
+    conn = _thread_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        changed = _release_expired_enrichment_claims(
+            conn, max_attempts, retry_base_seconds,
+            "resuming after interrupted worker",
+            release_all=release_all,
         )
-        conn.commit()
-        return cursor.rowcount
+        conn.execute("COMMIT")
+        return changed
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
 
 
 def get_enrichment_state(token: str) -> str | None:
@@ -1680,6 +2172,10 @@ def get_enrichment_state(token: str) -> str | None:
 
 def set_enrichment_state(tokens: list[str], state: str,
                          error: str | None = None) -> None:
+    if state == "complete":
+        raise ValueError(
+            "complete_enrichment_claim with positive evidence is required"
+        )
     if not tokens:
         return
     placeholders = ",".join("?" for _ in tokens)
@@ -1690,8 +2186,6 @@ def set_enrichment_state(tokens: list[str], state: str,
             fields.extend([
                 "started_at=COALESCE(started_at, strftime('%Y-%m-%d %H:%M:%S','now'))",
             ])
-        if state == "downloading":
-            fields.append("attempts=attempts+1")
         if state == "complete":
             fields.extend([
                 "completed_at=strftime('%Y-%m-%d %H:%M:%S','now')",
@@ -1725,23 +2219,31 @@ def get_series_enrichment_items(token: str, season_cap: int = 40,
                 (imdb_id,),
             ).fetchall()
         else:
-            base = (item.get("title") or "").split(" S", 1)[0]
+            base = (item.get("title") or "").rsplit(" S", 1)[0]
             rows = conn.execute(
                 """SELECT * FROM virtual_items
-                   WHERE media_type='series' AND title LIKE ? AND season IS NOT NULL
+                   WHERE media_type='series' AND title LIKE ? ESCAPE '\\'
+                     AND season IS NOT NULL
                    ORDER BY season, episode""",
-                (base + " S%",),
+                (_escape_like(base) + " S%",),
             ).fetchall()
     current_season = int(item["season"])
     current_episode = int(item.get("episode") or 0)
-    current = [dict(r) for r in rows if int(r["season"]) == current_season]
-    current = current[:max(1, min(int(season_cap), 40))]
+    current_all = [dict(r) for r in rows if int(r["season"]) == current_season]
+    current_all.sort(key=lambda row: int(row.get("episode") or 0))
+    cap = max(1, min(int(season_cap), 12))
+    current = [row for row in current_all if int(row.get("episode") or 0) >= current_episode]
+    current = current[:cap]
+    if len(current) < cap:
+        selected = {row["token"] for row in current}
+        preceding = [row for row in current_all if row["token"] not in selected]
+        current = preceding[-(cap - len(current)):] + current
     later_seasons = sorted({int(r["season"]) for r in rows if int(r["season"]) > current_season})
     next_items: list[dict] = []
     if later_seasons:
         next_season = later_seasons[0]
         next_items = [dict(r) for r in rows if int(r["season"]) == next_season]
-        next_items = next_items[:max(0, int(next_count))]
+        next_items = next_items[:max(0, min(int(next_count), 2))]
     for row in current:
         ep = int(row.get("episode") or 0)
         if ep == current_episode + 1:
@@ -1761,6 +2263,204 @@ def enrichment_counts() -> dict[str, int]:
             "SELECT state, COUNT(*) AS n FROM media_enrichment_queue GROUP BY state"
         ).fetchall()
     return {r["state"]: r["n"] for r in rows}
+
+
+def enrichment_metrics(max_attempts: int = 5) -> dict:
+    max_attempts = min(_MAX_ENRICHMENT_ATTEMPTS, max(1, int(max_attempts)))
+    with _connect() as conn:
+        states = {
+            str(row["state"]): int(row["n"])
+            for row in conn.execute(
+                "SELECT state, COUNT(*) AS n FROM media_enrichment_queue GROUP BY state"
+            )
+        }
+        oldest = conn.execute(
+            """
+            SELECT CAST((julianday('now') - julianday(MIN(queued_at))) * 86400 AS INTEGER)
+              FROM media_enrichment_queue
+             WHERE state IN ('queued', 'staged', 'retry', 'failed')
+               AND attempts < ?
+               AND lease_id IS NULL
+               AND (next_attempt_at IS NULL
+                    OR next_attempt_at <= strftime('%Y-%m-%d %H:%M:%S','now'))
+            """,
+            (max_attempts,),
+        ).fetchone()[0]
+        last_success = conn.execute(
+            """
+            SELECT CAST((julianday('now') - julianday(MAX(completed_at))) * 86400 AS INTEGER)
+              FROM media_enrichment_queue WHERE state='complete'
+            """
+        ).fetchone()[0]
+        attempts = conn.execute(
+            "SELECT COALESCE(SUM(attempts), 0) FROM media_enrichment_queue"
+        ).fetchone()[0]
+        playback_events = conn.execute(
+            "SELECT COUNT(*) FROM plex_playback_events"
+        ).fetchone()[0]
+    return {
+        "states": states,
+        "oldest_ready_age_seconds": int(oldest) if oldest is not None else -1,
+        "last_success_age_seconds": int(last_success) if last_success is not None else -1,
+        "claim_attempts": int(attempts or 0),
+        "playback_events": int(playback_events or 0),
+    }
+
+
+def find_virtual_item_by_plex_path(path: str) -> dict | None:
+    """Resolve an exact Plex part path to one virtual item without title guessing."""
+    normalized = str(path or "").replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    root_index = next(
+        (idx for idx, part in enumerate(parts) if part in ("series", "movies")),
+        None,
+    )
+    if root_index is None or root_index >= len(parts) - 1:
+        return None
+    relative = "/".join(parts[root_index:])
+    if relative.lower().endswith(".mkv"):
+        relative = relative[:-4] + ".strm"
+    suffix = "/" + relative
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM virtual_items WHERE strm_path LIKE ? ESCAPE '\\'",
+            ("%" + _escape_like(suffix),),
+        ).fetchall()
+    return dict(rows[0]) if len(rows) == 1 else None
+
+
+def record_plex_playback_event(event_id: str, session_id: str, rating_key: str,
+                               player_id: str | None,
+                               token: str | None) -> bool:
+    """Record an authoritative Plex session and return true until it is queued."""
+    conn = _thread_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT token, queued_at FROM plex_playback_events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO plex_playback_events
+                    (event_id, session_id, rating_key, player_id, token)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, session_id, rating_key, player_id, token),
+            )
+            needs_queue = bool(token)
+        else:
+            conn.execute(
+                """
+                UPDATE plex_playback_events
+                   SET last_seen_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                       token=COALESCE(token, ?), player_id=COALESCE(player_id, ?)
+                 WHERE event_id=?
+                """,
+                (token, player_id, event_id),
+            )
+            needs_queue = bool(token) and row["queued_at"] is None
+        conn.execute("COMMIT")
+        return needs_queue
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def mark_plex_playback_event_queued(event_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE plex_playback_events
+               SET queued_at=COALESCE(queued_at, strftime('%Y-%m-%d %H:%M:%S','now')),
+                   last_seen_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE event_id=?
+            """,
+            (event_id,),
+        )
+        conn.commit()
+
+
+def recent_plex_playback(seconds: int = 600) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM plex_playback_events
+             WHERE last_seen_at > datetime('now', ?)
+             LIMIT 1
+            """,
+            (f"-{max(1, int(seconds))} seconds",),
+        ).fetchone()
+    return row is not None
+
+
+def quarantine_pending_enrichment(batch_id: str, reason: str) -> int:
+    """Quarantine all unverified work while preserving completed evidence."""
+    if not batch_id:
+        raise ValueError("batch_id is required")
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE media_enrichment_queue
+               SET quarantine_previous_state=state, state='quarantined',
+                   quarantine_batch=?, quarantined_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                   last_error=?, lease_id=NULL, lease_expires_at=NULL,
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE state NOT IN ('complete', 'quarantined')
+            """,
+            (batch_id, reason[:500]),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def restore_quarantined_enrichment(batch_id: str) -> int:
+    """Restore one quarantine batch without changing completed rows."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE media_enrichment_queue
+               SET state=CASE
+                       WHEN quarantine_previous_state IN ('claimed', 'downloading', 'analyzing')
+                       THEN 'retry'
+                       ELSE COALESCE(quarantine_previous_state, 'queued')
+                   END,
+                   quarantine_batch=NULL, quarantine_previous_state=NULL,
+                   quarantined_at=NULL,
+                   next_attempt_at=strftime('%Y-%m-%d %H:%M:%S','now'),
+                   updated_at=strftime('%Y-%m-%d %H:%M:%S','now')
+             WHERE state='quarantined' AND quarantine_batch=?
+            """,
+            (batch_id,),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def get_quarantined_enrichment_tokens(batch_id: str) -> list[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT token FROM media_enrichment_queue
+             WHERE state='quarantined' AND quarantine_batch=?
+             ORDER BY token
+            """,
+            (batch_id,),
+        ).fetchall()
+    return [str(row["token"]) for row in rows]
+
+
+def get_enrichment_tokens_by_state(state: str) -> list[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT token FROM media_enrichment_queue WHERE state=? ORDER BY token",
+            (state,),
+        ).fetchall()
+    return [str(row["token"]) for row in rows]
 
 
 def get_idle_virtual_items(cutoff_iso: str) -> list[dict]:

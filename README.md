@@ -282,17 +282,32 @@ volumes:
 Plex marker and preview generation needs real media bytes, not the small Spore
 stub. Optional progression enrichment stages a bounded local copy only while
 Plex is idle, runs native targeted analysis, and then restores the exact stub.
-Watching an episode queues up to 40 episodes from its season plus four episodes
-from the next populated season. Completed work is invalidated if Mycelium
-changes the release hash.
+Mycelium polls Plex's real session endpoint and resolves the exact playing Part
+path back to a virtual item. Spore reads, NFS probes, preflight requests, and
+Catbox materialization do not enqueue work. A movie queues only itself. An
+episode queues at most 12 episodes from its current season, biased from the
+played episode forward, plus the first two episodes of the next populated
+season.
+
+The worker matches the Plex library item by IMDb first, then TMDB. It uses a
+normalized title and year only when that pair identifies exactly one candidate.
+Every batch is claimed atomically with a renewable lease, increments attempts
+at claim time, retries with bounded exponential backoff, and dead-letters after
+five failed claims. A delayed or poisoned title therefore cannot block the rest
+of the queue. Movies and series both use the same full-media analysis path.
 
 ```yaml
 environment:
   - ENRICHMENT_ENABLED=true
-  - ENRICHMENT_SEASON_CAP=40
-  - ENRICHMENT_NEXT_SEASON_EPISODES=4
+  - ENRICHMENT_SESSION_POLL_SECONDS=15
+  - ENRICHMENT_SEASON_CAP=12
+  - ENRICHMENT_NEXT_SEASON_EPISODES=2
   - ENRICHMENT_CACHE_DIR=/mnt/spore-cache/analysis
   - ENRICHMENT_MAX_BATCH_GB=160
+  - ENRICHMENT_MIN_FREE_GB=25
+  - ENRICHMENT_LEASE_SECONDS=28800
+  - ENRICHMENT_MAX_ATTEMPTS=5
+  - ENRICHMENT_RETRY_BASE_SECONDS=900
 volumes:
   # Mount the same absolute path into both Mycelium (read-write) and Plex
   # (read-only), because the temporary stub symlink uses this exact path.
@@ -302,6 +317,49 @@ volumes:
 The Plex container also needs the analysis directory mounted read-only. Set
 `PLEX_URL` and `PLEX_TOKEN` in Mycelium, keep Plex Butler deep-analysis tasks
 disabled, and never use the Plex `asap` analysis mode with a virtual library.
+Mycelium verifies all four analysis behavior preferences are `never` during
+startup and after every batch. It remains fail-closed when that read-back does
+not match. The byte cap is enforced against bytes actually streamed, even when
+the CDN omits or misstates `Content-Length`. A queue row is completed only after
+an observed analysis activity lifecycle or changed media metadata, successful
+stub checksum restoration, and a verified return to the safe preferences.
+
+Before replacing an older, untrusted pending backlog, inspect it and make a
+recoverable SQLite backup plus quarantine. Completed rows are never changed.
+Quarantined staged media is moved aside, not deleted, and a later confirmed Plex
+session safely requeues only its bounded window.
+
+```bash
+python3 /app/scripts/rebuild_enrichment_queue.py status
+python3 /app/scripts/rebuild_enrichment_queue.py quarantine QUARANTINE_PENDING
+python3 /app/scripts/rebuild_enrichment_queue.py restore BATCH_ID RESTORE_QUARANTINE
+```
+
+### Durable targeted Plex scan spool
+
+Targeted Plex scans default to the legacy two-column queue for compatibility.
+After the host consumer supports the versioned contract, enable the durable
+spool. Legacy mode still holds `analyze` operations in this spool so they are
+not discarded while the consumer upgrade is pending:
+
+```yaml
+environment:
+  - PLEX_SCAN_QUEUE_MODE=spool
+  - PLEX_SCAN_SPOOL_DIR=/data/plex-scan-spool
+```
+
+The standard `./data:/data` mount already places the spool at
+`./data/plex-scan-spool` on the host, so it does not require another Mycelium
+volume. Point the host consumer at that same host directory.
+
+The spool contains `ready`, `working`, `done`, `dead`, and `temp` directories.
+Each JSON v1 request retains `mode` (`scan`, `remove`, or `analyze`), `section`
+as a numeric string, `path`, a deterministic request ID, claim attempts, retry
+time, lease owner and expiry, and the last error. Producers deduplicate pending
+requests. Consumers must hold `.queue.lock` for each state transition,
+increment attempts at claim, renew long leases, archive successes in `done`,
+and retain exhausted or invalid requests in `dead`. An `analyze` request is
+never degraded to the Plex refresh API.
 
 In your Plex container, add an entrypoint that installs the wrapper once:
 

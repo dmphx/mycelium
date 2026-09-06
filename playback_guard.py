@@ -40,24 +40,27 @@ def _plex_active() -> bool | None:
         if resp.status_code != 200:
             return None
         root = ET.fromstring(resp.content)
-        return int(root.get("size") or 0) > 0
+        for node in root:
+            player = next(
+                (child for child in node if child.tag == "Player"), None
+            )
+            if player is not None and (player.get("state") or "").lower() in {
+                "playing", "paused", "buffering",
+            }:
+                return True
+        declared_size = root.get("size")
+        return int(declared_size) > 0 if declared_size is not None else None
     except Exception as exc:
         log.debug("playback guard Plex query failed: %s", exc)
         return None
 
 
-def _recent_play() -> bool:
+def _recent_play() -> bool | None:
     try:
         import db
-        with db._connect() as conn:
-            row = conn.execute(
-                "select count(*) from virtual_items "
-                "where last_played > datetime('now', ?)",
-                (f"-{_RECENT_SECONDS} seconds",),
-            ).fetchone()
-        return bool(row and row[0])
+        return db.recent_plex_playback(_RECENT_SECONDS)
     except Exception:
-        return False
+        return None
 
 
 def active(force: bool = False) -> bool:
@@ -68,7 +71,10 @@ def active(force: bool = False) -> bool:
         if not force and now < _cached_until:
             return _cached_active
     live = _plex_active()
-    result = bool(live) or _recent_play()
+    recent = _recent_play()
+    # A failed or malformed live query or durable-history lookup is not proof
+    # that playback is idle. Background mutation remains deferred.
+    result = True if live is None or recent is None else bool(live) or recent
     with _lock:
         _cached_active = result
         _cached_until = now + _CACHE_SECONDS

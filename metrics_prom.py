@@ -11,6 +11,8 @@ import logging
 
 from prometheus_client import Counter, Gauge, Histogram
 
+import config
+
 log = logging.getLogger(__name__)
 
 # ── Counters (monotonically increasing) ───────────────────────────────────────
@@ -145,6 +147,48 @@ release_candidate_states = Gauge(
     "Durable release candidates by state",
     ["state"],
 )
+enrichment_queue_items = Gauge(
+    "mycelium_enrichment_queue_items",
+    "Plex enrichment queue depth by state",
+    ["state"],
+)
+enrichment_oldest_ready_age_seconds = Gauge(
+    "mycelium_enrichment_oldest_ready_age_seconds",
+    "Age of the oldest eligible Plex enrichment item",
+)
+enrichment_last_success_age_seconds = Gauge(
+    "mycelium_enrichment_last_success_age_seconds",
+    "Age of the most recent positively verified Plex enrichment completion",
+)
+enrichment_claim_attempts = Gauge(
+    "mycelium_enrichment_claim_attempts",
+    "Durable Plex enrichment claim attempts recorded in the queue",
+)
+enrichment_playback_events = Gauge(
+    "mycelium_enrichment_playback_events",
+    "Authoritative Plex playback session events observed",
+)
+enrichment_staged_bytes = Gauge(
+    "mycelium_enrichment_staged_bytes",
+    "Bytes currently staged for Plex enrichment",
+)
+enrichment_overlay_backups = Gauge(
+    "mycelium_enrichment_overlay_backups",
+    "Spore stub backups that still need restoration",
+)
+enrichment_preferences_safe = Gauge(
+    "mycelium_enrichment_preferences_safe",
+    "Plex analysis preferences verified safe, with minus one meaning unknown",
+)
+enrichment_session_poll_ok = Gauge(
+    "mycelium_enrichment_session_poll_ok",
+    "Authoritative Plex session polling health, with minus one meaning unknown",
+)
+plex_scan_spool_items = Gauge(
+    "mycelium_plex_scan_spool_items",
+    "Durable targeted Plex scan requests by spool state",
+    ["state"],
+)
 
 
 def refresh_gauges() -> None:
@@ -236,6 +280,47 @@ def refresh_gauges() -> None:
             release_candidate_states.labels(state=row["state"]).set(row["count"])
     except Exception:
         pass
+
+    # Native Plex enrichment and targeted scan delivery
+    try:
+        enrichment_states = (
+            "queued", "claimed", "downloading", "staged", "analyzing",
+            "retry", "failed", "complete", "dead_letter", "quarantined",
+        )
+        summary = db.enrichment_metrics(
+            max_attempts=config.ENRICHMENT_MAX_ATTEMPTS
+        )
+        for state in enrichment_states:
+            enrichment_queue_items.labels(state=state).set(
+                summary["states"].get(state, 0)
+            )
+        enrichment_oldest_ready_age_seconds.set(
+            summary["oldest_ready_age_seconds"]
+        )
+        enrichment_last_success_age_seconds.set(
+            summary["last_success_age_seconds"]
+        )
+        enrichment_claim_attempts.set(summary["claim_attempts"])
+        enrichment_playback_events.set(summary["playback_events"])
+        import enrichment
+        worker = enrichment.health_snapshot()
+        enrichment_staged_bytes.set(worker["staged_bytes"])
+        enrichment_overlay_backups.set(worker["overlay_backups"])
+        safe = worker.get("preferences_safe")
+        enrichment_preferences_safe.set(-1 if safe is None else int(bool(safe)))
+        poll_ok = worker.get("last_session_poll_ok")
+        enrichment_session_poll_ok.set(
+            -1 if poll_ok is None else int(bool(poll_ok))
+        )
+        # Legacy mode also parks analyze operations in the durable spool while
+        # the host consumer is being upgraded, so expose these states in both
+        # producer modes.
+        import plex_scan_queue
+        spool = plex_scan_queue.counts(config.PLEX_SCAN_SPOOL_DIR)
+        for state in ("ready", "working", "done", "dead"):
+            plex_scan_spool_items.labels(state=state).set(spool.get(state, 0))
+    except Exception as exc:
+        log.debug("metrics: enrichment state failed: %s", exc)
 
     # Last success age
     try:

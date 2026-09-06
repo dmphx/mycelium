@@ -6,6 +6,16 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Plex enrichment now queues only from durable, authoritative Plex sessions,
+  not from Spore reads, NFS probes, or Catbox materialization
+- Plex library matching now prefers exact IMDb and TMDB identities, permits a
+  title and year fallback only when unique, and supports full movie analysis
+- Plex analysis preferences are verified as `never` during startup and cleanup;
+  uncertain preferences, activity responses, leases, or completion evidence
+  fail closed without marking work complete
+- Enrichment download limits now enforce actual streamed bytes and a free-space
+  reserve even when a CDN omits or misstates its content length, and staged
+  files are bound to the exact release hash, size, and checksum before reuse
 - Plex first-play transcoding now removes subtitle-first video filter graphs
   and stale EAE decoder hints when the probed Spore source has native AAC or
   another safe codec, preventing synthetic track metadata from killing sessions
@@ -19,8 +29,15 @@ All notable changes to Mycelium are documented in this file.
 - Sanitized health, request, playability, dependency, and TorBox summaries
 - Cursor-based activity events that omit paths, hashes, URLs, and requester identity
 - Progression-aware native Plex enrichment that stages real media only while
-  playback is idle, restores the original Spore stubs after analysis, caps a
-  played season at 40 episodes, and prepares four episodes from the next season
+  playback is idle, restores exact Spore stub checksums after analysis, caps a
+  played season at 12 episodes, and prepares two episodes from the next season
+- Atomic renewable enrichment claims with claim-time attempt accounting,
+  bounded retry backoff, five-attempt dead letters, no head-of-line blocking,
+  per-item failure isolation, positive completion evidence, and Prometheus
+  queue and safety metrics
+- A recoverable queue quarantine and restore tool that preserves completed
+  enrichment, plus a versioned targeted Plex scan spool with leased claims,
+  operation-preserving delivery, success archives, and retained failures
 
 ## [0.6.2] - 2026-08-16
 

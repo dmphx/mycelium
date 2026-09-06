@@ -22,8 +22,15 @@ def test_no_live_or_recent_play_leaves_gate_open(monkeypatch):
     assert guard.active(force=True) is False
 
 
-def test_live_query_failure_uses_recent_play_fallback(monkeypatch):
+def test_live_query_failure_fails_closed_even_without_recent_play(monkeypatch):
     _reset()
     monkeypatch.setattr(guard, "_plex_active", lambda: None)
-    monkeypatch.setattr(guard, "_recent_play", lambda: True)
+    monkeypatch.setattr(guard, "_recent_play", lambda: False)
+    assert guard.active(force=True) is True
+
+
+def test_durable_history_failure_fails_closed(monkeypatch):
+    _reset()
+    monkeypatch.setattr(guard, "_plex_active", lambda: False)
+    monkeypatch.setattr(guard, "_recent_play", lambda: None)
     assert guard.active(force=True) is True

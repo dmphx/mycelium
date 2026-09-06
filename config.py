@@ -404,13 +404,27 @@ SPORE_MEDIA_PATH = _env("SPORE_MEDIA_PATH", "/data/plex-media")
 # and preview artifacts, then restores the original Spore stubs.
 ENRICHMENT_ENABLED = _env("ENRICHMENT_ENABLED", "false").lower() in ("1", "true", "yes")
 ENRICHMENT_INTERVAL_MINUTES = _env_int("ENRICHMENT_INTERVAL_MINUTES", 15)
-ENRICHMENT_SEASON_CAP = min(40, max(1, _env_int("ENRICHMENT_SEASON_CAP", 40)))
-ENRICHMENT_NEXT_SEASON_EPISODES = max(0, _env_int("ENRICHMENT_NEXT_SEASON_EPISODES", 4))
+ENRICHMENT_SESSION_POLL_SECONDS = max(5, _env_int("ENRICHMENT_SESSION_POLL_SECONDS", 15))
+ENRICHMENT_SEASON_CAP = min(12, max(1, _env_int("ENRICHMENT_SEASON_CAP", 12)))
+ENRICHMENT_NEXT_SEASON_EPISODES = min(
+    2, max(0, _env_int("ENRICHMENT_NEXT_SEASON_EPISODES", 2))
+)
 ENRICHMENT_CACHE_DIR = _env("ENRICHMENT_CACHE_DIR", "/mnt/spore-cache/analysis")
 ENRICHMENT_MAX_BATCH_GB = max(1, _env_int("ENRICHMENT_MAX_BATCH_GB", 160))
+ENRICHMENT_MIN_FREE_GB = max(1, _env_int("ENRICHMENT_MIN_FREE_GB", 25))
+ENRICHMENT_LEASE_SECONDS = max(3600, _env_int("ENRICHMENT_LEASE_SECONDS", 28800))
+ENRICHMENT_MAX_ATTEMPTS = min(5, max(1, _env_int("ENRICHMENT_MAX_ATTEMPTS", 5)))
+ENRICHMENT_RETRY_BASE_SECONDS = max(
+    60, _env_int("ENRICHMENT_RETRY_BASE_SECONDS", 900)
+)
 ENRICHMENT_ANALYZE_TIMEOUT_SECONDS = max(
     60, _env_int("ENRICHMENT_ANALYZE_TIMEOUT_SECONDS", 1800)
 )
+
+# Durable targeted Plex scan spool. Legacy keeps compatibility with existing
+# host drainers until they are upgraded to the versioned JSON contract.
+PLEX_SCAN_QUEUE_MODE = _env("PLEX_SCAN_QUEUE_MODE", "legacy").lower()
+PLEX_SCAN_SPOOL_DIR = _env("PLEX_SCAN_SPOOL_DIR", "/data/plex-scan-spool")
 
 # ── WebDAV server (Plex / Emby compatibility) ─────────────────────────────────
 # When enabled, serves the .strm library as virtual .mkv files at /dav/...
