@@ -6,6 +6,9 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Plex first-play transcoding now removes subtitle-first video filter graphs
+  and stale EAE decoder hints when the probed Spore source has native AAC or
+  another safe codec, preventing synthetic track metadata from killing sessions
 - Currently airing TV seasons register only episodes whose TMDB air date has
   arrived, and episode-title identity ranking rejects older broadcast-order
   releases when they reuse the same season and episode numbers

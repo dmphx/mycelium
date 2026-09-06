@@ -101,10 +101,16 @@ done
 if [ "$spore_replaced" = "1" ]; then
     # ── Read .minfo options ────────────────────────────────────────────────────
     preferred_audio=""
+    cdn_audio_codec=""
     if [ -f "$spore_minfo" ]; then
         preferred_audio=$(grep "^preferred_audio=" "$spore_minfo" | head -1 | cut -d= -f2)
+        cdn_audio_codec=$(grep "^cdn_audio_codec=" "$spore_minfo" | head -1 | cut -d= -f2)
     fi
-    echo "$(date '+%H:%M:%S') WRAP spore preferred_audio=${preferred_audio:-0}" >> "$SPORE_LOG"
+    _native_audio_decoder=0
+    case "$cdn_audio_codec" in
+        aac|ac3|opus|flac|mp3|vorbis|pcm_*) _native_audio_decoder=1 ;;
+    esac
+    echo "$(date '+%H:%M:%S') WRAP spore preferred_audio=${preferred_audio:-0} cdn_audio_codec=${cdn_audio_codec:-unknown}" >> "$SPORE_LOG"
 
     # ── Detect audio output mode (copy vs transcode) ──────────────────────────
     # Must be done BEFORE modifying args, as it drives the EAE strategy:
@@ -180,7 +186,7 @@ if [ "$spore_replaced" = "1" ]; then
                 # Always remove PCM hints. For EAE hints: only remove on copy mode.
                 _is_pcm=0
                 [[ "$next_arg" =~ ^pcm_s[0-9]+(le|be)$ ]] && _is_pcm=1
-                if [ "$_is_pcm" = "1" ] || [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
+                if [ "$_is_pcm" = "1" ] || [ "$_audio_output_is_copy" = "1" ] || [ "$_native_audio_decoder" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
                     skip_next=1
                     stream_n="${arg#-codec:}"
                     removed_eae_indices+=("$stream_n")
@@ -195,9 +201,9 @@ if [ "$spore_replaced" = "1" ]; then
             # When transcoding (e.g. EAC3->AC3 for MiTV), -eae_prefix tells
             # eac3_eae which watchfolder to use. Removing it causes EAE timeout.
             if [ "$idx" -lt "$i_pos" ] && { [[ "$arg" =~ ^-eae_prefix:[0-9]+$ ]] || [[ "$arg" =~ ^-eae_prefix:[a-z]:[0-9]+$ ]]; }; then
-                if [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
+                if [ "$_audio_output_is_copy" = "1" ] || [ "$_native_audio_decoder" = "1" ] || [ -n "$_strm_tmp_minfo" ]; then
                     skip_next=1
-                    echo "$(date '+%H:%M:%S') WRAP removed -eae_prefix: $arg $next_arg (copy mode, no EAE)" >> "$SPORE_LOG"
+                    echo "$(date '+%H:%M:%S') WRAP removed -eae_prefix: $arg $next_arg (native/copy path, no EAE)" >> "$SPORE_LOG"
                     echo "SPORE-WRAP: removed EAE prefix hint: $arg" >&2
                     continue
                 else
@@ -219,10 +225,6 @@ if [ "$spore_replaced" = "1" ]; then
     #   eac3_eae hint was KEPT above, and -eae_prefix was KEPT, so EAE handles
     #   the decode. Do NOT inject a second native decoder here -- it would
     #   conflict with eac3_eae and break the EAE IPC pipeline.
-    cdn_audio_codec=""
-    if [ -f "$spore_minfo" ]; then
-        cdn_audio_codec=$(grep "^cdn_audio_codec=" "$spore_minfo" | head -1 | cut -d= -f2)
-    fi
     # ── EAE_ROOT discovery (only for EAC3/TrueHD) ─────────────────────────────
     # EAE IPC only initialises when Plex Transcoder runs with a local file.
     # With an HTTP URL (-i http://...) EAE never creates its watchfolder, so
@@ -306,7 +308,7 @@ if [ "$spore_replaced" = "1" ]; then
         # Inject native decoder only when audio output is copy -- EAE not needed,
         # native decoder prevents eac3_eae from being auto-selected on HTTP input.
         # Stale PCM + EAC3 CDN case is handled above via force-copy (_needs_eae=1).
-        if [ "$i_pos_n" -gt 0 ] && { [ "$_audio_output_is_copy" = "1" ] || [ -n "$_strm_tmp_minfo" ]; }; then
+        if [ "$i_pos_n" -gt 0 ] && { [ "$_audio_output_is_copy" = "1" ] || [ "$_native_audio_decoder" = "1" ] || [ -n "$_strm_tmp_minfo" ]; }; then
             front=("${newargs[@]:0:$i_pos_n}")
             back=("${newargs[@]:$i_pos_n}")
             # Use removed EAE stream indices if available; otherwise default to 1
@@ -407,7 +409,10 @@ if [ "$spore_replaced" = "1" ]; then
                 -fps_mode|-init_hw_device|-filter_hw_device)
                     _sk=1; continue ;;
                 -filter_complex)
-                    if [[ "$_n" == \[0:0\]* ]] || [[ "$_n" == \[0:V:0\]* ]]; then
+                    # Subtitle burn graphs can start with the subtitle pad, so
+                    # identify video filters by the video pad anywhere in the
+                    # graph. Plex may use a decimal, symbolic, or hex stream id.
+                    if [[ "$_n" == *"[0:0]"* ]] || [[ "$_n" == *"[0:V:0]"* ]] || [[ "$_n" == *"[0:#0x01]"* ]] || [[ "$_n" == *"[0:#0x1]"* ]]; then
                         _vhl=$(echo "$_n" | grep -oE '\[[0-9]+\]' | tail -1)
                         _sk=1
                         echo "$(date '+%H:%M:%S') WRAP removed video filter_complex (label=${_vhl})" >> "$SPORE_LOG"
