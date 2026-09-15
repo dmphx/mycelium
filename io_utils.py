@@ -7,12 +7,19 @@ reads continuously, that's a long-lived broken entry. The helpers below
 write to a uniquely-named sibling tempfile and then atomically rename it
 over the destination via os.replace, which is the POSIX rename guarantee
 on the same filesystem.
+
+mkstemp creates the tempfile 0600 and os.replace keeps that mode, so the
+tempfile is chmodded to 0644 first. Without it, files written while the
+container runs as root are unreadable to Plex (uid 99): "Please check the
+permissions for this file".
 """
 from __future__ import annotations
 
 import os
 import tempfile
 from pathlib import Path
+
+_FILE_MODE = 0o644
 
 
 def _write(path: Path, mode: str, payload, encoding: str | None) -> None:
@@ -24,6 +31,7 @@ def _write(path: Path, mode: str, payload, encoding: str | None) -> None:
         dir=str(path.parent),
     )
     try:
+        os.chmod(tmp, _FILE_MODE)
         if encoding is None:
             with os.fdopen(fd, mode) as fh:
                 fh.write(payload)
