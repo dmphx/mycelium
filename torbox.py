@@ -234,6 +234,42 @@ _MYLIST_TTL_SECONDS = 45
 _mylist_cache: dict = {"items": None, "ts": 0.0}
 _mylist_lock = __import__("threading").Lock()
 
+# TorBox answers 429 once the account hits its API ceiling. list_torrents pages
+# the whole account, so a burst of cache misses (a Plex analyze sweep, say) can
+# trip it. Without a cooldown the failure is self-sustaining: the exception
+# escapes before anything is cached, so the next caller hits the API again and
+# stays rate limited, and real playback 404s. Serve the last known list during
+# the cooldown instead. RequestException keeps existing callers' handling.
+class TorBoxRateLimited(requests.exceptions.RequestException):
+    """TorBox returned 429; back off instead of retrying immediately."""
+
+
+_MYLIST_COOLDOWN_DEFAULT = 60.0
+_MYLIST_COOLDOWN_MAX = 300.0
+_mylist_cooldown_until = 0.0
+
+
+def _note_rate_limit(resp=None) -> None:
+    """Open a cooldown window after a 429, honouring Retry-After when sane."""
+    global _mylist_cooldown_until
+    import time as _t
+    delay = _MYLIST_COOLDOWN_DEFAULT
+    header = (getattr(resp, "headers", None) or {}).get("Retry-After")
+    if header:
+        try:
+            delay = float(header)
+        except (TypeError, ValueError):
+            pass
+    delay = max(1.0, min(delay, _MYLIST_COOLDOWN_MAX))
+    with _mylist_lock:
+        _mylist_cooldown_until = max(_mylist_cooldown_until, _t.monotonic() + delay)
+    log.warning("TorBox rate limited (429); pausing mylist calls for %.0fs", delay)
+
+
+def _rate_limited_now() -> bool:
+    import time as _t
+    return _t.monotonic() < _mylist_cooldown_until
+
 
 def iter_torrents(timeout: int = 30, max_pages: int = 20):
     """Yield TorBox torrents a page at a time without retaining the full account."""
@@ -247,6 +283,9 @@ def iter_torrents(timeout: int = 30, max_pages: int = 20):
         if resp.status_code == 403:
             log.warning("TorBox mylist returned 403 - API key invalid or plan restriction")
             return
+        if resp.status_code == 429:
+            _note_rate_limit(resp)
+            raise TorBoxRateLimited("TorBox mylist rate limited (429)", response=resp)
         resp.raise_for_status()
         payload = resp.json() or {}
         page = payload.get("data", []) or []
@@ -273,11 +312,25 @@ def list_torrents(timeout: int = 30, force_refresh: bool = False,
     early at the real end of the list, so a high cap costs nothing on small
     accounts; it only raises the anti-infinite-loop ceiling."""
     import time as _t
+    cached = _mylist_cache["items"]
+    age = _t.monotonic() - _mylist_cache["ts"]
     if not force_refresh:
-        cached = _mylist_cache["items"]
-        if cached is not None and (_t.monotonic() - _mylist_cache["ts"]) < _MYLIST_TTL_SECONDS:
+        if cached is not None and age < _MYLIST_TTL_SECONDS:
             return cached
-    all_items = list(iter_torrents(timeout=timeout, max_pages=max_pages))
+    if _rate_limited_now():
+        if cached is not None:
+            log.warning("TorBox rate limited; serving cached mylist (%d items, %.0fs old)",
+                        len(cached), age)
+            return cached
+        raise TorBoxRateLimited("TorBox mylist rate limited and nothing cached to serve")
+    try:
+        all_items = list(iter_torrents(timeout=timeout, max_pages=max_pages))
+    except TorBoxRateLimited:
+        if cached is not None:
+            log.warning("TorBox rate limited mid-refresh; serving cached mylist "
+                        "(%d items, %.0fs old)", len(cached), age)
+            return cached
+        raise
     with _mylist_lock:
         _mylist_cache["items"] = all_items
         _mylist_cache["ts"] = _t.monotonic()
@@ -305,10 +358,16 @@ def find_by_hash(info_hash: str, force_refresh: bool = False) -> dict | None:
 
 def find_by_id(torrent_id: int, timeout: int = 15) -> dict | None:
     """Fetch a single torrent by ID directly from TorBox  -  not limited to mylist top-1000."""
+    if _rate_limited_now():
+        log.warning("TorBox find_by_id(%s) skipped: rate-limit cooldown active", torrent_id)
+        return None
     url = f"{_base_url().rstrip('/')}/torrents/mylist"
     try:
         resp = requests.get(url, headers=_headers(), timeout=timeout,
                             params={"id": torrent_id})
+        if resp.status_code == 429:
+            _note_rate_limit(resp)
+            return None
         resp.raise_for_status()
         data = (resp.json() or {}).get("data")
         if isinstance(data, dict) and data.get("id") == torrent_id:

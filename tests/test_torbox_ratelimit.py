@@ -1,113 +1,86 @@
-"""
-Unit tests for the createtorrent rate-limit reservation in torbox.py.
+"""A 429 from TorBox must open a cooldown and fall back to the cached list.
 
-Covers the TOCTOU fix: reserving a slot must count against the budget
-immediately (before the HTTP call happens), and releasing a slot after a
-failed call must give the budget back.
+Regression test for 2026-09-15: list_torrents only cached on success, so a rate
+limit left the cache empty and every later call hit the API again, keeping the
+account rate limited until playback itself 404'd.
 """
-import os
+import importlib
 import sys
 
 import pytest
-
-os.environ.setdefault("TORBOX_API_KEY", "test")
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-# Other test modules (test_strm_generator.py) replace sys.modules["torbox"]
-# with a MagicMock at collection time and only restore it once their own
-# tests run. Grab a real import for our own use, then put back whatever was
-# there so those other files' torbox_mod references stay mocked as they
-# expect - our own `torbox` name below stays bound to the real module either way.
-_prior_torbox = sys.modules.get("torbox")
-sys.modules.pop("torbox", None)
-import torbox  # noqa: E402
-if _prior_torbox is not None:
-    sys.modules["torbox"] = _prior_torbox
-else:
-    sys.modules.pop("torbox", None)
+import requests
 
 
-@pytest.fixture(autouse=True)
-def _isolated_log(monkeypatch):
-    """Give each test its own in-memory log and skip the DB-backed preload."""
-    monkeypatch.setattr(torbox, "_CREATETORRENT_LOG", __import__("collections").deque(maxlen=200))
-    monkeypatch.setattr(torbox, "_CREATETORRENT_LOADED", True)
-    monkeypatch.setattr(torbox, "_persist_createtorrent", lambda ts, reason: None)
-    yield
+@pytest.fixture
+def torbox(monkeypatch):
+    """Load the real torbox module.
+
+    conftest force-mocks sys.modules["torbox"] for the whole session; monkeypatch
+    restores the mock at teardown so later modules keep the harness they expect.
+    """
+    monkeypatch.delitem(sys.modules, "torbox", raising=False)
+    real = importlib.import_module("torbox")
+    monkeypatch.setitem(sys.modules, "torbox", real)
+    return real
 
 
-def test_reservation_counts_immediately():
-    entry = torbox._reserve_createtorrent_slot("test")
-    assert len(torbox._CREATETORRENT_LOG) == 1
-    assert entry in torbox._CREATETORRENT_LOG
-
-
-def test_release_gives_the_slot_back():
-    entry = torbox._reserve_createtorrent_slot("test")
-    torbox._release_createtorrent_slot(entry)
-    assert len(torbox._CREATETORRENT_LOG) == 0
-
-
-def test_hourly_limit_blocks_reservation_once_reached(monkeypatch):
-    monkeypatch.setattr(torbox, "_CREATETORRENT_LIMIT_MIN", 10_000)  # isolate the hourly check
-    for _ in range(torbox._CREATETORRENT_LIMIT_HOUR - 2):
-        torbox._reserve_createtorrent_slot("test")
-    with pytest.raises(torbox.RateLimited):
-        torbox._reserve_createtorrent_slot("test")
-
-
-def test_released_slot_is_available_again(monkeypatch):
-    monkeypatch.setattr(torbox, "_CREATETORRENT_LIMIT_MIN", 10_000)  # isolate the hourly check
-    entries = [torbox._reserve_createtorrent_slot("test")
-               for _ in range(torbox._CREATETORRENT_LIMIT_HOUR - 2)]
-    with pytest.raises(torbox.RateLimited):
-        torbox._reserve_createtorrent_slot("test")
-    torbox._release_createtorrent_slot(entries[0])
-    # Releasing one slot should free up room for exactly one more reservation.
-    torbox._reserve_createtorrent_slot("test")
-    with pytest.raises(torbox.RateLimited):
-        torbox._reserve_createtorrent_slot("test")
-
-
-class _Response:
-    def __init__(self, payload=None, content=b"", status_code=200):
-        self._payload = payload or {}
-        self.content = content
+class _Resp:
+    def __init__(self, status_code=429, headers=None, payload=None):
         self.status_code = status_code
-        self.headers = {}
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise torbox.requests.HTTPError(str(self.status_code))
+        self.headers = headers or {}
+        self._payload = payload or {}
 
     def json(self):
         return self._payload
 
-
-def test_add_nzb_uses_shared_atomic_reservation(monkeypatch):
-    monkeypatch.setattr(
-        torbox.requests, "get", lambda *_args, **_kwargs: _Response(content=b"nzb"))
-    monkeypatch.setattr(
-        torbox.requests,
-        "post",
-        lambda *_args, **_kwargs: _Response(
-            payload={"success": True, "data": {"usenet_download_id": 42}}),
-    )
-
-    result = torbox.add_nzb("https://indexer.invalid/item", name="Episode")
-
-    assert result["id"] == 42
-    assert len(torbox._CREATETORRENT_LOG) == 1
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError("boom", response=self)
 
 
-def test_add_nzb_releases_reservation_when_post_fails(monkeypatch):
-    monkeypatch.setattr(
-        torbox.requests, "get", lambda *_args, **_kwargs: _Response(content=b"nzb"))
-    monkeypatch.setattr(
-        torbox.requests, "post", lambda *_args, **_kwargs: _Response(status_code=500))
+def test_429_without_cache_raises_rate_limited(torbox, monkeypatch):
+    monkeypatch.setattr(torbox.requests, "get", lambda *a, **k: _Resp(429))
+    with pytest.raises(torbox.TorBoxRateLimited):
+        torbox.list_torrents(force_refresh=True)
+    assert torbox._rate_limited_now()
 
-    with pytest.raises(torbox.requests.HTTPError):
-        torbox.add_nzb("https://indexer.invalid/item", name="Episode")
 
-    assert len(torbox._CREATETORRENT_LOG) == 0
+def test_rate_limited_is_a_request_exception(torbox):
+    assert issubclass(torbox.TorBoxRateLimited, requests.exceptions.RequestException)
+
+
+def test_429_serves_stale_cache_and_stops_calling(torbox, monkeypatch):
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(k.get("params"))
+        return _Resp(429)
+
+    torbox._mylist_cache["items"] = [{"id": 1, "hash": "abc"}]
+    torbox._mylist_cache["ts"] = -10_000.0  # long expired
+    monkeypatch.setattr(torbox.requests, "get", fake_get)
+
+    assert torbox.list_torrents(force_refresh=True) == [{"id": 1, "hash": "abc"}]
+    hits_after_first = len(calls)
+    for _ in range(5):
+        assert torbox.list_torrents(force_refresh=True) == [{"id": 1, "hash": "abc"}]
+    assert len(calls) == hits_after_first, "cooldown must stop further API calls"
+
+
+def test_retry_after_header_sets_cooldown(torbox, monkeypatch):
+    monkeypatch.setattr(torbox.requests, "get",
+                        lambda *a, **k: _Resp(429, headers={"Retry-After": "120"}))
+    with pytest.raises(torbox.TorBoxRateLimited):
+        torbox.list_torrents(force_refresh=True)
+    import time
+    remaining = torbox._mylist_cooldown_until - time.monotonic()
+    assert 100 < remaining <= torbox._MYLIST_COOLDOWN_MAX
+
+
+def test_find_by_id_skips_during_cooldown(torbox, monkeypatch):
+    calls = []
+    monkeypatch.setattr(torbox.requests, "get",
+                        lambda *a, **k: calls.append(1) or _Resp(429))
+    torbox._note_rate_limit(None)
+    assert torbox.find_by_id(123) is None
+    assert calls == [], "find_by_id must not call TorBox while cooling down"

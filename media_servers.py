@@ -59,6 +59,8 @@ JF_LIBRARY_ROOT    = _cfg("JELLYFIN_LIBRARY_ROOT", "/mnt/library-mycelium")
 PLEX_QUEUE         = _cfg("PLEX_SCAN_QUEUE", "/data/plex-scan-queue")
 PLEX_QUEUE_MODE    = str(_cfg("PLEX_SCAN_QUEUE_MODE", "legacy")).lower()
 PLEX_SPOOL_DIR     = _cfg("PLEX_SCAN_SPOOL_DIR", "/data/plex-scan-spool")
+# Plex analyze on a Spore library downloads the real media: see request_reanalyze.
+PLEX_ANALYZE_ENABLED = str(_cfg("PLEX_ANALYZE_ENABLED", "false")).lower() in ("1", "true", "yes")
 PLEX_TV_ROOT       = _cfg("PLEX_TV_ROOT", "/mnt/library/shows")
 PLEX_MOVIE_ROOT    = _cfg("PLEX_MOVIE_ROOT", "/mnt/library/movies")
 PLEX_SECTION_TV    = str(_cfg("PLEX_SERIES_SECTION", _cfg("PLEX_SECTION_TV", "8")))
@@ -117,7 +119,21 @@ def request_reanalyze(strm_path):
     Plex caches the codec at scan time, so a rewritten stub stays stale until it
     is re-analyzed; a plain scan only detects new files. Durable spool mode keeps
     the analyze operation distinct so the host-side consumer runs Plex Media
-    Scanner analysis instead of a plain refresh."""
+    Scanner analysis instead of a plain refresh.
+
+    Analyze is OFF by default. The transcoder wrapper rewrites every read of a
+    stub to /spore-stream/<token>, so analysis streams the real file from the
+    debrid CDN, and the consumer analyzes a whole season directory: one corrected
+    stub pulls every episode of that season. On 2026-09-15 that sweep rate
+    limited the TorBox API (429) until playback itself failed for everyone. The
+    plain scan queued instead still picks up the rewritten stub."""
+    if not PLEX_ANALYZE_ENABLED:
+        log.info(
+            "Plex re-analyze suppressed for %s (PLEX_ANALYZE_ENABLED=false); "
+            "queuing a plain scan instead", strm_path,
+        )
+        _enqueue(strm_path, "scan")
+        return
     _enqueue(strm_path, "analyze")
 
 
