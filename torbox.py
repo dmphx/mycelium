@@ -68,14 +68,20 @@ def _reserve_createtorrent_slot(reason: str) -> tuple[float, str]:
     with _CREATETORRENT_LOCK:
         hour_count = sum(1 for ts, _ in _CREATETORRENT_LOG if ts >= now - 3600)
         min_count  = sum(1 for ts, _ in _CREATETORRENT_LOG if ts >= now - 60)
-        if hour_count >= _CREATETORRENT_LIMIT_HOUR - 2:
+        # Background jobs stop early so playback and user requests always have
+        # headroom (2026-09-16: pack consolidation held the budget at 58/60 all
+        # day and a cold on-play re-add 404'd).
+        background = reason in _BACKGROUND_REASONS
+        hour_cap = _BACKGROUND_LIMIT_HOUR if background else _CREATETORRENT_LIMIT_HOUR - 2
+        min_cap = _BACKGROUND_LIMIT_MIN if background else _CREATETORRENT_LIMIT_MIN - 1
+        if hour_count >= hour_cap:
             log.warning("createtorrent [%s] SKIPPED  -  hourly quota %d/%d reached",
-                        reason, hour_count, _CREATETORRENT_LIMIT_HOUR)
-            raise RateLimited()
-        if min_count >= _CREATETORRENT_LIMIT_MIN - 1:
+                        reason, hour_count, hour_cap)
+            raise RateLimited(f"createtorrent hourly quota {hour_count}/{hour_cap} reached")
+        if min_count >= min_cap:
             log.warning("createtorrent [%s] SKIPPED  -  per-minute burst %d/%d reached",
-                        reason, min_count, _CREATETORRENT_LIMIT_MIN)
-            raise RateLimited()
+                        reason, min_count, min_cap)
+            raise RateLimited(f"createtorrent per-minute burst {min_count}/{min_cap} reached")
         entry = (now, reason)
         _CREATETORRENT_LOG.append(entry)
         log.info("createtorrent [%s] (%d/60h, %d/10m): reserving slot",
@@ -119,6 +125,10 @@ def createtorrent_usage(window_sec: int = 3600) -> dict:
 
 _CREATETORRENT_LIMIT_HOUR = 60   # TorBox: 60/hour per IP
 _CREATETORRENT_LIMIT_MIN  = 10   # TorBox: 10/min edge burst limit
+# Unattended callers that can always wait for the next hour.
+_BACKGROUND_REASONS = frozenset({"upgrade", "upgrade-pack", "cleanup-repair", "preload"})
+_BACKGROUND_LIMIT_HOUR = 40
+_BACKGROUND_LIMIT_MIN  = 6
 
 
 class RateLimited(Exception):

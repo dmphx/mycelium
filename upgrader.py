@@ -166,6 +166,9 @@ def run_auto_upgrade() -> int:
                             f"{row.get('quality')} → {better.quality}", True)
             strm_generator._cache_cdn_url(better.info_hash, item, row["title"])
             upgraded += 1
+        except torbox.RateLimited as exc:
+            log.info("Auto-upgrade: stopping early, %s", exc)
+            break
         except Exception as exc:
             log.warning("Upgrade failed for %s: %s", row["title"], exc)
     if upgraded:
@@ -243,6 +246,9 @@ def run_pack_consolidation() -> int:
             db.log_activity("consolidated", f"{title} S{season:02d}",
                             f"{len(strms)} episodes → 1 pack ({pack.quality})", True)
             consolidated += 1
+        except torbox.RateLimited as exc:
+            log.info("Season-pack consolidation: stopping early, %s", exc)
+            break
         except Exception as exc:
             log.warning("Pack consolidation failed for %s S%02d: %s", title, season, exc)
     if consolidated:
