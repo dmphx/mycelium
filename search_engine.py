@@ -61,6 +61,22 @@ def _source_jobs(media_type: str, imdb_id: str, title: str,
     return jobs
 
 
+def _with_show_identity(override: dict | None, imdb_id: str,
+                        title: str) -> dict | None:
+    """Add the series identity to a ranking override, so every catalog's hits
+    (zilean, torrentio, mediafusion, stremio addons, prowlarr) pass the same
+    check against other national versions of the show."""
+    if override and override.get("show_identity") is not None:
+        return override
+    import release_sanity
+    identity = release_sanity.series_identity(imdb_id, title)
+    if identity is None:
+        return override
+    merged = dict(override or {})
+    merged["show_identity"] = identity
+    return merged
+
+
 def search_candidates(media_type: str, imdb_id: str, title: str,
                       season: int | None = None,
                       episode: int | None = None,
@@ -70,6 +86,8 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
                       include_prowlarr: bool = True,
                       prowlarr_on_cache_miss: bool = False) -> list[TorrentioStream]:
     """Query all enabled catalogs concurrently and persist the search trace."""
+    if media_type != "movie":
+        override = _with_show_identity(override, imdb_id, title)
     ckey = content_key(imdb_id, season, episode)
     run_id = db.start_search_run(
         ckey, title, media_type, season, episode, trigger)
@@ -109,6 +127,12 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
         # out of the common path when a fast catalog already exposes a cached
         # release, but retain it as a deep fallback for actual misses.
         fast_streams = [stream for streams in groups.values() for stream in streams]
+        if (override or {}).get("show_identity") is not None:
+            # A cached release of another version of the show must not count as
+            # a hit, or the deep search that could find this one never runs.
+            import release_sanity
+            fast_streams, _ = release_sanity.apply_series_identity(
+                fast_streams, override["show_identity"], label=ckey)
         cache_gate_streams = fast_streams
         expected_title = str((override or {}).get("episode_title") or "").strip()
         identity_miss = False

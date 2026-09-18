@@ -181,6 +181,12 @@ SERIES_PACK_NAME_REGEX = _env(
 # sane single video file that matches the request before writing its .strm and
 # marking success. When nothing sane is cached the title stays 'wanted' instead.
 VERIFY_RELEASE_BEFORE_GRAB = _env("VERIFY_RELEASE_BEFORE_GRAB", "true").lower() in ("1", "true", "yes")
+# When true, a series episode or season pack never takes a release whose name
+# carries another national version's qualifier: "The.Traitors.UK.S03" for The
+# Traitors (US), "The.Traitors.2023.S04E01" for the 2022 UK show, or a
+# Hindi-only release of an English show. Uses TMDB origin_country and
+# first_air_date; unqualified names always pass. See release_sanity.
+SERIES_IDENTITY_CHECK = _env("SERIES_IDENTITY_CHECK", "true").lower() in ("1", "true", "yes")
 # Languages to hard-block (comma-separated codes, e.g. ru). Torrents detected as
 # exclusively in a blocked language are filtered out before sorting.
 EXCLUDE_LANGUAGES = [l.strip().lower() for l in _env("EXCLUDE_LANGUAGES", "").split(",") if l.strip()]

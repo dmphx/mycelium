@@ -29,23 +29,41 @@ _PLACEHOLDER_TITLE_RE = re.compile(r"^(?:tt\d{6,10}|tmdb[:_ -]?\d+)$", re.IGNORE
 
 # ── Filesystem helpers ────────────────────────────────────────────────────────
 
-def _series_dir(title: str) -> str | None:
-    """Return the series folder that best matches title, or None."""
+def _series_dir(title: str, imdb_id: str | None = None) -> str | None:
+    """Return the series folder that best matches title, or None.
+
+    With an imdb_id, a folder whose tvshow.nfo names another show is never
+    returned. "The Traitors" matches the US folder, the UK "The Traitors
+    (2022)" and "The Traitors Uncloaked"; without this, whichever one listdir
+    yields first would answer for all of them.
+    """
     base = os.path.join(MEDIA_PATH, "series")
     if not os.path.isdir(base):
         return None
     needle = title[:12].lower()
+    if imdb_id:
+        from pathlib import Path
+        import strm_generator
+    fallback = None
     for entry in os.listdir(base):
-        if needle in entry.lower():
-            return os.path.join(base, entry)
-    return None
+        if needle not in entry.lower():
+            continue
+        path = os.path.join(base, entry)
+        if not imdb_id:
+            return path
+        folder_imdb = strm_generator._series_folder_imdb(Path(path))
+        if folder_imdb == imdb_id:
+            return path
+        if folder_imdb is None and fallback is None:
+            fallback = path
+    return fallback
 
 
 def strm_exists_episode(title: str, season: int, episode: int,
                         imdb_id: str | None = None) -> bool:
     if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
         return True
-    folder = _series_dir(title)
+    folder = _series_dir(title, imdb_id)
     if not folder:
         return False
     s_ep = f"s{season:02d}e{episode:02d}"

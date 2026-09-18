@@ -316,12 +316,25 @@ def rank_streams(
     cannot be a single film (season/series packs, oversized collections)  -  see
     release_sanity. Unlike the heuristic filters below this one does NOT fall back
     to allowing rejected candidates: an empty result sends the movie to 'wanted'
-    rather than latching onto a mislabeled pack that shares the imdb_id."""
+    rather than latching onto a mislabeled pack that shares the imdb_id.
+
+    override["show_identity"] (a release_sanity.ShowIdentity) drops releases of
+    another national version of the series ("The.Traitors.UK.S03" for the US
+    show) before any other filter, with the same no-fallback rule, and ranks a
+    release whose qualifier names this show ahead of an unqualified one of the
+    same quality."""
     if not streams:
         return []
 
     import settings as _settings
     override = override or {}
+    identity_rank: dict[int, int] = {}
+    if override.get("show_identity") is not None:
+        import release_sanity
+        streams, identity_rank = release_sanity.apply_series_identity(
+            streams, override["show_identity"])
+        if not streams:
+            return []
     quality_pref = (
         [q.strip() for q in (override.get("quality_preference") or "").split(",") if q.strip()]
         or _settings.get("QUALITY_PREFERENCE", QUALITY_PREFERENCE)
@@ -491,6 +504,7 @@ def rank_streams(
         return (
             0 if prefer_season_pack and s.is_season_pack else 1,
             _quality_rank(s, quality_pref),
+            identity_rank.get(id(s), 1),
             _lang_score(s),
             _compat_score(s),
             0 if prefer_webdl and _WEBDL_RE.search(blob) else 1,

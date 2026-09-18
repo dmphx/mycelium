@@ -9,7 +9,7 @@ same season, looks for a cached season pack and atomically replaces them.
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import db
@@ -63,7 +63,11 @@ def _fetch_movie_candidates(imdb_id: str) -> list:
 
 
 def _fetch_season_candidates(imdb_id: str, season: int) -> list:
+    import release_sanity
     override = _episode_runtime_override(imdb_id, season)
+    identity = release_sanity.series_identity(imdb_id)
+    if identity is not None:
+        override["show_identity"] = identity
     if _settings.get("ZILEAN_ENABLED", False):
         streams = zilean.fetch_streams(imdb_id, season=season, episode=1)
         candidates = torrentio.rank_streams(streams, prefer_season_pack=True, override=override)
@@ -199,6 +203,52 @@ def _group_episode_strms_by_season() -> dict[tuple[str, int], list[Path]]:
     return groups
 
 
+def _folder_imdb_votes() -> dict[str, Counter]:
+    """Series folder name -> Counter of the imdb ids its virtual items carry."""
+    root = Path(MEDIA_PATH) / "series"
+    votes: dict[str, Counter] = defaultdict(Counter)
+    for imdb_id, strm_path in db.get_series_strm_paths():
+        try:
+            parts = Path(strm_path).relative_to(root).parts
+        except ValueError:
+            continue
+        if len(parts) >= 2:
+            votes[parts[0]][imdb_id] += 1
+    return votes
+
+
+def _resolve_series_folder(folder: str, votes: dict[str, Counter],
+                           by_title: dict[str, set[str]],
+                           monitored_ids: set[str]) -> str | None:
+    """IMDb id of the monitored show a series folder holds, or None if unsure.
+
+    Folder names are not identities: "The Traitors" (US) and "The Traitors
+    (2022)" (UK) are both monitored under the title "The Traitors". The
+    folder's tvshow.nfo and the imdb ids of the virtual items stored in it
+    decide; a monitored title is only trusted when no other show shares it.
+    """
+    nfo_imdb = strm_generator._series_folder_imdb(Path(MEDIA_PATH) / "series" / folder)
+    vote_imdb = None
+    counts = votes.get(folder)
+    if counts:
+        top, top_count = counts.most_common(1)[0]
+        if top_count * 2 > sum(counts.values()):
+            vote_imdb = top
+    if nfo_imdb and vote_imdb and nfo_imdb != vote_imdb:
+        log.warning("Pack consolidation: %s tvshow.nfo says %s but its items say %s  -  skipping",
+                    folder, nfo_imdb, vote_imdb)
+        return None
+    imdb_id = nfo_imdb or vote_imdb
+    if imdb_id:
+        return imdb_id if imdb_id in monitored_ids else None
+    titled = by_title.get(folder) or set()
+    if len(titled) > 1:
+        log.info("Pack consolidation: %s matches %d monitored shows by title and has no "
+                 "nfo/item identity  -  skipping", folder, len(titled))
+        return None
+    return next(iter(titled), None)
+
+
 def run_pack_consolidation() -> int:
     """For each series-season with >=3 per-episode strms, try to swap in a cached pack."""
     if playback_guard.defer("pack_consolidation"):
@@ -208,13 +258,20 @@ def run_pack_consolidation() -> int:
     log.info("Season-pack consolidation: scanning")
     groups = _group_episode_strms_by_season()
     consolidated = 0
-    monitored = {s["title"]: s["imdb_id"] for s in db.get_all_monitored_series()}
+    by_title: dict[str, set[str]] = defaultdict(set)
+    for series in db.get_all_monitored_series():
+        by_title[series["title"]].add(series["imdb_id"])
+    monitored_ids = set().union(*by_title.values())
+    votes = _folder_imdb_votes()
+    folder_imdb: dict[str, str | None] = {}
     for (title, season), strms in groups.items():
         if playback_guard.defer("pack_consolidation"):
             break
         if len(strms) < 3:
             continue
-        imdb_id = monitored.get(title)
+        if title not in folder_imdb:
+            folder_imdb[title] = _resolve_series_folder(title, votes, by_title, monitored_ids)
+        imdb_id = folder_imdb[title]
         if not imdb_id:
             continue
         try:

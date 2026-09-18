@@ -152,7 +152,11 @@ def _fetch_candidates(imdb_id: str, title: str, media_type: str) -> list:
                 "series", imdb_id, season=1, episode=1, title=title):
             if s.info_hash not in seen:
                 seen.add(s.info_hash); all_streams.append(s)
-        return torrentio.rank_streams(all_streams, prefer_season_pack=True)
+        import release_sanity
+        identity = release_sanity.series_identity(imdb_id, title)
+        return torrentio.rank_streams(
+            all_streams, prefer_season_pack=True,
+            override={"show_identity": identity} if identity else None)
 
 
 def _repair_strm(path: Path, run_id: int, mylist: list[dict]) -> str:

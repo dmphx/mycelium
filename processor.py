@@ -627,7 +627,8 @@ def _process_season(req: MediaRequest, season: int) -> tuple[bool, Optional[Torr
         packs = [s for s in pack_candidates if s.is_season_pack]
         try:
             ok, winner = _add_best_from(packs, f"{req.title} S{season:02d} pack",
-                                        verify={"kind": "season_pack", "season": season})
+                                        verify={"kind": "season_pack", "season": season,
+                                                "imdb_id": req.imdb_id})
         except RateLimited:
             log.info("TorBox rate limited  -  trying RD pack fallback for %s S%02d", req.title, season)
             rd_winner = _try_realdebrid_fallback(
