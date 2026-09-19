@@ -86,6 +86,14 @@ def test_choice_skips_a_foreign_dub_of_an_english_show():
     assert choice is english
 
 
+def test_choice_skips_fansub_rips_of_an_english_show():
+    fansub = _stream("TEENAGE MUTANT NINJA TURTLES 1987 - Seasons 1 to 10 - French FanSub TVRip",
+                     "a" * 40)
+    clean = _stream("Teenage Mutant Ninja Turtles 1987 S01E01 1080p", "b" * 40)
+    choice, _ = tool.choose_replacement([fansub, clean], TMNT_1987, "Turtle Tracks", "c" * 40)
+    assert choice is clean
+
+
 def test_choice_refuses_ambiguous_or_current_releases():
     unqualified = _stream("Teenage Mutant Ninja Turtles S01E01 1080p", "a" * 40)
     current = _stream("Teenage Mutant Ninja Turtles 1987 S01E01 1080p", "c" * 40)

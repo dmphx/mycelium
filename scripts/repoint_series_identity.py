@@ -43,6 +43,10 @@ _GENERIC_TITLE_RE = re.compile(
     r"programme|program|week|day|series|season|pilot|special|finale|final|premiere|"
     r"reunion|launch|heat|round|results?)s?)?(?: (?:\d+|one|two|three|four|five|six))*")
 _RECENT_PLAY = timedelta(minutes=90)
+# Fansub and hardsub rips burn foreign subtitles into the picture
+# ("DOCTOR WHO 1963 - Seasons 1 to 26 - French FanSub TVRip").
+_SUBBED_RE = re.compile(r"\b(?:fan[ ._-]?sub(?:bed|s)?|vostfr|hard[ ._-]?sub(?:bed|s)?|hc)\b",
+                        re.IGNORECASE)
 _BACKUP_COLUMNS = ("info_hash", "magnet", "quality", "source", "size_gb", "torbox_id",
                    "file_id", "spore_tracks", "protocol", "debrid_provider", "rd_id",
                    "nzb_url", "usenet_id")
@@ -68,8 +72,10 @@ def choose_replacement(candidates: list, identity, expected_title: str | None,
         if (identity.language == "en" and languages
                 and not languages & {"en", "multi"}):
             continue  # a dub ("Черепашки ниндзя / ...") is the right show, wrong audio
-        verdict, _ = release_sanity.classify_release(
-            release_sanity._stream_text(candidate), identity)
+        text = release_sanity._stream_text(candidate)
+        if identity.language == "en" and _SUBBED_RE.search(text):
+            continue
+        verdict, _ = release_sanity.classify_release(text, identity)
         if verdict == release_sanity.IDENTITY_MATCH:
             return candidate, "qualifier"
         if (verdict == release_sanity.IDENTITY_NEUTRAL
