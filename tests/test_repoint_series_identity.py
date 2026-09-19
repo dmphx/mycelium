@@ -100,6 +100,16 @@ def test_only_mixed_shows_are_repointed():
     assert share == {"tt_mixed": 0.2, "tt_whole": 0.9}
 
 
+def test_whole_show_suspect_offers_only_duplicates_the_right_show_holds():
+    present = {"tt_uk": {(5, 1)}}
+    mixed = {"tt_mixed"}
+    assert tool.eligible({"imdb_id": "tt_mixed", "season": 1, "episode": 1}, mixed, present)
+    assert tool.eligible({"imdb_id": "tt_uk", "season": 5, "episode": 1}, mixed, present)
+    # The US version lacks this episode: the mislabeled slot is its only copy.
+    assert not tool.eligible({"imdb_id": "tt_uk", "season": 5, "episode": 2}, mixed, present)
+    assert not tool.eligible({"imdb_id": "tt_other", "season": 1, "episode": 1}, mixed, present)
+
+
 def test_repoint_virtual_item_swaps_only_the_expected_hash(tmp_path, monkeypatch):
     real_db = _load("repoint_real_db", os.path.join(_ROOT, "db.py"))
     monkeypatch.setattr(real_db, "DB_PATH", str(tmp_path / "test.db"))

@@ -88,6 +88,16 @@ def mixed_show_ids(findings: list[dict], totals: dict[str, int],
     return {imdb for imdb, value in share.items() if value < max_share}, share
 
 
+def eligible(finding: dict, mixed: set[str], present: dict[str, set]) -> bool:
+    """Mixed shows are eligible. A whole-show suspect only offers the items
+    whose episode the right version (--duplicate-of) already holds, since those
+    slots are duplicates: repointing them loses nothing anyone can watch."""
+    imdb_id = finding["imdb_id"]
+    if imdb_id in mixed:
+        return True
+    return (int(finding["season"]), int(finding["episode"])) in present.get(imdb_id, set())
+
+
 def _stub_paths(strm_path: str) -> list[Path]:
     import strm_generator
     strm = Path(strm_path)
@@ -140,26 +150,36 @@ def repoint(args) -> int:
     import search_engine
 
     findings = json.load(open(args.findings, encoding="utf-8"))
+    duplicate_of = dict(pair.split("=", 1) for pair in args.duplicate_of)
     with db._connect() as conn:
         totals = dict(conn.execute(
             "SELECT imdb_id, COUNT(*) FROM virtual_items WHERE media_type='series' "
             "GROUP BY imdb_id").fetchall())
         titles = dict(conn.execute("SELECT imdb_id, title FROM monitored_series").fetchall())
+        present = {
+            wrong: {(int(s), int(e)) for s, e in conn.execute(
+                "SELECT season, episode FROM virtual_items WHERE imdb_id=? "
+                "AND media_type='series' AND season IS NOT NULL AND episode IS NOT NULL",
+                (right,))}
+            for wrong, right in duplicate_of.items()
+        }
     mixed, share = mixed_show_ids(findings, totals, args.max_show_share)
-    skipped_shows = sorted({(r["show"], r["imdb_id"]) for r in findings
-                            if r["imdb_id"] not in mixed})
+    suspects = sorted({(r["show"], r["imdb_id"]) for r in findings
+                       if r["imdb_id"] not in mixed})
     print(f"Findings: {len(findings)} items. Mixed shows: {len(mixed)}. "
-          f"Skipped whole-show identity suspects: {len(skipped_shows)}")
-    for show, imdb in skipped_shows:
-        print(f"  skip {show} ({imdb}): {share[imdb]:.0%} of its items are another version")
+          f"Whole-show identity suspects: {len(suspects)}")
+    findings = [r for r in findings if eligible(r, mixed, present)]
+    print(f"Eligible items: {len(findings)} (mixed shows, plus duplicates that the right "
+          f"version of {len(duplicate_of)} suspect show(s) already holds)")
+    for show, imdb in suspects:
+        print(f"  whole-show suspect {show} ({imdb}): {share[imdb]:.0%} of its items are "
+              f"another version; only its duplicates are eligible")
 
     backup_dir = Path(args.backup_dir) if args.apply else None
     if backup_dir:
         backup_dir.mkdir(parents=True, exist_ok=True)
     outcome = Counter()
     for finding in findings:
-        if finding["imdb_id"] not in mixed:
-            continue
         if args.imdb and finding["imdb_id"] not in args.imdb:
             continue
         row = db.get_virtual_item(finding["token"])
@@ -267,6 +287,9 @@ def main(argv=None) -> int:
                     default=f"/data/ops/identity_repoint_{datetime.now():%Y%m%d-%H%M%S}")
     ap.add_argument("--rollback")
     ap.add_argument("--imdb", action="append", default=[])
+    ap.add_argument("--duplicate-of", action="append", default=[], metavar="WRONG=RIGHT",
+                    help="whole-show suspect WRONG whose content is show RIGHT; its items "
+                         "whose episode RIGHT already holds become eligible")
     ap.add_argument("--max-show-share", type=float, default=0.8)
     ap.add_argument("--delay", type=float, default=2.0)
     args = ap.parse_args(argv)
