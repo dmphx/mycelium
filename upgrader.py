@@ -255,6 +255,16 @@ def run_pack_consolidation() -> int:
         return 0
     if not _settings.get("SEASON_PACK_CONSOLIDATION_ENABLED", True):
         return 0
+    if _settings.get("CATBOX_MODE", False):
+        # Catbox .strm files are proxy tokens, not TorBox file URLs. A pack
+        # whose parsed title matches the folder hits existing paths and writes
+        # nothing (on 2026-09-17/18: 101 pack adds, 96 wrote 0, 0 consolidated,
+        # each run exhausting the background createtorrent budget). One whose
+        # title differs writes a second folder and then deletes the original
+        # .strm files, orphaning their virtual items.
+        log.info("Season-pack consolidation: skipped in catbox mode (lazy .strm "
+                 "tokens cannot be swapped for a pack)")
+        return 0
     log.info("Season-pack consolidation: scanning")
     groups = _group_episode_strms_by_season()
     consolidated = 0

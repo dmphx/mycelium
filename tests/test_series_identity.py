@@ -493,6 +493,20 @@ def test_consolidation_skips_when_nfo_and_items_disagree(monkeypatch, tmp_path):
     assert searched == [(UK_IMDB, 3)]
 
 
+def test_consolidation_is_skipped_in_catbox_mode(monkeypatch, tmp_path):
+    import upgrader
+    _traitors_library(tmp_path)
+    monkeypatch.setattr(upgrader, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(upgrader.playback_guard, "defer", lambda *_a, **_k: False)
+    monkeypatch.setattr(upgrader, "_settings", types.SimpleNamespace(
+        get=lambda key, default=None: True if key == "CATBOX_MODE" else default))
+    monkeypatch.setattr(upgrader, "_fetch_season_candidates",
+                        lambda *a: pytest.fail("catbox mode must not search for packs"))
+    monkeypatch.setattr(upgrader.torbox, "add_magnet",
+                        lambda *a, **k: pytest.fail("catbox mode must not add packs"))
+    assert upgrader.run_pack_consolidation() == 0
+
+
 def test_upgrader_season_candidates_carry_the_identity(monkeypatch):
     import upgrader
     seen = {}
