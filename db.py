@@ -1306,6 +1306,27 @@ def update_virtual_item_upgrade(token: str, info_hash: str, magnet: str,
         conn.commit()
 
 
+def repoint_virtual_item(token: str, old_hash: str, info_hash: str, magnet: str,
+                         quality: str | None, source: str | None,
+                         size_gb: float | None) -> bool:
+    """Point an item at a different cached torrent, only if it still holds
+    old_hash. Clears everything that belonged to the old release (TorBox ids,
+    probed Spore tracks, usenet and RealDebrid state) so the next play and the
+    stub probe start from the new one. Returns whether the row changed."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE virtual_items
+               SET info_hash=?, magnet=?, quality=?, source=?, size_gb=?,
+                   torbox_id=NULL, file_id=NULL, spore_tracks=NULL,
+                   protocol='torrent', debrid_provider='torbox', rd_id=NULL,
+                   nzb_url=NULL, usenet_id=NULL
+               WHERE token=? AND lower(info_hash)=lower(?)""",
+            (info_hash.lower(), magnet, quality, source, size_gb, token, old_hash),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
 def get_upgradeable_virtual_items() -> list[dict]:
     """Return movie virtual items that have a stored quality below 2160p."""
     with _connect() as conn:
