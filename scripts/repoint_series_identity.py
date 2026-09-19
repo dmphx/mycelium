@@ -64,6 +64,10 @@ def choose_replacement(candidates: list, identity, expected_title: str | None,
     for candidate in candidates:
         if candidate.info_hash.lower() == (current_hash or "").lower():
             continue
+        languages = set(getattr(candidate, "languages", ()) or ())
+        if (identity.language == "en" and languages
+                and not languages & {"en", "multi"}):
+            continue  # a dub ("Черепашки ниндзя / ...") is the right show, wrong audio
         verdict, _ = release_sanity.classify_release(
             release_sanity._stream_text(candidate), identity)
         if verdict == release_sanity.IDENTITY_MATCH:

@@ -77,6 +77,15 @@ def test_choice_accepts_a_distinctive_episode_title():
     assert choice is titled and why == "episode title"
 
 
+def test_choice_skips_a_foreign_dub_of_an_english_show():
+    dub = _stream("Черепашки ниндзя / Teenage Mutant Ninja Turtles S01E01 Turtle Tracks",
+                  "a" * 40)
+    dub.languages = ("ru",)
+    english = _stream("Teenage Mutant Ninja Turtles 1987 S01E01 1080p", "b" * 40)
+    choice, _ = tool.choose_replacement([dub, english], TMNT_1987, "Turtle Tracks", "c" * 40)
+    assert choice is english
+
+
 def test_choice_refuses_ambiguous_or_current_releases():
     unqualified = _stream("Teenage Mutant Ninja Turtles S01E01 1080p", "a" * 40)
     current = _stream("Teenage Mutant Ninja Turtles 1987 S01E01 1080p", "c" * 40)
