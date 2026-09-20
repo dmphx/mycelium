@@ -168,3 +168,17 @@ def test_identity_repair_cursor_rotates_unresolved_items():
     second = db.get_virtual_items_missing_identity(limit=1)[0]
 
     assert second["token"] != first["token"]
+
+
+def test_gunicorn_entrypoint_never_wraps_db_helpers():
+    """app_cache.py is the gunicorn entrypoint and cannot see a signature
+    change in the module it imports. It used to wrap db.get_wanted_episodes
+    without a `limit` parameter, so once monitor started passing one
+    (d107142, 2026-08-09) every hourly wanted-episode search raised TypeError
+    and 203k older wanted rows went unsearched for six weeks. The ordering it
+    added lives in db.get_wanted_episodes itself now."""
+    source = open(os.path.join(os.path.dirname(__file__), "..", "app_cache.py"),
+                  encoding="utf-8").read()
+    body = source.split('"""')[2]
+    assert "db." not in body, f"entrypoint must not touch db: {body.strip()!r}"
+    assert "get_wanted_episodes" not in body

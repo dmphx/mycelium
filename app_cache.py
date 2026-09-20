@@ -1,9 +1,20 @@
 """
 Gunicorn entrypoint (thin override over app:app).
 
-Imports the real Flask app unchanged, then applies the wanted-episode queue
-prioritisation patch below. The gunicorn CMD stays `app_cache:app` SOLELY to
-carry that patch — see 15b-media-automation.yml.
+Imports the real Flask app unchanged. Nothing else: this module is only a
+named entrypoint, kept because the gunicorn CMD in 15b-media-automation.yml
+says `app_cache:app`.
+
+── queue prioritisation patch RETIRED 2026-09-20 ─────────────────────────────
+This file used to wrap db.get_wanted_episodes so the queue ran fewest
+attempts first, then newest aired. db.get_wanted_episodes orders that way
+itself now, and it takes a `limit` that the wrapper never accepted. Since
+d107142 (2026-08-09) monitor passes that limit, so every hourly wanted
+episode search died in TypeError before searching anything. Only the
+fresh-release lane (get_fresh_wanted_episodes, never wrapped) kept running,
+so new episodes still arrived while 203k older wanted rows sat untouched
+for six weeks. Do not wrap a db helper from here: this module cannot see a
+signature change in the module it patches.
 
 ── SSD prefetch cache RETIRED 2026-07-22 ────────────────────────────────────
 This file used to also install a local-SSD prefetch cache (spore_cache) in
@@ -32,34 +43,4 @@ same-title reads, and is not the retired whole-file prefetcher described here.
 
 Deploy: gunicorn ... app_cache:app   (instead of app:app)
 """
-import logging
-
-from app import app          # runs the full mycelium init, exactly like app:app
-
-log = logging.getLogger("spore_cache")
-
-# ── wanted-episode queue prioritisation (Onyx patch 2026-07-11) ──────────────
-# Root cause: db.get_wanted_episodes() ordered by (title, season, episode), so
-# the newest episode of every ongoing show sat at the very back of a ~290k-row
-# queue and monitor.run_series_check never reached it (alphabetical + oldest-
-# first). Re-order to fewest-attempts-then-newest-aired so current episodes of
-# ongoing shows (e.g. American Dad S22) are processed first each pass, and the
-# high-attempt un-gettable back-catalog naturally sinks to the back.
-try:
-    import db as _qp_db
-
-    _qp_orig_get_wanted = _qp_db.get_wanted_episodes
-
-    def _qp_get_wanted(max_attempts: int = 10):
-        rows = _qp_orig_get_wanted(max_attempts)
-        # stable sort: secondary key first (air_date DESC = newest), then
-        # primary key (attempt_count ASC = never-tried first).
-        rows.sort(key=lambda e: (e.get("air_date") or ""), reverse=True)
-        rows.sort(key=lambda e: (e.get("attempt_count") or 0))
-        return rows
-
-    _qp_get_wanted.__name__ = _qp_orig_get_wanted.__name__
-    _qp_db.get_wanted_episodes = _qp_get_wanted
-    log.info("queue-priority: get_wanted_episodes re-ordered (attempt asc, air_date desc)")
-except Exception as exc:  # never block startup
-    log.warning("queue-priority: patch failed, using default order: %s", exc)
+from app import app  # noqa: F401
