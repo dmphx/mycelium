@@ -458,7 +458,7 @@
           <code id="catbox-url" style="display:block;background:var(--panel2);padding:6px 10px;border-radius:4px"></code>
         </div>
         <div>
-          <div class="dim" style="margin-bottom:4px">Webhook secret &mdash; add to Seerr: Settings &rarr; Notifications &rarr; Webhook &rarr; Header <code>X-Webhook-Secret</code></div>
+          <div class="dim" style="margin-bottom:4px">Webhook secret: add to Seerr under Settings &rarr; Notifications &rarr; Webhook &rarr; Authorization Header</div>
           <div style="display:flex;gap:6px;align-items:center">
             <code id="webhook-secret-val" style="flex:1;display:block;background:var(--panel2);padding:6px 10px;border-radius:4px;filter:blur(4px);cursor:pointer" title="Click to reveal" onclick="this.style.filter=this.style.filter?'':'blur(4px)'">loading...</code>
             <button onclick="navigator.clipboard.writeText(document.getElementById('webhook-secret-val').textContent)" class="btn btn-secondary btn-sm">Copy</button>

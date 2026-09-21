@@ -861,17 +861,27 @@ def _check_auth() -> None:
     secret = _effective_webhook_secret()
     if not secret:
         return
-    header_secret = request.headers.get("X-Webhook-Secret")
-    query_secret  = request.args.get("secret")
-    provided = header_secret or query_secret
-    if query_secret and not header_secret:
+    presented = [request.headers.get("X-Webhook-Secret")]
+    # Seerr's webhook agent can send exactly one credential: its "Authorization
+    # Header" setting, verbatim. Accept it raw or as "Bearer <secret>".
+    authorization = request.headers.get("Authorization")
+    if authorization:
+        presented.append(authorization)
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            presented.append(token.strip())
+    query_secret = request.args.get("secret")
+    if query_secret:
         # Deprecated: secret in query string leaks via access logs and proxy history.
-        # Migrate to the X-Webhook-Secret header.
         log.warning("Webhook secret passed via ?secret= query param from %s"
-                    " - migrate to X-Webhook-Secret header", request.remote_addr)
+                    " - send it in the Authorization or X-Webhook-Secret header instead",
+                    request.remote_addr)
+        presented.append(query_secret)
     # Constant-time compare to avoid leaking the secret one character at a time
-    # via response-time side-channels.
-    if not hmac.compare_digest(provided or "", secret):
+    # via response-time side-channels. Compare bytes: compare_digest raises on a
+    # non-ASCII str, which would turn a garbage credential into a 500.
+    expected = secret.encode()
+    if not any(hmac.compare_digest(p.encode(), expected) for p in presented if p):
         log.warning("Rejected webhook with bad/missing secret from %s", request.remote_addr)
         abort(401)
 
