@@ -99,6 +99,21 @@ _EP_SPAN_RES = (
 # not recompile the (non-trivial) pack regex thousands of times in a sweep.
 _pack_re_cache: dict[str, "re.Pattern | None"] = {}
 
+# Fakes of episodes that have not aired yet often wrap a Windows executable in
+# an episode name ("South Park S29E02 1080p WEB H264-MeGusta.exe"). Scraper
+# titles can render the extension as a last word ("... x265 NTb exe").
+_EXECUTABLE_NAME_RE = re.compile(r"[.\s](?:exe|scr|msi|lnk|bat|cmd|vbs|pif)$",
+                                 re.IGNORECASE)
+
+
+def executable_reason(text: str | None) -> str | None:
+    """Reason when any line of a torrent or scraper name is an executable."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line and _EXECUTABLE_NAME_RE.search(line):
+            return f"executable, not media: {_short(line)}"
+    return None
+
 
 def _config_val(name: str, fallback):
     """Read a config.py attribute, tolerating a stale config that predates it."""
@@ -262,6 +277,9 @@ def verify_entry(entry: dict, kind: str, *, season: int | None = None,
     """
     if not entry:
         return None  # nothing to check (uncached / no listing)  -  fail open
+    reason = executable_reason(entry.get("name"))
+    if reason:
+        return reason
     if kind == "movie":
         return _verify_movie(entry)
     if kind == "episode":
@@ -804,6 +822,20 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
     Series kinds with an imdb_id also get the series identity check, on the
     candidate's own name and on the TorBox cached torrent/file names.
     """
+    if not candidates:
+        return candidates
+    # Before the enabled() switch and the TorBox call: an executable is never
+    # media, whatever the settings or TorBox's availability.
+    safe = []
+    for c in candidates:
+        reason = executable_reason(c.name) or executable_reason(c.title)
+        if reason:
+            log.warning("Release sanity: rejected %s cached candidate %s  -  %s",
+                        label or kind, c.info_hash, reason)
+            _record_reject(kind, reason)
+        else:
+            safe.append(c)
+    candidates = safe
     if not candidates:
         return candidates
     identity = (series_identity(imdb_id)

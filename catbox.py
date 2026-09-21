@@ -1002,6 +1002,13 @@ def _prepare_next_episode(imdb_id: str, title: str,
             nxt = db.get_virtual_item_by_episode(imdb_id, next_season, next_episode)
         if not wanted and not nxt:
             return
+        # Before its air date only fakes exist, often executables named like
+        # the episode (South Park S29E02, 2026-09-20), and registering one
+        # marks the episode found so the real release is never searched.
+        if wanted and (wanted.get("air_date") or "") > datetime.now().date().isoformat():
+            log.info("Next episode prepare: %s S%02dE%02d airs %s, skipping",
+                     title, next_season, next_episode, wanted["air_date"])
+            return
 
         ckey = search_engine.content_key(imdb_id, next_season, next_episode)
         if nxt and nxt.get("info_hash"):
@@ -1016,16 +1023,28 @@ def _prepare_next_episode(imdb_id: str, title: str,
                     return
                 search_engine.reject(ckey, nxt["info_hash"], reason)
 
+        # Same identity rules as the wanted-episode search: rank with TMDB's
+        # episode title, and when no candidate carries it, keep only cached
+        # releases that do.
+        import monitor
+        import processor
+        override = processor._episode_search_override(imdb_id, next_season, next_episode)
         streams = search_engine.search_candidates(
             "series", imdb_id, title, season=next_season,
-            episode=next_episode, trigger="next_episode_prepare")
+            episode=next_episode, override=override,
+            trigger="next_episode_prepare")
         cache_results = search_engine.cache_map(ckey, streams)
-        cached = [stream for stream in streams
-                  if not stream.is_usenet and
-                  stream.info_hash in cache_results.get("torbox", set())]
+        cached_before_sanity = [stream for stream in streams
+                                if not stream.is_usenet and
+                                stream.info_hash in cache_results.get("torbox", set())]
         cached = release_sanity.filter_cached(
-            cached, kind="episode", season=next_season,
+            cached_before_sanity, kind="episode", season=next_season,
             episode=next_episode, imdb_id=imdb_id, label=ckey)
+        expected_title = str(override.get("episode_title") or "")
+        require_title = monitor._episode_requires_title_verification(
+            streams, expected_title, len(cached) < len(cached_before_sanity))
+        cached = monitor._episode_title_verified_candidates(
+            cached, expected_title, require_title)
         if not cached:
             log.info("Next episode prepare: no valid cached release for %s", ckey)
             return

@@ -437,3 +437,36 @@ def test_cached_name_span_rejected_even_when_torbox_listing_is_absent(monkeypatc
     )
 
     assert kept == []
+
+
+# ── executables dressed as episodes (South Park S29E02, 2026-09-20) ───────────
+
+def test_executable_single_file_without_listing_is_rejected():
+    entry = {"name": "South Park S29E02 1080p WEB H264-MeGusta.exe", "size": 1 * GB, "files": []}
+
+    reason = release_sanity.verify_entry(entry, "episode", season=29, episode=2)
+
+    assert reason and "executable" in reason
+
+
+def test_executable_scraper_title_is_dropped_before_the_torbox_listing(monkeypatch):
+    import torbox
+
+    monkeypatch.setattr(release_sanity, "enabled", lambda: True)
+    monkeypatch.setattr(torbox, "check_cached_files", lambda hashes: {})
+    fake = _stream("South Park S29E01 South America 1080p WEB-DL x265 NTb exe",
+                   "1080p", 0.86, "f" * 40)
+    real = _stream("South Park S29E01 South American Biker Gangs 1080p AMZN WEB-DL H 264-NTb",
+                   "1080p", 0.86, "a" * 40)
+
+    kept = release_sanity.filter_cached([fake, real], "episode", season=29, episode=1)
+
+    assert kept == [real]
+
+
+def test_names_that_merely_contain_exe_are_media():
+    for name in ("The.Exes.S02E01.1080p.WEB.h264-GRP",
+                 "Execution 2023 1080p WEB-DL.mkv",
+                 "Show S01E01 1080p WEB H264-EXE",
+                 "Show S01E01 exe files 1080p.mkv"):
+        assert release_sanity.executable_reason(name) is None, name

@@ -6,6 +6,10 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Watching an episode no longer prepares the next one before it has aired,
+  next-episode preparation applies the same episode-title identity check as
+  the wanted-episode search, and releases named as executables (a common fake
+  for new episodes) are rejected everywhere
 - Newly aired episodes are searched once their air date arrives instead of
   waiting for the show's weekly metadata refresh, and undated back-catalog
   rows no longer crowd them out of the fresh-release search lane
