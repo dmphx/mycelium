@@ -159,6 +159,51 @@ def test_only_an_item_that_still_holds_the_flagged_release_is_touched():
     assert tool.still_wrong({"info_hash": "aabb"}, None) is False
 
 
+def test_a_plex_stub_path_maps_to_the_strm_behind_it():
+    strm = tool.plex_file_to_strm(
+        "/mnt/library/shows/Hell's Kitchen/Season 02/Hell's Kitchen S02E01.mkv",
+        "/mnt/library/shows/", "/data/media")
+    assert strm == "/data/media/series/Hell's Kitchen/Season 02/Hell's Kitchen S02E01.strm"
+
+
+@pytest.mark.parametrize("plex_file", [
+    None, "", "/mnt/library/movies/Heat (1995)/Heat (1995).mkv",
+    "/mnt/library/showsX/Show/Season 01/Show S01E01.mkv",
+])
+def test_a_path_outside_the_tv_root_maps_to_nothing(plex_file):
+    assert tool.plex_file_to_strm(plex_file, "/mnt/library/shows", "/data/media") is None
+
+
+def test_rescan_covers_both_folders_of_a_move_and_the_folder_of_a_removal():
+    records = [
+        {"kind": tool.MOVE, "row": {"strm_path": "/m/series/Powers/Season 01/Powers S01E01.strm"},
+         "new_strm": "/m/series/Powers (2015)/Season 01/Powers (2015) S01E01.strm"},
+        {"kind": tool.MOVE, "row": {"strm_path": "/m/series/AR/Season 27/AR S27E02.strm"},
+         "new_strm": "/m/series/AR/Season 27/AR S27E02.strm"},
+        {"kind": tool.GHOST, "row": {"strm_path": "/m/series/Shameless/Season 05/Shameless S05E13.strm"}},
+        {"kind": "nfo", "row": {"token": None}, "path": "/m/series/Bullseye/tvshow.nfo"},
+        {"kind": tool.MOVE, "row": {"strm_path": "/m/series/Powers/Season 01/Powers S01E01.strm"},
+         "new_strm": "/m/series/Powers (2015)/Season 01/Powers (2015) S01E01.strm"},
+    ]
+    assert tool.rescan_ops(records) == [
+        ("remove", "/m/series/Powers/Season 01/Powers S01E01.strm"),
+        ("scan", "/m/series/Powers (2015)/Season 01/Powers (2015) S01E01.strm"),
+        # A shared folder: nothing left it, so only the scan.
+        ("scan", "/m/series/AR/Season 27/AR S27E02.strm"),
+        ("remove", "/m/series/Shameless/Season 05/Shameless S05E13.strm"),
+        ("scan", "/m/series/Bullseye/tvshow.nfo"),
+    ]
+
+
+def test_scans_are_flushed_by_the_process_not_a_daemon_timer():
+    """A daemon-thread flush dies with a short-lived script and takes its batch
+    with it, so the tool pushes the debounce out of reach and flushes itself."""
+    import types
+    fake = types.SimpleNamespace(_DEBOUNCE=20.0)
+    tool._flush_synchronously(fake)
+    assert fake._DEBOUNCE >= 10 ** 6
+
+
 def test_episode_stem_matches_the_folder_name():
     assert tool.episode_stem("Shameless (US)", 5, 13) == "Shameless (US) S05E13"
 

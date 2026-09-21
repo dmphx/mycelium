@@ -194,6 +194,20 @@ def still_wrong(item: dict, finding: dict | None) -> bool:
     return (item.get("info_hash") or "").lower() == (finding.get("info_hash") or "").lower()
 
 
+def plex_file_to_strm(plex_file: str | None, plex_tv_root: str, media_root) -> str | None:
+    """The .strm behind a file Plex has open. Plex sees the Spore stub under
+    its TV root (/mnt/library/shows/Show/Season 01/Show S01E01.mkv); mycelium
+    keeps the matching .strm under MEDIA_PATH/series with the same relative
+    path."""
+    root = plex_tv_root.rstrip("/") + "/"
+    if not plex_file or not plex_file.startswith(root):
+        return None
+    rel = plex_file[len(root):]
+    if rel.lower().endswith(".mkv"):
+        rel = rel[:-4] + ".strm"
+    return str(Path(media_root) / "series" / rel)
+
+
 def _recently_played(row: dict) -> bool:
     try:
         played = datetime.strptime(row.get("last_played") or "", "%Y-%m-%d %H:%M:%S")
@@ -602,10 +616,14 @@ def apply_show(plan: dict, args, backup_dir: Path | None) -> Counter:
         season, episode = item.get("season"), item.get("episode")
         label = (f"{entry['wrong']} S{int(season):02d}E{int(episode):02d}"
                  if season is not None else f"{entry['wrong']} {item['token']}")
+        open_paths: set = set()
         if not dry:
             # Wait first, then read the row, so a play that happened during
             # the wait still counts as recent below.
-            _wait_for_idle_playback()
+            if getattr(args, "allow_paused", False):
+                open_paths = _wait_for_no_stream()
+            else:
+                _wait_for_idle_playback()
         current = db.get_virtual_item(item["token"])
         if not current or (current.get("info_hash") or "").lower() != (
                 item.get("info_hash") or "").lower():
@@ -614,6 +632,10 @@ def apply_show(plan: dict, args, backup_dir: Path | None) -> Counter:
         if _recently_played(current):
             outcome["played in the last 90 min"] += 1
             print(f"  keep   {label}: played in the last 90 minutes")
+            continue
+        if current.get("strm_path") in open_paths:
+            outcome["open in a paused Plex session"] += 1
+            print(f"  keep   {label}: open in a paused Plex session")
             continue
 
         if row["disposition"] == MOVE:
@@ -738,6 +760,67 @@ def _wait_for_idle_playback() -> None:
         time.sleep(60)
 
 
+_sessions_cache: dict = {"at": 0.0, "value": None}
+
+
+def _plex_sessions() -> tuple[bool, set] | None:
+    """(is anything streaming, .strm paths open in any session), or None when
+    Plex could not be asked. A paused session counts as open, not streaming.
+    Cached for 30 seconds so a long run asks Plex a few times a minute."""
+    now = time.monotonic()
+    if _sessions_cache["value"] is not None and now - _sessions_cache["at"] < 30:
+        return _sessions_cache["value"]
+    import os
+    import xml.etree.ElementTree as ET
+
+    import media_servers
+    import requests
+    import settings
+    import strm_generator
+    url = (os.environ.get("PLEX_URL") or str(settings.get("PLEX_URL", "") or "")).rstrip("/")
+    token = os.environ.get("PLEX_TOKEN") or str(settings.get("PLEX_TOKEN", "") or "")
+    if not (url and token):
+        return None
+    headers = {"X-Plex-Token": token}
+    try:
+        root = ET.fromstring(requests.get(url + "/status/sessions", headers=headers,
+                                          timeout=5).content)
+        streaming, open_paths = False, set()
+        for node in root:
+            player = next((c for c in node if c.tag == "Player"), None)
+            if (player is None or (player.get("state") or "").lower()
+                    in {"playing", "buffering"}):
+                streaming = True
+            # /status/sessions leaves out file paths; the item's metadata has them.
+            meta = ET.fromstring(requests.get(
+                f"{url}/library/metadata/{node.get('ratingKey')}", headers=headers,
+                timeout=5).content)
+            for part in meta.iter("Part"):
+                strm = plex_file_to_strm(part.get("file"), media_servers.PLEX_TV_ROOT,
+                                         strm_generator.MEDIA_PATH)
+                if strm:
+                    open_paths.add(strm)
+    except Exception as exc:
+        print(f"  Plex session check failed: {type(exc).__name__}", flush=True)
+        return None
+    _sessions_cache.update(at=now, value=(streaming, open_paths))
+    return streaming, open_paths
+
+
+def _wait_for_no_stream() -> set:
+    """--allow-paused: wait only while something is actually streaming, and
+    return the .strm paths still open in a (paused) session so the caller can
+    leave those items alone."""
+    while True:
+        state = _plex_sessions()
+        if state is not None and not state[0]:
+            return state[1]
+        print("  " + ("playback active" if state else "Plex unreachable")
+              + ", waiting 60s", flush=True)
+        _sessions_cache["value"] = None
+        time.sleep(60)
+
+
 # ── rollback ─────────────────────────────────────────────────────────────────
 
 def _restore_wanted(conn, before: dict | None, imdb_id: str, season, episode) -> None:
@@ -765,6 +848,7 @@ def _restore_files(backup_dir: Path, paths: list) -> None:
 def rollback(args) -> int:
     import db
     import media_servers
+    _flush_synchronously(media_servers)
     backup_dir = Path(args.rollback)
     restored = skipped = 0
     records = [json.loads(line) for line in
@@ -825,11 +909,56 @@ def rollback(args) -> int:
     return 0
 
 
+# ── media server notifications ───────────────────────────────────────────────
+
+def _flush_synchronously(media_servers) -> None:
+    """Make every scan request wait for the one _flush() this process runs at
+    the end. media_servers normally flushes on a debounce timer in a daemon
+    thread, and a short-lived script can exit while that thread is still
+    inside its Jellyfin POST: the batch it holds never reaches the Plex spool.
+    The 2026-09-20 run lost the scans for four shows that way."""
+    media_servers._DEBOUNCE = 10 ** 9
+
+
+def rescan_ops(records: list[dict]) -> list[tuple[str, str]]:
+    """Every (mode, path) scan an applied run implies: the old season folder of
+    anything that left it, the new season folder of anything moved in, and the
+    show folder of a corrected tvshow.nfo. Rerunning these is harmless."""
+    ops = []
+    for record in records:
+        if record["kind"] == "nfo":
+            ops.append(("scan", record["path"]))
+            continue
+        old = (record.get("row") or {}).get("strm_path")
+        new = record.get("new_strm")
+        if old and old != new:
+            ops.append(("remove", old))
+        if new:
+            ops.append(("scan", new))
+    return list(dict.fromkeys(ops))
+
+
+def rescan(args) -> int:
+    import media_servers
+    _flush_synchronously(media_servers)
+    backup_dir = Path(args.rescan)
+    records = [json.loads(line) for line in
+               open(backup_dir / "rows.jsonl", encoding="utf-8")]
+    ops = rescan_ops(records)
+    for mode, path in ops:
+        (media_servers.mark_removed if mode == "remove" else media_servers.mark)(Path(path))
+    media_servers._flush()
+    print(f"Queued scans for {len(ops)} path(s) from {len(records)} record(s)")
+    return 0
+
+
 # ── entry point ──────────────────────────────────────────────────────────────
 
 def run(args) -> int:
     import db
     import media_servers
+
+    _flush_synchronously(media_servers)
 
     entries = load_plan(json.load(open(args.plan, encoding="utf-8")))
     if args.imdb:
@@ -875,6 +1004,8 @@ def main(argv=None) -> int:
     ap.add_argument("--backup-dir",
                     default=f"/data/ops/series_reidentify_{datetime.now():%Y%m%d-%H%M%S}")
     ap.add_argument("--rollback")
+    ap.add_argument("--rescan", metavar="DIR",
+                    help="queue again every Plex/Jellyfin scan an applied run implies")
     ap.add_argument("--imdb", action="append", default=[],
                     help="only this wrong-side show (repeatable)")
     ap.add_argument("--on-duplicate", choices=("drop", "keep"), default="drop",
@@ -884,9 +1015,15 @@ def main(argv=None) -> int:
                     help="do not add or extend the right show's monitored_series row")
     ap.add_argument("--no-request-row", dest="request_row", action="store_false",
                     help="do not create a requests row for the right show")
+    ap.add_argument("--allow-paused", action="store_true",
+                    help="wait only while Plex is streaming, not for paused sessions or "
+                         "the 10 minute after-play window; items open in a paused "
+                         "session are still left alone")
     args = ap.parse_args(argv)
     if args.rollback:
         return rollback(args)
+    if args.rescan:
+        return rescan(args)
     if not args.plan or not args.findings:
         ap.error("--plan and --findings are required")
     return run(args)
