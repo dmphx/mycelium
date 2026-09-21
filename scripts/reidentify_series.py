@@ -602,6 +602,10 @@ def apply_show(plan: dict, args, backup_dir: Path | None) -> Counter:
         season, episode = item.get("season"), item.get("episode")
         label = (f"{entry['wrong']} S{int(season):02d}E{int(episode):02d}"
                  if season is not None else f"{entry['wrong']} {item['token']}")
+        if not dry:
+            # Wait first, then read the row, so a play that happened during
+            # the wait still counts as recent below.
+            _wait_for_idle_playback()
         current = db.get_virtual_item(item["token"])
         if not current or (current.get("info_hash") or "").lower() != (
                 item.get("info_hash") or "").lower():
@@ -611,8 +615,6 @@ def apply_show(plan: dict, args, backup_dir: Path | None) -> Counter:
             outcome["played in the last 90 min"] += 1
             print(f"  keep   {label}: played in the last 90 minutes")
             continue
-        if not dry:
-            _wait_for_idle_playback()
 
         if row["disposition"] == MOVE:
             if dry:

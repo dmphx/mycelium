@@ -212,6 +212,75 @@ def test_rollback_reinserts_a_removed_item_and_its_files(tmp_path, monkeypatch):
     assert (wanted["status"], wanted["attempt_count"]) == ("found", 2)
 
 
+def test_rollback_moves_a_moved_item_back(tmp_path, monkeypatch):
+    """Undoing a move puts the files, the row, the episode NFO and both
+    wanted rows back as they were."""
+    from pathlib import Path
+    real_db = _load("reidentify_real_db3", os.path.join(_ROOT, "db.py"))
+    monkeypatch.setattr(real_db, "DB_PATH", str(tmp_path / "test3.db"))
+    real_db.init()
+    media, spore = tmp_path / "media", tmp_path / "plex-media"
+    old = media / "series" / "Powers" / "Season 01" / "Powers S01E01.strm"
+    new = media / "series" / "Powers (2015)" / "Season 01" / "Powers (2015) S01E01.strm"
+    old_stub = spore / "series" / "Powers" / "Season 01"
+    new_stub = spore / "series" / "Powers (2015)" / "Season 01"
+    old.parent.mkdir(parents=True)
+    old_stub.mkdir(parents=True)
+    old.write_text("/stream/tok", encoding="utf-8")
+    old.with_suffix(".nfo").write_text(
+        '<episodedetails><uniqueid type="imdb">tt0398546</uniqueid></episodedetails>',
+        encoding="utf-8")
+    (old_stub / "Powers S01E01.mkv").write_bytes(b"stub")
+    (old_stub / "Powers S01E01.minfo").write_text("token=tok\nsize=1\n", encoding="utf-8")
+    with real_db._connect() as conn:
+        conn.execute(
+            """INSERT INTO virtual_items (token, info_hash, magnet, title, media_type,
+                   strm_path, imdb_id, season, episode, play_count)
+               VALUES ('tok', 'aaaa', 'm', 'Powers S01E01', 'series', ?, 'tt0398546',
+                       1, 1, 4)""", (str(old),))
+        conn.execute("""INSERT INTO wanted_episodes (imdb_id, title, season, episode,
+                            status, attempt_count)
+                        VALUES ('tt0398546', 'Powers', 1, 1, 'found', 1)""")
+        conn.commit()
+    row = real_db.get_virtual_item("tok")
+
+    # Apply the move the way apply_show does.
+    moved = tool._move_files([(str(s), str(d)) for s, d in tool.planned_moves(
+        old, new, old_stub, new_stub)])
+    with real_db._connect() as conn:
+        conn.execute("UPDATE virtual_items SET imdb_id='tt1851040', "
+                     "title='Powers (2015) S01E01', strm_path=? WHERE token='tok'",
+                     (str(new),))
+        conn.commit()
+    nfo_before = tool._retag_nfo(new.with_suffix(".nfo"), "tt1851040", None)
+    wrong_before = tool._requeue_slot(real_db, "tt0398546", 1, 1)
+    right_before = tool._mark_found(real_db, "tt1851040", 42531, "Powers", 1, 1)
+    backup = tmp_path / "backup3"
+    backup.mkdir()
+    tool._record(backup, {"kind": tool.MOVE, "row": row, "right": "tt1851040",
+                          "new_strm": str(new), "new_title": "Powers (2015) S01E01",
+                          "moved": moved, "nfo_before": nfo_before,
+                          "wrong_wanted": wrong_before, "right_wanted": right_before})
+    assert new.exists() and not old.exists()
+    assert (new_stub / "Powers (2015) S01E01.minfo").exists()
+    assert "tt1851040" in new.with_suffix(".nfo").read_text(encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "db", real_db)
+    monkeypatch.setitem(sys.modules, "media_servers", _fake_media_servers())
+    tool.rollback(_args(rollback=str(backup)))
+
+    back = real_db.get_virtual_item("tok")
+    assert (back["imdb_id"], back["strm_path"], back["title"]) == (
+        "tt0398546", str(old), "Powers S01E01")
+    assert back["play_count"] == 4
+    assert old.exists() and not new.exists()
+    assert (old_stub / "Powers S01E01.minfo").read_text(encoding="utf-8").startswith(
+        "token=tok")
+    assert "tt0398546" in old.with_suffix(".nfo").read_text(encoding="utf-8")
+    assert real_db.get_wanted_episode("tt0398546", 1, 1)["status"] == "found"
+    assert real_db.get_wanted_episode("tt1851040", 1, 1) is None
+
+
 def test_rollback_leaves_an_item_that_changed_since_the_run(tmp_path, monkeypatch):
     real_db = _load("reidentify_real_db2", os.path.join(_ROOT, "db.py"))
     monkeypatch.setattr(real_db, "DB_PATH", str(tmp_path / "test2.db"))
