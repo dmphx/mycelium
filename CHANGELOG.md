@@ -6,6 +6,9 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Newly aired episodes are searched once their air date arrives instead of
+  waiting for the show's weekly metadata refresh, and undated back-catalog
+  rows no longer crowd them out of the fresh-release search lane
 - Plex enrichment now queues only from durable, authoritative Plex sessions,
   not from Spore reads, NFS probes, or Catbox materialization
 - Plex library matching now prefers exact IMDb and TMDB identities, permits a

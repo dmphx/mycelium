@@ -1003,14 +1003,21 @@ def get_wanted_episodes_with_search() -> list[dict]:
 
 def get_fresh_wanted_episodes(limit: int = 12,
                               window_days: int = 3) -> list[dict]:
-    """Return newly aired episodes due for the fast release-window lane."""
+    """Return newly aired episodes due for the fast release-window lane.
+
+    Undated rows stay in the regular lane. They are mostly back-catalog that
+    TMDB never dated, and they used to take about 95 percent of this lane,
+    so a new episode that missed a few early searches sat behind thousands
+    of them until its window closed.
+    """
     cutoff = f"-{max(1, int(window_days))} days"
     with _connect() as conn:
         rows = conn.execute(
             """SELECT * FROM wanted_episodes
                WHERE status='wanted'
-                 AND (air_date IS NULL OR air_date <= date('now'))
-                 AND (air_date IS NULL OR air_date >= date('now', ?))
+                 AND air_date IS NOT NULL
+                 AND air_date <= date('now')
+                 AND air_date >= date('now', ?)
                  AND (
                    attempt_count=0 OR last_attempted IS NULL OR
                    (attempt_count BETWEEN 1 AND 3 AND
@@ -1021,11 +1028,30 @@ def get_fresh_wanted_episodes(limit: int = 12,
                     last_attempted <= datetime('now','-6 hours'))
                  )
                ORDER BY CASE WHEN air_date=date('now') THEN 0 ELSE 1 END,
-                        attempt_count ASC, COALESCE(air_date, '') DESC
+                        attempt_count ASC, air_date DESC
                LIMIT ?""",
             (cutoff, max(1, int(limit))),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def promote_aired_episodes(today: str) -> int:
+    """Mark not_aired rows as wanted once their air date has arrived.
+
+    Before this, only the per-show metadata refresh did it, and that reaches
+    each show about once a week. An aired episode could wait days before its
+    first search and miss the fresh-release window entirely.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE wanted_episodes SET status='wanted'
+               WHERE status='not_aired'
+                 AND air_date IS NOT NULL
+                 AND air_date <= ?""",
+            (today,),
+        )
+        conn.commit()
+    return cursor.rowcount
 
 
 def mark_episode_status(imdb_id: str, season: int, episode: int, status: str) -> None:

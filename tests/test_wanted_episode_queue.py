@@ -124,6 +124,57 @@ def test_fresh_lane_retries_new_releases_without_touching_old_backlog():
     assert {row["imdb_id"] for row in rows} == {"tt0000001"}
 
 
+def _insert_row(index, air_modifier, status="wanted", attempts=0,
+                attempted_ago_hours=None):
+    """Insert a wanted row; air_modifier None leaves the air date unknown."""
+    with db._connect() as conn:
+        conn.execute(
+            """INSERT INTO wanted_episodes
+               (imdb_id, title, season, episode, air_date, status,
+                attempt_count, last_attempted)
+               VALUES (?, ?, 1, ?,
+                       CASE WHEN ? IS NULL THEN NULL ELSE date('now', ?) END,
+                       ?, ?,
+                       CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', ?) END)""",
+            (f"tt{index:07d}", f"Show {index}", index,
+             air_modifier, air_modifier, status, attempts,
+             attempted_ago_hours,
+             f"-{attempted_ago_hours} hours" if attempted_ago_hours is not None else None),
+        )
+
+
+def test_fresh_lane_is_not_starved_by_undated_backlog():
+    """South Park S29E01 (aired 2026-09-16) used six searches before any
+    release existed and was never searched again: undated back-catalog rows
+    with fewer attempts filled every batch until its window closed."""
+    for index in range(30):
+        _insert_row(index, None, attempts=4, attempted_ago_hours=3)
+    _insert_row(100, "-1 day", attempts=6, attempted_ago_hours=3)
+
+    rows = db.get_fresh_wanted_episodes(limit=12, window_days=3)
+
+    assert [row["imdb_id"] for row in rows] == ["tt0000100"]
+
+
+def test_aired_rows_are_promoted_without_a_metadata_refresh():
+    _insert_row(1, "-1 day", status="not_aired")
+    _insert_row(2, "+1 day", status="not_aired")
+    _insert_row(3, None, status="not_aired")
+    _insert_row(4, "-1 day", status="found")
+    with db._connect() as conn:
+        today = conn.execute("SELECT date('now')").fetchone()[0]
+
+    assert db.promote_aired_episodes(today) == 1
+
+    statuses = {row["imdb_id"]: row["status"] for row in db.get_all_wanted_episodes()}
+    assert statuses == {
+        "tt0000001": "wanted",
+        "tt0000002": "not_aired",
+        "tt0000003": "not_aired",
+        "tt0000004": "found",
+    }
+
+
 def test_release_candidate_rejection_is_scoped_to_content_key():
     key_one = "tt1234567:S01E01"
     key_two = "tt1234567:S01E02"

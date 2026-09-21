@@ -110,6 +110,20 @@ def test_add_series_canonicalizes_placeholder_title_before_wanted_sync(monkeypat
     assert sync_calls == [("tt6568694", 71795, "Criminal Minds (2017)", [1])]
 
 
+def test_wanted_search_promotes_aired_rows_before_reconciling(monkeypatch):
+    monitor.db.reset_mock()
+    monitor.db.promote_aired_episodes.return_value = 3
+    monitor.db.reconcile_wanted_episodes.return_value = 0
+    monitor.db.get_fresh_wanted_episodes.return_value = []
+    monkeypatch.setattr(monitor, "_TODAY", lambda: "2026-09-30")
+
+    monitor._search_wanted_episodes_locked(fresh_only=True)
+
+    names = [call[0] for call in monitor.db.method_calls]
+    assert names.index("promote_aired_episodes") < names.index("reconcile_wanted_episodes")
+    monitor.db.promote_aired_episodes.assert_called_once_with("2026-09-30")
+
+
 def test_sync_marks_episode_rows_removed_from_current_metadata(monkeypatch):
     monitor.db.reset_mock()
     monkeypatch.setattr(

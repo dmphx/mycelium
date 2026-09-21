@@ -236,6 +236,13 @@ def _search_wanted_episodes_locked(fresh_only: bool = False) -> None:
         episode_batch = max(1, int(os.environ.get("WANTED_EPISODE_BATCH", "50") or "50"))
         retry_delay = max(0.0, float(os.environ.get("WANTED_EPISODE_DELAY_SEC", "2") or "2"))
 
+    # Runs before reconcile so a promoted row already in the library is
+    # marked found instead of searched.
+    promoted = db.promote_aired_episodes(today)
+    if promoted:
+        log.info("Monitor: %d episode(s) aired since their show's last metadata "
+                 "refresh; now wanted", promoted)
+
     reconciled = db.reconcile_wanted_episodes()
     if reconciled:
         log.info("Monitor: reconciled %d wanted episode(s) already in the virtual library",
