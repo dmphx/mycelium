@@ -629,3 +629,155 @@ def test_self_heal_does_not_materialize_https_catbox_urls(tmp_path, monkeypatch)
     )
 
     sg._self_heal_sample(sample_size=6)
+
+
+# =============================================================================
+# Season packs: folder names and catbox rows
+# =============================================================================
+
+class TestParseInfoPackPaths:
+    """TorBox lists pack files as "<pack folder>/<file>". The show title must
+    come from the file's own name, or each pack becomes a second show folder
+    ("South Park S21") that duplicates the series in Jellyfin."""
+
+    def test_pack_folder_does_not_leak_into_title(self):
+        info = sg._parse_info(
+            "South.Park.S21.1080p.WEB-DL.x264-GRP",
+            "South.Park.S21.1080p.WEB-DL.x264-GRP/South.Park.S21E01.1080p.WEB-DL.x264-GRP.mkv",
+        )
+        assert info == {"type": "episode", "title": "South Park", "season": 21, "episode": 1}
+
+    def test_nested_pack_folders(self):
+        info = sg._parse_info(
+            "Abandoned.Engineering.S01-S05",
+            "Abandoned.Engineering.S01-S05/Abandoned.Engineering.S01/Abandoned.Engineering.S01E03.1080p.mkv",
+        )
+        assert info["title"] == "Abandoned Engineering"
+        assert (info["season"], info["episode"]) == (1, 3)
+
+    def test_site_prefixed_pack_folder(self):
+        info = sg._parse_info(
+            "www.UIndex.org    -    Futurama-1999-S06",
+            "www.UIndex.org    -    Futurama-1999-S06/Futurama.S06E04.720p.mkv",
+        )
+        assert info["title"] == "Futurama"
+        assert (info["season"], info["episode"]) == (6, 4)
+
+    def test_season_x_episode_file_names(self):
+        info = sg._parse_info(
+            "Criminal.Minds.S01-15.ITA.WEBRIP.x264-mkeagle3",
+            "Criminal.Minds.S01-15.ITA.WEBRIP.x264-mkeagle3/Criminal.Minds.01x03.Scarica.emotiva.ITA.WEBRIP.x264-mkeagle3.mkv",
+        )
+        assert info["type"] == "episode"
+        assert info["title"] == "Criminal Minds"
+        assert (info["season"], info["episode"]) == (1, 3)
+
+    def test_file_without_show_title_uses_pack_name(self):
+        info = sg._parse_info("Show.Name.S02.1080p.WEB-DL", "Show.Name.S02.1080p.WEB-DL/S02E05.mkv")
+        assert info["title"] == "Show Name"
+        assert (info["season"], info["episode"]) == (2, 5)
+
+    def test_episode_tag_only_on_folder(self):
+        info = sg._parse_info("Show.S01.Complete", "Show.S01.Complete/Show.S01E02/video.mkv")
+        assert info["title"] == "Show"
+        assert (info["season"], info["episode"]) == (1, 2)
+
+    def test_movie_in_release_folder(self):
+        info = sg._parse_info("Civil.War.2024.1080p.WEB-DL", "Civil.War.2024.1080p.WEB-DL/Civil.War.2024.1080p.WEB-DL.mkv")
+        assert info["type"] == "movie"
+        assert info["year"] == 2024
+
+    def test_season_x_episode_pattern_ignored_in_torrent_name(self):
+        # Only the file's own path may use "NNxNN"; a movie release name can't.
+        info = sg._parse_info("Some.Film.3x10.2007.1080p", "movie.mkv")
+        assert info["type"] == "movie"
+
+
+class _FakeCatbox:
+    def __init__(self):
+        self.calls = []
+
+    def register(self, **kwargs):
+        self.calls.append(kwargs)
+        return "tok%d" % len(self.calls)
+
+    def proxy_url(self, token):
+        return "https://mycelium.example/stream/" + token
+
+
+def _catbox_mode(monkeypatch, tmp_path):
+    import sys
+    from unittest.mock import MagicMock
+    fake = _FakeCatbox()
+    monkeypatch.setitem(sys.modules, "catbox", fake)
+    monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(sg.torbox_mod, "_is_ready", lambda item: True)
+    monkeypatch.setattr(sg.settings, "get",
+                        lambda key, default=None: True if key == "CATBOX_MODE" else default)
+    fake_db = MagicMock()
+    fake_db.get_virtual_item_by_hash.return_value = None
+    monkeypatch.setattr(sg, "db", fake_db)
+    return fake, fake_db
+
+
+PACK = {
+    "id": 7,
+    "name": "South.Park.S21.1080p.WEB-DL.x264-GRP",
+    "hash": "c" * 40,
+    "files": [
+        {"id": 10, "name": "South.Park.S21.1080p.WEB-DL.x264-GRP/South.Park.S21E01.1080p.WEB-DL.x264-GRP.mkv"},
+        {"id": 5, "name": "South.Park.S21.1080p.WEB-DL.x264-GRP/South.Park.S21E02.1080p.WEB-DL.x264-GRP.mkv"},
+    ],
+}
+
+
+class TestProcessTorrentCatboxRows:
+    def test_pack_lands_in_show_folder_with_row_backed_paths(self, tmp_path, monkeypatch):
+        fake, _ = _catbox_mode(monkeypatch, tmp_path)
+        assert sg.process_torrent(PACK) == 2
+        season = Path(tmp_path) / "series" / "South Park" / "Season 21"
+        e01 = season / "South Park S21E01.strm"
+        assert e01.read_text() == "https://mycelium.example/stream/tok1"
+        assert not (Path(tmp_path) / "series" / "South Park S21").exists()
+        first = fake.calls[0]
+        assert first["strm_path"] == str(e01)
+        assert (first["season"], first["episode"], first["file_id"]) == (21, 1, 10)
+
+    def test_imdb_id_is_stored_on_the_row(self, tmp_path, monkeypatch):
+        fake, _ = _catbox_mode(monkeypatch, tmp_path)
+        sg.process_torrent(PACK, canonical_title="South Park", imdb_id="tt0121955")
+        assert {c["imdb_id"] for c in fake.calls} == {"tt0121955"}
+
+    def test_skipped_write_drops_the_token(self, tmp_path, monkeypatch):
+        fake, fake_db = _catbox_mode(monkeypatch, tmp_path)
+        monkeypatch.setattr(sg, "_write_strm", lambda *a, **kw: False)
+        assert sg.process_torrent(PACK) == 0
+        dropped = [c.args[0] for c in fake_db.delete_virtual_item.call_args_list]
+        assert dropped == ["tok1", "tok2"]
+
+
+class TestCreateStrmForTorrentMovie:
+    ITEM = {"id": 3, "hash": "d" * 40, "files": [{"id": 1, "name": "The.Odyssey.2026.1080p/The.Odyssey.2026.1080p.mkv",
+                                                   "size": 8 * 1024 ** 3}]}
+
+    def test_existing_strm_registers_nothing(self, tmp_path, monkeypatch):
+        fake, fake_db = _catbox_mode(monkeypatch, tmp_path)
+        monkeypatch.setattr(sg.torbox_mod, "find_by_id", lambda tid: self.ITEM)
+        existing = Path(tmp_path) / "movies" / "The Odyssey (2026)" / "The Odyssey (2026).strm"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("https://mycelium.example/stream/lazy")
+        assert sg.create_strm_for_torrent(3, "The Odyssey (2026)", "movie") == 0
+        assert fake.calls == []
+
+    def test_duplicate_folder_skip_drops_the_token(self, tmp_path, monkeypatch):
+        # The request title has no year, so the path differs from the lazy
+        # folder "The Odyssey (2026)" and _write_strm skips it as a duplicate.
+        fake, fake_db = _catbox_mode(monkeypatch, tmp_path)
+        monkeypatch.setattr(sg.torbox_mod, "find_by_id", lambda tid: self.ITEM)
+        existing = Path(tmp_path) / "movies" / "The Odyssey (2026)" / "The Odyssey (2026).strm"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("https://mycelium.example/stream/lazy")
+        assert sg.create_strm_for_torrent(3, "The Odyssey", "movie") == 0
+        assert len(fake.calls) == 1
+        fake_db.delete_virtual_item.assert_called_once_with("tok1")
+        assert not (Path(tmp_path) / "movies" / "The Odyssey").exists()

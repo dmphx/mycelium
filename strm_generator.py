@@ -249,18 +249,36 @@ def _safe(s: str) -> str:
     return _SAFE_RE.sub('', s).strip().rstrip('([{ -')
 
 
+def _title_before_season(name: str) -> str:
+    """Show title from a pack name such as "South.Park.S21.1080p.WEB-DL"."""
+    s = re.split(r'\b(?:S\d{1,2}|Season\s*\d{1,2}|Series\s*\d{1,2})\b', _clean(name),
+                 maxsplit=1, flags=re.IGNORECASE)[0]
+    return _safe(_strip_junk(s).strip())
+
+
 def _parse_info(torrent_name: str, file_name: str) -> dict | None:
     """Extract title/year/season/episode from torrent and file names."""
     torrent_name = _clean_torrent_name(torrent_name)
-    file_base = re.sub(r'\.[a-zA-Z0-9]{2,5}$', '', file_name)
+    # TorBox names pack files "<pack folder>/<file>", sometimes several folders
+    # deep. The text before SxxEyy in that whole path carries the folder along,
+    # so every file of "South.Park.S21.1080p/South.Park.S21E01.mkv" landed in
+    # a second show folder "South Park S21". Read the file's own name first,
+    # then its folders (innermost first), then the torrent name.
+    parts = [_clean_torrent_name(p) for p in re.split(r'[\\/]', file_name) if p.strip()]
+    file_base = re.sub(r'\.[a-zA-Z0-9]{2,5}$', '', parts[-1]) if parts else ''
 
-    # Episode: try file name first (most reliable for season packs)
-    for source in (_clean(file_base), _clean(torrent_name)):
-        ep_m = _EP_RE.search(source)
+    # Episode: try file name first (most reliable for season packs). "01x03"
+    # only counts in the file's own path, so a movie's release name can't
+    # turn it into an episode.
+    sources = [(p, True) for p in [file_base, *parts[-2::-1]]] + [(torrent_name, False)]
+    for raw, in_file in sources:
+        source = _clean(raw)
+        ep_m = _EP_RE.search(source) or (_EP_ALT_RE.search(source) if in_file else None)
         if ep_m:
             season = int(ep_m.group(1))
             episode = int(ep_m.group(2))
-            title = _safe(_strip_junk(source[:ep_m.start()]).strip())
+            title = (_safe(_strip_junk(source[:ep_m.start()]).strip())
+                     or _title_before_season(torrent_name))
             return {'type': 'episode', 'title': title or 'Unknown', 'season': season, 'episode': episode}
 
     # Movie: find year
@@ -2239,7 +2257,8 @@ def _write_strm(path: Path, url: str, imdb_id: str | None = None) -> bool:
         return False
 
 
-def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_type: str) -> str | None:
+def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_type: str,
+                 strm_path: Path | None = None, imdb_id: str | None = None) -> str | None:
     """Return the URL to write into a .strm file.
     In Catbox mode this is a proxy URL pointing at /stream/<token>.
     Otherwise it is the direct TorBox CDN URL.
@@ -2249,6 +2268,10 @@ def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_typ
         import catbox
         magnet = item.get("magnet") or f"magnet:?xt=urn:btih:{item.get('hash')}"
         title = f"{info.get('title','')} ({info['year']})" if info.get("year") else info.get("title", file_name)
+        # Store the .strm path and episode like the lazy writers do. Without a
+        # strm_path the row is invisible to everything keyed on it (folder
+        # merges and renames, the missing-file rebuild, the same-hash guard
+        # in process_torrent), and its file lives on as an orphan.
         token = catbox.register(
             info_hash=(item.get("hash") or "").lower(),
             magnet=magnet,
@@ -2256,9 +2279,24 @@ def _resolve_url(item: dict, file_id: int, file_name: str, info: dict, media_typ
             media_type=media_type,
             torbox_id=torrent_id,
             file_id=file_id,
+            strm_path=str(strm_path) if strm_path else None,
+            imdb_id=imdb_id,
+            season=info.get("season"),
+            episode=info.get("episode"),
+            year=info.get("year"),
         )
         return catbox.proxy_url(token)
     return _get_stream_url(torrent_id, file_id)
+
+
+def _drop_unwritten_token(url: str | None) -> None:
+    """Delete the virtual item behind a proxy URL whose .strm was not written,
+    so a skipped write does not leave a row without a file."""
+    if not url or "/stream/" not in url or not settings.get("CATBOX_MODE", False):
+        return
+    token = url.rsplit("/stream/", 1)[1].strip("/")
+    if token:
+        db.delete_virtual_item(token)
 
 
 def process_torrent(item: dict, canonical_title: str | None = None,
@@ -2324,10 +2362,14 @@ def process_torrent(item: dict, canonical_title: str | None = None,
         path = _strm_path(info)
         if path.exists():
             continue
-        url = _resolve_url(item, file_id, file_name, info, info['type'] if info['type'] == 'movie' else 'series')
+        url = _resolve_url(item, file_id, file_name, info,
+                           info['type'] if info['type'] == 'movie' else 'series',
+                           strm_path=path, imdb_id=imdb_id)
         if not url:
             continue
-        if _write_strm(path, url, imdb_id=imdb_id):
+        if not _write_strm(path, url, imdb_id=imdb_id):
+            _drop_unwritten_token(url)
+        else:
             written += 1
             if imdb_id and info['type'] != 'movie' and not nfo_written:
                 series_root = path.parent.parent
@@ -2365,11 +2407,18 @@ def create_strm_for_torrent(torrent_id: int, title: str, media_type: str,
         clean_title = _safe(title[:yr.start()].strip() if yr else title)
         folder = f"{clean_title} ({year})" if year else clean_title
         path = Path(MEDIA_PATH) / 'movies' / folder / f"{folder}.strm"
+        if path.exists():
+            # Typically the lazy .strm written when the request was registered.
+            # Registering here too only left a second token that no file used.
+            return 0
         info = {'type': 'movie', 'title': clean_title, 'year': year}
-        url = _resolve_url(item, main_file['id'], main_file.get('name', ''), info, 'movie')
+        url = _resolve_url(item, main_file['id'], main_file.get('name', ''), info, 'movie',
+                           strm_path=path, imdb_id=imdb_id)
         if not url:
             return 0
         written = _write_strm(path, url, imdb_id=imdb_id)
+        if not written:
+            _drop_unwritten_token(url)
         if written and (imdb_id or tmdb_id):
             _write_nfo(path, imdb_id, tmdb_id)
         return 1 if written else 0
