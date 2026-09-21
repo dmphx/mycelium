@@ -216,13 +216,61 @@ def _session_identity(node: ET.Element) -> tuple[str, str, str, str] | None:
     return event_id, session_id, rating_key, player_id
 
 
+_PART_FILE_TTL_SECONDS = 600
+_part_file_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _plex_roots() -> list[tuple[str, str]]:
+    """Plex section roots and the library folder each one mirrors. The TV root
+    (/mnt/library/shows) names its folder "shows", not "series", so a stub
+    registered under it never matched db.find_virtual_item_by_plex_path."""
+    import media_servers
+    roots = []
+    for value, library in ((getattr(media_servers, "PLEX_TV_ROOT", ""), "/series/"),
+                           (getattr(media_servers, "PLEX_MOVIE_ROOT", ""), "/movies/")):
+        # An empty root would become "/" and claim every path.
+        if isinstance(value, str) and value.strip("/"):
+            roots.append((value.rstrip("/") + "/", library))
+    return roots
+
+
+def _library_part_path(path: str) -> str | None:
+    path = path.replace("\\", "/")
+    for root, library in _plex_roots():
+        if path.startswith(root):
+            return library + path[len(root):]
+    if "/series/" in path or "/movies/" in path:
+        return path
+    return None
+
+
+def _metadata_part_files(rating_key: str) -> list[str]:
+    """Part files from the item's metadata, cached for ten minutes: a poll
+    repeats every few seconds for as long as the session lasts."""
+    now = time.monotonic()
+    cached = _part_file_cache.get(rating_key)
+    if cached and now - cached[0] < _PART_FILE_TTL_SECONDS:
+        return cached[1]
+    try:
+        response = _plex_request("GET", f"/library/metadata/{rating_key}", timeout=5)
+        response.raise_for_status()
+        files = [part.get("file") for part in ET.fromstring(response.content).iter("Part")
+                 if part.get("file")]
+    except Exception as exc:
+        log.debug("Plex metadata lookup failed for %s: %s", rating_key, exc)
+        return []
+    if len(_part_file_cache) > 256:
+        _part_file_cache.clear()
+    _part_file_cache[rating_key] = (now, files)
+    return files
+
+
 def _session_part_path(node: ET.Element) -> str | None:
     paths = [part.get("file") for part in node.iter("Part") if part.get("file")]
-    matching = [
-        path for path in paths
-        if "/series/" in path.replace("\\", "/")
-        or "/movies/" in path.replace("\\", "/")
-    ]
+    if not paths and node.get("ratingKey"):
+        # /status/sessions often leaves Part@file out entirely.
+        paths = _metadata_part_files(node.get("ratingKey"))
+    matching = [found for found in (_library_part_path(path) for path in paths) if found]
     return matching[0] if len(matching) == 1 else None
 
 

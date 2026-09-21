@@ -77,6 +77,86 @@ def test_session_poll_queues_only_durable_real_session_start(monkeypatch):
     enrichment.db.mark_plex_playback_event_queued.assert_called_once()
 
 
+_ROOTS = [("/mnt/library/shows/", "/series/"), ("/mnt/library/movies/", "/movies/")]
+
+
+def test_session_under_the_plex_section_root_resolves(monkeypatch):
+    """Plex registers newer stubs under its TV root, /mnt/library/shows, whose
+    folder is not called "series"; those sessions never found their token."""
+    xml = b"""
+    <MediaContainer size="1">
+      <Video ratingKey="201" type="episode">
+        <Media><Part file="/mnt/library/shows/South Park/Season 29/South Park S29E01.mkv" /></Media>
+        <Player state="playing" machineIdentifier="player-a" />
+        <Session id="session-a" />
+      </Video>
+    </MediaContainer>
+    """
+    monkeypatch.setattr(enrichment, "enabled", lambda: True)
+    monkeypatch.setattr(enrichment, "_plex_roots", lambda: _ROOTS)
+    monkeypatch.setattr(enrichment, "_plex_request", lambda *a, **k: Response(xml))
+    lookup = MagicMock(return_value={"token": "token-sp"})
+    monkeypatch.setattr(enrichment.db, "find_virtual_item_by_plex_path", lookup)
+    monkeypatch.setattr(enrichment.db, "record_plex_playback_event",
+                        MagicMock(return_value=True))
+    queued = MagicMock(return_value=1)
+    monkeypatch.setattr(enrichment, "queue_from_playback", queued)
+
+    assert enrichment.poll_plex_sessions()["queued"] == 1
+    lookup.assert_called_once_with("/series/South Park/Season 29/South Park S29E01.mkv")
+    queued.assert_called_once_with("token-sp", reason="plex-session")
+
+
+def test_session_without_a_part_file_reads_the_item_metadata(monkeypatch):
+    sessions = b"""
+    <MediaContainer size="1">
+      <Video ratingKey="253209" type="episode">
+        <Media><Part id="9" /></Media>
+        <Player state="playing" machineIdentifier="player-a" />
+        <Session id="session-a" />
+      </Video>
+    </MediaContainer>
+    """
+    metadata = b"""
+    <MediaContainer size="1"><Video ratingKey="253209"><Media>
+      <Part file="/mnt/library/shows/South Park/Season 28/South Park S28E03.mkv" />
+    </Media></Video></MediaContainer>
+    """
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append(path)
+        return Response(metadata if path.startswith("/library/metadata/") else sessions)
+
+    enrichment._part_file_cache.clear()
+    monkeypatch.setattr(enrichment, "enabled", lambda: True)
+    monkeypatch.setattr(enrichment, "_plex_roots", lambda: _ROOTS)
+    monkeypatch.setattr(enrichment, "_plex_request", fake_request)
+    lookup = MagicMock(return_value={"token": "token-sp"})
+    monkeypatch.setattr(enrichment.db, "find_virtual_item_by_plex_path", lookup)
+    monkeypatch.setattr(enrichment.db, "record_plex_playback_event",
+                        MagicMock(return_value=False))
+    monkeypatch.setattr(enrichment, "queue_from_playback", MagicMock())
+
+    enrichment.poll_plex_sessions()
+    enrichment.poll_plex_sessions()
+
+    lookup.assert_called_with("/series/South Park/Season 28/South Park S28E03.mkv")
+    # Polls repeat every few seconds; the metadata is fetched once, then cached.
+    assert calls.count("/library/metadata/253209") == 1
+
+
+def test_an_empty_plex_root_never_claims_every_path(monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "media_servers", types.SimpleNamespace(
+        PLEX_TV_ROOT="", PLEX_MOVIE_ROOT=MagicMock()))
+    assert enrichment._plex_roots() == []
+    assert enrichment._library_part_path("/some/other/file.mkv") is None
+    assert enrichment._library_part_path(
+        "/spore-nfs-media/series/Show/Season 01/Show S01E01.mkv"
+    ) == "/spore-nfs-media/series/Show/Season 01/Show S01E01.mkv"
+
+
 def test_bad_session_does_not_block_another_session(monkeypatch):
     xml = b"""
     <MediaContainer size="2">
