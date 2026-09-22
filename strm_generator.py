@@ -568,12 +568,30 @@ def _fileinfo_xml(quality: str | None,
     )
 
 
+_SEASON_DIR_RE = re.compile(r"^Season\s+\d+$", re.IGNORECASE)
+
+
+def _tvshow_title(show_title: str | None, show_folder: Path) -> str:
+    """Show name for a tvshow.nfo: the caller's title, else the show folder's name.
+
+    Never the folder an episode .strm sits in. That folder is "Season NN", and
+    Jellyfin takes a show's name from its tvshow.nfo, so every show whose NFO
+    was named after it was listed as "Season 01"."""
+    for candidate in (_base_series_title(show_title), show_folder.name):
+        if (candidate and not _SEASON_DIR_RE.match(candidate)
+                and not _looks_like_placeholder_title(candidate)):
+            return candidate
+    return show_folder.name
+
+
 def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
                media_type: str = "movie", nfo_path: Path | None = None,
-               quality: str | None = None) -> None:
+               quality: str | None = None, show_title: str | None = None) -> None:
     """Write a Kodi/Jellyfin/Plex NFO sidecar. nfo_path overrides the default
     (strm_path.with_suffix('.nfo')) so callers can write tvshow.nfo anywhere.
-    Includes <fileinfo><streamdetails> so Plex knows the codec for Direct Play."""
+    Includes <fileinfo><streamdetails> so Plex knows the codec for Direct Play.
+    show_title names the show in a tvshow.nfo; without it the folder holding
+    the tvshow.nfo does."""
     if not imdb_id and not tmdb_id:
         return
     nfo_path = nfo_path or strm_path.with_suffix(".nfo")
@@ -612,10 +630,12 @@ def _write_nfo(strm_path: Path, imdb_id: str | None, tmdb_id: int | None = None,
             f"<episodedetails>\n{uid_tags}{fileinfo}</episodedetails>\n"
         )
     else:
-        # tvshow.nfo - no fileinfo needed (Plex reads episode NFOs for codec info)
+        # tvshow.nfo - no fileinfo needed (Plex reads episode NFOs for codec info).
+        # strm_path is usually an episode, whose folder is "Season NN".
+        safe_show = _xml_escape(_tvshow_title(show_title, nfo_path.parent))
         content = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-            f"<tvshow>\n  <title>{safe_title}</title>\n{uid_tags}</tvshow>\n"
+            f"<tvshow>\n  <title>{safe_show}</title>\n{uid_tags}</tvshow>\n"
         )
     try:
         atomic_write_text(nfo_path, content)
@@ -1315,6 +1335,7 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     # the placeholder and Plex stores the show as an unmatched "TmdbNNNNN".
     # Movies already do this via _canonical_movie_folder.
     title = _base_series_title(title)
+    show_title = title  # the caller's name for the show, before folder resolution
     if imdb_id or _looks_like_placeholder_title(title):
         resolved = _canonical_series_folder(imdb_id, fallback_title=title)
         if resolved:
@@ -1364,7 +1385,8 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
             series_root = path.parent.parent
             tvshow_nfo = series_root / "tvshow.nfo"
             if not tvshow_nfo.exists():
-                _write_nfo(path, imdb_id, nfo_path=tvshow_nfo, media_type="series")
+                _write_nfo(path, imdb_id, nfo_path=tvshow_nfo, media_type="series",
+                           show_title=show_title)
             # Per-episode NFO with codec info so Plex can make playback decisions
             _write_nfo(path, imdb_id, media_type="episode", quality=quality)
             try:
@@ -2375,7 +2397,8 @@ def process_torrent(item: dict, canonical_title: str | None = None,
                 series_root = path.parent.parent
                 tvshow_nfo = series_root / "tvshow.nfo"
                 if not tvshow_nfo.exists():
-                    _write_nfo(path, imdb_id, tmdb_id=tmdb_id, nfo_path=tvshow_nfo, media_type="series")
+                    _write_nfo(path, imdb_id, tmdb_id=tmdb_id, nfo_path=tvshow_nfo,
+                               media_type="series", show_title=canonical_title)
                 nfo_written = True
 
     return written

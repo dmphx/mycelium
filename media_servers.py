@@ -137,6 +137,26 @@ def request_reanalyze(strm_path):
     _enqueue(strm_path, "analyze")
 
 
+def refresh_jellyfin_folders(folders):
+    """Ask Jellyfin to re-read the metadata files of these library folders.
+
+    Jellyfin reads a show's tvshow.nfo when it scans the show, so an NFO
+    rewritten in place stays unread until something rescans that folder. A
+    "Modified" update makes Jellyfin refresh the item at that path. Plex is
+    left out on purpose: it ignores NFO files. Returns the number of folders sent."""
+    updates = []
+    for folder in folders:
+        try:
+            rel = Path(folder).relative_to(Path(MEDIA_PATH))
+        except ValueError:
+            continue
+        updates.append({"Path": "%s/%s" % (JF_LIBRARY_ROOT, rel.as_posix()),
+                        "UpdateType": "Modified"})
+    if updates:
+        _scan_jellyfin(updates)
+    return len(updates)
+
+
 def _enqueue(strm_path, mode):
     info = _top_folder(strm_path)
     if not info:

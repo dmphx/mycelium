@@ -230,15 +230,21 @@ def repair_tvshow_titles() -> dict:
     Uses (in order of preference):
       1. Canonical title from monitored_series table (by imdb_id)
       2. Folder name stripped of trailing region codes like (IN) or (ZA)
+
+    Jellyfin is then asked to re-read the repaired shows. It reads a show's
+    name when it scans the show, so a file fixed in place is otherwise never
+    seen and the show keeps the bad name.
     """
     media = Path(MEDIA_PATH)
     series_dir = media / "series"
     if not series_dir.is_dir():
-        return {"fixed": 0, "skipped": 0}
+        return {"fixed": 0, "skipped": 0, "unreadable": 0}
 
     monitored_by_imdb = {s["imdb_id"]: s["title"] for s in db.get_all_monitored_series()}
 
     fixed = skipped = 0
+    repaired: list[Path] = []
+    unreadable: list[str] = []
     for folder in sorted(series_dir.iterdir()):
         if not folder.is_dir():
             continue
@@ -247,6 +253,9 @@ def repair_tvshow_titles() -> dict:
             continue
         try:
             root = ET.parse(nfo_path).getroot()
+        except PermissionError:
+            unreadable.append(folder.name)
+            continue
         except Exception:
             continue
 
@@ -270,12 +279,24 @@ def repair_tvshow_titles() -> dict:
             atomic_write_text(nfo_path, _tvshow_nfo(correct_title, imdb_id))
             log.info("NFO repair: '%s' -> '%s' (%s)", title_el.text.strip(), correct_title, nfo_path)
             fixed += 1
+            repaired.append(folder)
         except Exception as exc:
             log.warning("NFO repair: could not write %s: %s", nfo_path, exc)
             skipped += 1
 
+    if unreadable:
+        log.warning("NFO repair: %d tvshow.nfo file(s) could not be read, so their titles "
+                    "were not checked (owned by another user?): %s",
+                    len(unreadable), ", ".join(unreadable[:20]))
+    if repaired:
+        try:
+            import media_servers
+            media_servers.refresh_jellyfin_folders(repaired)
+        except Exception as exc:
+            log.warning("NFO repair: could not ask Jellyfin to re-read %d show(s): %s",
+                        len(repaired), exc)
     log.info("NFO repair complete: %d fixed, %d skipped", fixed, skipped)
-    return {"fixed": fixed, "skipped": skipped}
+    return {"fixed": fixed, "skipped": skipped, "unreadable": len(unreadable)}
 
 
 def _read_imdb_from_nfo(nfo_path: Path) -> str | None:

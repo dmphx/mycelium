@@ -112,3 +112,57 @@ def test_routine_nfo_pass_skips_untracked_folders_without_tmdb_search(tmp_path, 
     assert result == {"movies": 0, "series": 0}
     assert not (movie / "Unmatched Movie.nfo").exists()
     assert not (series / "tvshow.nfo").exists()
+
+
+def _show(tmp_path, name, title, imdb):
+    folder = tmp_path / "series" / name
+    folder.mkdir(parents=True)
+    (folder / "tvshow.nfo").write_text(
+        f'<tvshow><title>{title}</title>'
+        f'<uniqueid type="imdb" default="true">{imdb}</uniqueid></tvshow>',
+        encoding="utf-8",
+    )
+    return folder
+
+
+def test_title_repair_asks_jellyfin_to_reread_the_repaired_shows(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    bad = _show(tmp_path, "999 On the Front Line", "Season 14", "tt9020422")
+    good = _show(tmp_path, "The Hack", "The Hack", "tt35615598")
+    monkeypatch.setattr(nfo_generator, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(nfo_generator.db, "get_all_monitored_series", lambda: [
+        {"imdb_id": "tt9020422", "title": "999: On the Front Line"}])
+    sent = []
+    monkeypatch.setitem(sys.modules, "media_servers", types.SimpleNamespace(
+        refresh_jellyfin_folders=lambda folders: sent.append(list(folders))))
+
+    result = nfo_generator.repair_tvshow_titles()
+
+    assert result == {"fixed": 1, "skipped": 0, "unreadable": 0}
+    assert ET.parse(bad / "tvshow.nfo").getroot().findtext("title") == "999: On the Front Line"
+    assert ET.parse(good / "tvshow.nfo").getroot().findtext("title") == "The Hack"
+    assert sent == [[bad]]
+
+
+def test_title_repair_reports_nfos_it_cannot_read(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    _show(tmp_path, "Hitler's Last Stand", "Season 01", "tt8675140")
+    monkeypatch.setattr(nfo_generator, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(nfo_generator.db, "get_all_monitored_series", lambda: [])
+    sent = []
+    monkeypatch.setitem(sys.modules, "media_servers", types.SimpleNamespace(
+        refresh_jellyfin_folders=lambda folders: sent.append(list(folders))))
+
+    def root_owned(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(nfo_generator.ET, "parse", root_owned)
+
+    result = nfo_generator.repair_tvshow_titles()
+
+    assert result == {"fixed": 0, "skipped": 0, "unreadable": 1}
+    assert sent == []

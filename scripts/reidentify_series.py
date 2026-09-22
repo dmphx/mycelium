@@ -570,7 +570,8 @@ def _ensure_right_show(db, strm_generator, plan: dict, args) -> dict:
         # so any name inside series_root gives it the right one.
         strm_generator._write_nfo(series_root / "show.strm", right_imdb,
                                   tmdb_id=plan.get("right_tmdb_id"),
-                                  media_type="series", nfo_path=tvshow_nfo)
+                                  media_type="series", nfo_path=tvshow_nfo,
+                                  show_title=title)
         before["created"].append(str(tvshow_nfo))
         try:
             import nfo_generator
@@ -728,7 +729,8 @@ def _retitle_folder_nfo(db, strm_generator, plan: dict, backup_dir: Path) -> boo
     nfo.unlink()
     strm_generator._write_nfo(folder / "show.strm", right_imdb,
                               tmdb_id=plan.get("right_tmdb_id"),
-                              media_type="series", nfo_path=nfo)
+                              media_type="series", nfo_path=nfo,
+                              show_title=plan.get("right_title"))
     print(f"    tvshow.nfo in {folder.name}: {current} -> {right_imdb}")
     return True
 

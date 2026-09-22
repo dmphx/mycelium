@@ -276,6 +276,7 @@ class TestProcessTorrentCanonicalTitle:
         nfo = folder / "tvshow.nfo"
         assert nfo.exists()
         assert "tt0092359" in nfo.read_text()
+        assert "<title>Full House</title>" in nfo.read_text()
 
     def test_two_differently_named_torrents_land_in_same_folder(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
@@ -781,3 +782,72 @@ class TestCreateStrmForTorrentMovie:
         assert len(fake.calls) == 1
         fake_db.delete_virtual_item.assert_called_once_with("tok1")
         assert not (Path(tmp_path) / "movies" / "The Odyssey").exists()
+
+
+def _nfo_title(path):
+    import xml.etree.ElementTree as ET
+    return ET.parse(path).getroot().findtext("title")
+
+
+class TestTvshowNfoTitle:
+    """A tvshow.nfo names the show, and Jellyfin lists the show under that name."""
+
+    def _episode(self, tmp_path, show="The Hack", season="Season 01"):
+        strm = Path(tmp_path) / "series" / show / season / f"{show} S01E01.strm"
+        strm.parent.mkdir(parents=True)
+        return strm
+
+    def test_without_show_title_uses_show_folder_not_season(self, tmp_path):
+        strm = self._episode(tmp_path)
+        nfo = strm.parent.parent / "tvshow.nfo"
+        sg._write_nfo(strm, "tt35615598", nfo_path=nfo, media_type="series")
+        assert _nfo_title(nfo) == "The Hack"
+
+    def test_show_title_wins_and_is_escaped(self, tmp_path):
+        strm = self._episode(tmp_path, show="Law Order", season="Season 14")
+        nfo = strm.parent.parent / "tvshow.nfo"
+        sg._write_nfo(strm, "tt0098844", nfo_path=nfo, media_type="series",
+                      show_title="Law & Order")
+        assert _nfo_title(nfo) == "Law & Order"
+
+    def test_season_label_or_id_placeholder_falls_back_to_folder(self, tmp_path):
+        for bad in ("Season 01", "tt35615598", "", None):
+            strm = self._episode(tmp_path / str(bad))
+            nfo = strm.parent.parent / "tvshow.nfo"
+            sg._write_nfo(strm, "tt35615598", nfo_path=nfo, media_type="series",
+                          show_title=bad)
+            assert _nfo_title(nfo) == "The Hack", bad
+
+    def test_movie_nfo_still_titled_from_its_folder(self, tmp_path):
+        strm = Path(tmp_path) / "movies" / "Heat (1995)" / "Heat (1995).strm"
+        strm.parent.mkdir(parents=True)
+        sg._write_nfo(strm, "tt0113277")
+        nfo = strm.with_suffix(".nfo")
+        assert _nfo_title(nfo) == "Heat"
+        assert "<year>1995</year>" in nfo.read_text()
+
+    def _lazy(self, tmp_path, monkeypatch, title, folder):
+        fake, fake_db = _catbox_mode(monkeypatch, tmp_path)
+        fake_db.get_virtual_item_by_episode.return_value = None
+        monkeypatch.setattr(sg, "_canonical_series_folder",
+                            lambda imdb_id, fallback_title=None: folder)
+        monkeypatch.setattr(sg, "_write_spore_stubs", lambda *a, **kw: None)
+
+        def write_strm(path, url, imdb_id=None):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(url)
+            return True
+
+        monkeypatch.setattr(sg, "_write_strm", write_strm)
+        assert sg.create_lazy_episode_strm("e" * 40, "magnet:?xt=urn:btih:" + "e" * 40,
+                                           title, 14, 1, imdb_id="tt9020422")
+        return Path(tmp_path) / "series" / folder / "tvshow.nfo"
+
+    def test_lazy_episode_names_the_show(self, tmp_path, monkeypatch):
+        nfo = self._lazy(tmp_path, monkeypatch, "999: On the Front Line",
+                         "999 On the Front Line")
+        assert _nfo_title(nfo) == "999: On the Front Line"
+
+    def test_lazy_episode_with_placeholder_title_uses_folder(self, tmp_path, monkeypatch):
+        nfo = self._lazy(tmp_path, monkeypatch, "tt9020422", "999 On the Front Line")
+        assert _nfo_title(nfo) == "999 On the Front Line"
