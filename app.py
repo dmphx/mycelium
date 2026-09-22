@@ -870,13 +870,6 @@ def _check_auth() -> None:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() == "bearer":
             presented.append(token.strip())
-    query_secret = request.args.get("secret")
-    if query_secret:
-        # Deprecated: secret in query string leaks via access logs and proxy history.
-        log.warning("Webhook secret passed via ?secret= query param from %s"
-                    " - send it in the Authorization or X-Webhook-Secret header instead",
-                    request.remote_addr)
-        presented.append(query_secret)
     # Constant-time compare to avoid leaking the secret one character at a time
     # via response-time side-channels. Compare bytes: compare_digest raises on a
     # non-ASCII str, which would turn a garbage credential into a 500.

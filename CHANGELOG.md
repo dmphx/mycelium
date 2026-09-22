@@ -35,8 +35,8 @@ All notable changes to Mycelium are documented in this file.
 - The Seerr webhook accepts its secret in the `Authorization` header, raw or
   as `Bearer <secret>`, so Seerr's "Authorization Header" field works and the
   secret no longer has to ride in the webhook URL. `X-Webhook-Secret` still
-  works; `?secret=` still works but is deprecated and logs a warning whenever
-  it is present. A non-ASCII credential now gets a 401 instead of a 500
+  works; `?secret=` is rejected now that managed callers have migrated. A
+  non-ASCII credential gets a 401 instead of a 500
 - A versioned, read-only Discord integration API protected by a dedicated bearer token
 - Sanitized health, request, playability, dependency, and TorBox summaries
 - Cursor-based activity events that omit paths, hashes, URLs, and requester identity

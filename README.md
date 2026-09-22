@@ -463,7 +463,7 @@ flowchart LR
 ## 🔒 Security
 
 - All UI and API routes require login. CSRF protection on all forms.
-- **Webhook secret** auto-generated on first start, shown in Admin > Integration Endpoints. In Seerr/Jellyseerr, paste it into the webhook agent's **Authorization Header** field, which is sent as the `Authorization` header (the raw secret or `Bearer <secret>` both work). Other callers can use the `X-Webhook-Secret` header. The `?secret=<secret>` query parameter still works but is deprecated, because it puts the secret in access logs. Override the secret with `WEBHOOK_SECRET` in `.env`.
+- **Webhook secret** auto-generated on first start, shown in Admin > Integration Endpoints. In Seerr/Jellyseerr, paste it into the webhook agent's **Authorization Header** field, which is sent as the `Authorization` header (the raw secret or `Bearer <secret>` both work). Other callers can use the `X-Webhook-Secret` header. Query-string credentials are rejected because URLs are commonly retained in access logs. Override the secret with `WEBHOOK_SECRET` in `.env`.
 - `/setup` locked after first run - admin only via Settings > Re-run wizard.
 - `/metrics` requires admin session or `X-Metrics-Token` header (`METRICS_TOKEN` in `.env`).
 - `/health/discord/v1/*` requires `Authorization: Bearer <MYCELIUM_BOT_TOKEN>` and returns only sanitized, read-only operational data.

@@ -5,8 +5,8 @@ Seerr's webhook agent can send exactly one credential: its "Authorization
 Header" setting, verbatim as the Authorization header. Accepting that header
 (raw or as "Bearer <secret>") lets Seerr call the plain /webhook URL instead of
 carrying the secret in ?secret=, where it lands in access logs and in Seerr's
-saved settings. X-Webhook-Secret keeps working, and ?secret= keeps working with
-a deprecation warning until every caller has moved to a header.
+saved settings. X-Webhook-Secret remains supported; query-string credentials
+fail closed now that every managed caller uses a header.
 """
 import logging
 import os
@@ -43,7 +43,6 @@ from werkzeug.exceptions import Unauthorized  # noqa: E402
 import app as app_mod  # noqa: E402
 
 SECRET = "test-webhook-secret"
-DEPRECATION = "passed via ?secret="
 NON_ASCII = "caf" + chr(0xE9)
 
 
@@ -73,7 +72,7 @@ def _check(headers=None, query=None):
 ])
 def test_authorization_header_is_accepted(value, warnings):
     _check(headers={"Authorization": value})
-    assert DEPRECATION not in warnings.text
+    assert "?secret=" not in warnings.text
 
 
 @pytest.mark.parametrize("value", [
@@ -92,7 +91,7 @@ def test_wrong_authorization_header_is_rejected(value):
 
 def test_x_webhook_secret_header_is_still_accepted(warnings):
     _check(headers={"X-Webhook-Secret": SECRET})
-    assert DEPRECATION not in warnings.text
+    assert "?secret=" not in warnings.text
 
 
 def test_wrong_x_webhook_secret_is_rejected():
@@ -100,17 +99,14 @@ def test_wrong_x_webhook_secret_is_rejected():
         _check(headers={"X-Webhook-Secret": "wrong"})
 
 
-def test_query_secret_is_still_accepted_with_a_deprecation_warning(warnings):
-    _check(query={"secret": SECRET})
-    assert DEPRECATION in warnings.text
-    # The warning names the transport, never the value.
-    assert SECRET not in warnings.text
+def test_query_secret_is_rejected_even_when_correct():
+    with pytest.raises(Unauthorized):
+        _check(query={"secret": SECRET})
 
 
-def test_query_secret_next_to_a_header_still_warns(warnings):
-    # The secret is in the URL either way, so it is in the access log too.
+def test_query_secret_next_to_a_valid_header_is_ignored(warnings):
     _check(headers={"Authorization": SECRET}, query={"secret": SECRET})
-    assert DEPRECATION in warnings.text
+    assert "?secret=" not in warnings.text
 
 
 def test_wrong_query_secret_is_rejected():
