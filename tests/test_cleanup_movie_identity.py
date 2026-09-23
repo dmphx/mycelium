@@ -20,6 +20,7 @@ def test_movie_rename_skips_folder_with_mixed_identity(monkeypatch, tmp_path):
     (folder / "Breakdown 1975 (2025).strm").write_text("stream", encoding="utf-8")
     fake_db = SimpleNamespace(
         get_virtual_item_imdb_ids_under_path=lambda path: {"tt38985973"},
+        get_movie_strm_paths=lambda: [("tt38985973", str(folder / "movie.strm"))],
     )
     monkeypatch.setattr(cleanup, "db", fake_db)
     monkeypatch.setattr(cleanup, "MEDIA_PATH", str(tmp_path))
@@ -46,6 +47,7 @@ def test_movie_merge_excludes_folder_with_mixed_identity(monkeypatch, tmp_path):
     fake_db = SimpleNamespace(
         get_virtual_item_imdb_ids_under_path=identities,
         get_media_items=lambda media_type=None: [],
+        get_movie_strm_paths=lambda: [("tt38985973", str(mixed / "movie.strm"))],
     )
     monkeypatch.setattr(cleanup, "db", fake_db)
     monkeypatch.setattr(cleanup, "MEDIA_PATH", str(tmp_path))

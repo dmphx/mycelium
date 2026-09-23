@@ -6,6 +6,11 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Daily cleanup now groups series only from NFO or row-backed IMDb identity,
+  isolates unreadable files and failed moves instead of aborting the run, and
+  safely binds legacy Catbox rows whose `strm_path` is still null. Healthy
+  Catbox files no longer incur a two-second delay each during the scan, and
+  identity checks use bounded database reads instead of per-folder queries
 - Watching an episode no longer prepares the next one before it has aired,
   next-episode preparation applies the same episode-title identity check as
   the wanted-episode search, and releases named as executables (a common fake

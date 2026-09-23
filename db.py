@@ -1474,6 +1474,17 @@ def get_series_strm_paths() -> list[tuple[str, str]]:
     return [(r["imdb_id"], r["strm_path"]) for r in rows]
 
 
+def get_movie_strm_paths() -> list[tuple[str, str]]:
+    """Return movie IMDb IDs and paths for identity-safe folder cleanup."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT imdb_id, strm_path FROM virtual_items
+               WHERE media_type='movie' AND imdb_id IS NOT NULL
+                 AND strm_path IS NOT NULL"""
+        ).fetchall()
+    return [(r["imdb_id"], r["strm_path"]) for r in rows]
+
+
 def get_virtual_item_by_episode(imdb_id: str, season: int, episode: int) -> dict | None:
     """Return the virtual_item for a specific series episode, or None if not registered."""
     with _connect() as conn:
@@ -1594,6 +1605,17 @@ def update_virtual_item_strm_path(old_path: str, new_path: str) -> int:
         cur = conn.execute(
             "UPDATE virtual_items SET strm_path=? WHERE strm_path=?",
             (new_path, old_path),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def update_virtual_item_strm_path_if_unset(token: str, new_path: str) -> int:
+    """Bind a legacy Catbox row to its file only while strm_path is NULL."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE virtual_items SET strm_path=? WHERE token=? AND strm_path IS NULL",
+            (new_path, token),
         )
         conn.commit()
         return cur.rowcount

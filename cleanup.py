@@ -28,6 +28,8 @@ _TORRENT_ID_RE = re.compile(r"torrent_id[=:](\d+)", re.IGNORECASE)
 _FILE_ID_RE = re.compile(r"file_id[=:](\d+)", re.IGNORECASE)
 _EP_FILENAME_RE = re.compile(r"S(\d{1,2})E(\d{1,2})", re.IGNORECASE)
 _QUALITY_TIER_RE = re.compile(r'\b(2160[pi]?|4[Kk]|UHD|1080[pi]?|720[pi]?|480[pi]?)\b', re.IGNORECASE)
+_STREAM_TOKEN_RE = re.compile(r"/stream/([A-Za-z0-9_-]+)/*(?:[?#].*)?$")
+_IMDB_ID_RE = re.compile(r"^tt\d+$")
 
 
 def _extract_file_id(strm_url: str) -> str | None:
@@ -52,6 +54,53 @@ def _extract_torrent_id(strm_url: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _extract_stream_token(strm_url: str) -> str | None:
+    match = _STREAM_TOKEN_RE.search(strm_url.strip())
+    return match.group(1) if match else None
+
+
+def _repoint_moved_series_strm(old_path: Path, new_path: Path, content: str) -> bool:
+    """Move a virtual-item binding without stealing a token from another path.
+
+    Old orphan rows can have a NULL strm_path. In that case the token embedded
+    in the Catbox URL is the only safe key. A token already bound anywhere else
+    is a conflict and leaves the source file in place.
+    """
+    if db.update_virtual_item_strm_path(str(old_path), str(new_path)) > 0:
+        return True
+
+    token = _extract_stream_token(content)
+    if not token:
+        log.warning("No virtual item row or Catbox token for %s", old_path)
+        return False
+
+    row = db.get_virtual_item(token)
+    if not row:
+        log.warning("Catbox token %s from %s has no virtual item row", token, old_path)
+        return False
+
+    bound_path = row.get("strm_path")
+    if bound_path == str(new_path):
+        return True
+    if bound_path:
+        log.warning(
+            "Catbox token %s from %s is already bound to %s",
+            token, old_path, bound_path,
+        )
+        return False
+
+    if db.update_virtual_item_strm_path_if_unset(token, str(new_path)) == 1:
+        return True
+
+    # A concurrent worker may have completed the same safe re-point between the
+    # read and conditional update. Re-read before declaring a conflict.
+    row = db.get_virtual_item(token)
+    if row and row.get("strm_path") == str(new_path):
+        return True
+    log.warning("Could not bind Catbox token %s to %s", token, new_path)
+    return False
 
 
 def _parse_folder_name(folder: str) -> tuple[str, int | None]:
@@ -487,7 +536,6 @@ def merge_series_duplicates() -> int:
     if not series_base.is_dir():
         return 0
 
-    items_by_title = {m["title"]: m["imdb_id"] for m in db.get_media_items()}
     monitored = {s["imdb_id"]: s["title"] for s in db.get_all_monitored_series()}
 
     def _nfo_imdb(folder: Path) -> str | None:
@@ -499,29 +547,49 @@ def merge_series_duplicates() -> int:
             for uid in root.findall("uniqueid"):
                 if uid.get("type") == "imdb" and uid.text:
                     return uid.text.strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not read series identity from %s: %s", nfo, exc)
         return None
 
-    # Group folders by resolved IMDb ID
+    # Build row evidence in one query. Opening SQLite once per folder makes a
+    # cleanup over a large library take hours on user shares.
+    row_ids_by_folder: dict[Path, set[str]] = {}
+    try:
+        series_paths = db.get_series_strm_paths()
+    except Exception as exc:
+        log.warning("Could not load series row identities, skipping series merge: %s", exc)
+        return 0
+    for imdb_id, strm_path in series_paths:
+        try:
+            relative = Path(strm_path).relative_to(series_base)
+        except ValueError:
+            continue
+        if relative.parts:
+            row_ids_by_folder.setdefault(series_base / relative.parts[0], set()).add(imdb_id)
+
+    # Group only on identities carried by the folder or by rows below it.
+    # Title search is unsuitable for destructive cleanup: similarly named
+    # editions, national versions and revivals can resolve to the same result.
     groups: dict[str, list[Path]] = {}
     for folder in series_base.iterdir():
         if not folder.is_dir():
             continue
-        # Primary: read directly from tvshow.nfo (always correct when present)
-        imdb_id = _nfo_imdb(folder)
-        if not imdb_id:
-            imdb_id = items_by_title.get(folder.name)
-        if not imdb_id or imdb_id.startswith("unknown_"):
-            clean = _series_clean_title(folder.name)
-            if clean:
-                try:
-                    imdb_id = tmdb.search_tv(clean)
-                    time.sleep(0.15)
-                except Exception:
-                    imdb_id = None
-        if imdb_id and not imdb_id.startswith("unknown_"):
-            groups.setdefault(imdb_id, []).append(folder)
+        nfo_id = _nfo_imdb(folder)
+        row_ids = row_ids_by_folder.get(folder, set())
+        identities = {
+            str(imdb_id) for imdb_id in row_ids
+            if imdb_id and _IMDB_ID_RE.fullmatch(str(imdb_id))
+        }
+        if nfo_id and _IMDB_ID_RE.fullmatch(nfo_id):
+            identities.add(nfo_id)
+        if len(identities) > 1:
+            log.warning(
+                "Series folder identity conflict: %s has identities %s; skipping merge",
+                folder, sorted(identities),
+            )
+            continue
+        if len(identities) == 1:
+            groups.setdefault(next(iter(identities)), []).append(folder)
 
     removed = 0
     for imdb_id, folders in groups.items():
@@ -548,7 +616,12 @@ def merge_series_duplicates() -> int:
             for item in list(dup.iterdir()):
                 if item.is_dir() and _SEASON_DIR_RE.match(item.name):
                     dest_season = canonical / item.name
-                    dest_season.mkdir(exist_ok=True)
+                    try:
+                        dest_season.mkdir(exist_ok=True)
+                    except Exception as exc:
+                        log.warning("Could not create season folder %s: %s", dest_season, exc)
+                        fully_merged = False
+                        continue
                     for strm in list(item.glob("*.strm")):
                         ep_m = _EP_RE2.search(strm.stem)
                         if ep_m:
@@ -563,8 +636,15 @@ def merge_series_duplicates() -> int:
                             log.warning("Could not read strm %s, leaving in place: %s", strm, exc)
                             fully_merged = False
                             continue
-                        if dest.exists():
-                            if dest.read_text(encoding="utf-8") != content:
+                        dest_existed = dest.exists()
+                        if dest_existed:
+                            try:
+                                destination_content = dest.read_text(encoding="utf-8")
+                            except Exception as exc:
+                                log.warning("Could not read destination strm %s: %s", dest, exc)
+                                fully_merged = False
+                                continue
+                            if destination_content != content:
                                 log.warning(
                                     "Duplicate strm %s differs from existing %s - keeping source, skipping folder removal",
                                     strm, dest,
@@ -578,8 +658,22 @@ def merge_series_duplicates() -> int:
                                 log.warning("Could not copy strm %s: %s", strm, exc)
                                 fully_merged = False
                                 continue
-                        db.update_virtual_item_strm_path(str(strm), str(dest))
-                        strm.unlink(missing_ok=True)
+                        if not _repoint_moved_series_strm(strm, dest, content):
+                            # Roll back a newly-created destination when its DB
+                            # binding could not be moved. Existing destinations
+                            # are never removed here.
+                            if not dest_existed:
+                                try:
+                                    dest.unlink(missing_ok=True)
+                                except Exception as exc:
+                                    log.warning("Could not roll back unbound strm %s: %s", dest, exc)
+                            fully_merged = False
+                            continue
+                        try:
+                            strm.unlink(missing_ok=True)
+                        except Exception as exc:
+                            log.warning("Could not remove merged source strm %s: %s", strm, exc)
+                            fully_merged = False
                 elif item.is_dir():
                     # Non-season subfolder (extras, etc.) - leave it, don't delete the parent.
                     fully_merged = False
@@ -602,9 +696,10 @@ def merge_series_duplicates() -> int:
 def rename_messy_series_folders() -> int:
     """Rename series folders whose name doesn't match the canonical DB title.
 
-    Reads IMDb ID from tvshow.nfo → looks up monitored_series.title → renames
-    the folder and updates virtual_items.strm_path so catbox proxy URLs keep
-    working.  Returns number of folders renamed."""
+    Reads IMDb ID from tvshow.nfo, looks up monitored_series.title, renames the
+    folder and updates virtual_items.strm_path so Catbox proxy URLs keep
+    working. Unmonitored folders are left alone instead of making thousands of
+    remote title lookups during daily cleanup. Returns number renamed."""
     import xml.etree.ElementTree as ET
 
     series_base = Path(MEDIA_PATH) / "series"
@@ -633,16 +728,6 @@ def rename_messy_series_folders() -> int:
             continue
 
         canonical_title = monitored.get(imdb_id)
-        if not canonical_title:
-            # Not in monitored_series  -  ask TMDB for the official title
-            try:
-                tmdb_id = tmdb.find_by_imdb(imdb_id, kind="tv")
-                if tmdb_id:
-                    info = tmdb.get_show_info(tmdb_id)
-                    canonical_title = (info or {}).get("name") or None
-                time.sleep(0.15)
-            except Exception:
-                pass
         if not canonical_title:
             continue
 
@@ -694,9 +779,14 @@ def _movie_nfo_info(folder: Path) -> tuple[str | None, int | None, str | None]:
         return None, None, None
 
 
-def _movie_folder_identity_matches(folder: Path, nfo_imdb_id: str) -> bool:
+def _movie_folder_identity_matches(
+    folder: Path,
+    nfo_imdb_id: str,
+    virtual_ids: set[str] | None = None,
+) -> bool:
     """Fail closed when a folder's NFO and virtual items name different films."""
-    virtual_ids = db.get_virtual_item_imdb_ids_under_path(str(folder))
+    if virtual_ids is None:
+        virtual_ids = db.get_virtual_item_imdb_ids_under_path(str(folder))
     if virtual_ids and virtual_ids != {nfo_imdb_id}:
         log.warning(
             "Movie folder identity conflict: %s has NFO %s but virtual items %s; "
@@ -707,6 +797,24 @@ def _movie_folder_identity_matches(folder: Path, nfo_imdb_id: str) -> bool:
     return True
 
 
+def _movie_row_identities(movies_base: Path) -> dict[Path, set[str]] | None:
+    """Load movie row identities in one SQLite query and group them by folder."""
+    try:
+        movie_paths = db.get_movie_strm_paths()
+    except Exception as exc:
+        log.warning("Could not load movie row identities, skipping movie cleanup: %s", exc)
+        return None
+    by_folder: dict[Path, set[str]] = {}
+    for imdb_id, strm_path in movie_paths:
+        try:
+            relative = Path(strm_path).relative_to(movies_base)
+        except ValueError:
+            continue
+        if relative.parts:
+            by_folder.setdefault(movies_base / relative.parts[0], set()).add(imdb_id)
+    return by_folder
+
+
 def merge_movie_duplicates() -> int:
     """Merge movie folders that resolve to the same IMDb ID into one canonical
     folder. Reads IMDb from .nfo; falls back to virtual_items. Returns count removed."""
@@ -714,6 +822,9 @@ def merge_movie_duplicates() -> int:
 
     movies_base = Path(MEDIA_PATH) / "movies"
     if not movies_base.is_dir():
+        return 0
+    row_ids_by_folder = _movie_row_identities(movies_base)
+    if row_ids_by_folder is None:
         return 0
 
     # Build imdb_id → canonical title mapping from DB requests
@@ -731,7 +842,9 @@ def merge_movie_duplicates() -> int:
         title, year, imdb_id = _movie_nfo_info(folder)
         if not imdb_id:
             continue
-        if not _movie_folder_identity_matches(folder, imdb_id):
+        if not _movie_folder_identity_matches(
+            folder, imdb_id, row_ids_by_folder.get(folder, set())
+        ):
             continue
         groups.setdefault(imdb_id, []).append(folder)
 
@@ -784,6 +897,9 @@ def rename_messy_movie_folders() -> int:
     movies_base = Path(MEDIA_PATH) / "movies"
     if not movies_base.is_dir():
         return 0
+    row_ids_by_folder = _movie_row_identities(movies_base)
+    if row_ids_by_folder is None:
+        return 0
 
     renamed = 0
     for folder in list(movies_base.iterdir()):
@@ -792,7 +908,9 @@ def rename_messy_movie_folders() -> int:
         title, year, imdb_id = _movie_nfo_info(folder)
         if not title or not year:
             continue
-        if imdb_id and not _movie_folder_identity_matches(folder, imdb_id):
+        if imdb_id and not _movie_folder_identity_matches(
+            folder, imdb_id, row_ids_by_folder.get(folder, set())
+        ):
             continue
         import strm_generator as _sg
         canonical_name = _sg._safe(f"{title} ({year})")
@@ -897,7 +1015,10 @@ def _run_cleanup_locked() -> None:
         except _RateLimitedError:
             log.warning("Cleanup: TorBox rate limit hit  -  stopping repairs for this run")
             break
-        time.sleep(2)
+        # Healthy entries, including every Catbox proxy, need no network work.
+        # Sleeping for each one made a 98k-file scan take more than 54 hours.
+        if result != "ok":
+            time.sleep(2)
         if result == "repaired":
             repaired += 1
             changed = True
