@@ -980,7 +980,7 @@ def _run_cleanup_locked() -> None:
     if not strm_files:
         db.update_cleanup_run(run_id, 0, 0, 0, 0)
         if orphan_removed:
-            strm_generator.run_and_refresh()
+            strm_generator.run_and_refresh(maintenance_held=True)
         return
 
     try:
@@ -1042,5 +1042,5 @@ def _run_cleanup_locked() -> None:
              scanned, repaired, deleted, unfixable)
 
     if changed:
-        strm_generator.run_and_refresh()
+        strm_generator.run_and_refresh(maintenance_held=True)
         jellyfin.refresh_library()

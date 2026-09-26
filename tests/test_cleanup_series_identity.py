@@ -261,11 +261,16 @@ def test_cleanup_sleeps_only_after_a_repair_attempt(monkeypatch, tmp_path):
     monkeypatch.setattr(cleanup, "_repair_strm", lambda path, run_id, mylist: next(results))
     monkeypatch.setattr(cleanup.torbox, "list_torrents", lambda: [])
     monkeypatch.setattr(cleanup.time, "sleep", lambda seconds: sleeps.append(seconds))
-    monkeypatch.setattr(cleanup.strm_generator, "run_and_refresh", lambda: refreshes.append("strm"))
+    monkeypatch.setattr(
+        cleanup.strm_generator, "run_and_refresh",
+        lambda maintenance_held=False: refreshes.append(("strm", maintenance_held)),
+    )
     monkeypatch.setattr(cleanup.jellyfin, "refresh_library", lambda: refreshes.append("jellyfin"))
 
     cleanup._run_cleanup_locked()
 
     assert sleeps == [2]
     assert updates[-1] == (42, 2, 1, 0, 0)
-    assert refreshes == ["strm", "jellyfin"]
+    # Cleanup holds _maintenance_lock, so its own rebuild must say so or it
+    # would defer itself.
+    assert refreshes == [("strm", True), "jellyfin"]

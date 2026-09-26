@@ -2575,15 +2575,25 @@ def create_movie_strm_from_url(title: str, url: str) -> Path | None:
         return None
 
 
-def _run_once_catbox() -> int:
+def _run_once_catbox(maintenance_held: bool = False) -> int:
     """Catbox mode: rebuild any .strm files that are missing from disk.
 
     virtual_items is the source of truth  -  torrents are not in TorBox when
     idle-released, so scanning mylist would find nothing.
+
+    The row list is a snapshot, and checking ~100k paths takes minutes. Cleanup
+    renames and merges show folders under _maintenance_lock during that time
+    and rebinds the rows, so a snapshot path can look missing only because its
+    folder moved. Rewriting it recreated the old folder as a second copy of the
+    show. Each rebuild therefore holds the maintenance lock (unless the caller
+    already does) and re-reads the row, and writes only while the row is still
+    bound to the same missing path. While maintenance runs, the pass stops and
+    the next run picks up anything still missing.
     """
     import catbox
     items = db.get_all_virtual_items()
     recreated = 0
+    deferred = False
     for item in items:
         strm_path = item.get("strm_path")
         if not strm_path:
@@ -2591,19 +2601,38 @@ def _run_once_catbox() -> int:
         path = Path(strm_path)
         if path.exists():
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if _write_strm(path, catbox.proxy_url(item["token"]), imdb_id=item.get("imdb_id")):
-            log.info("Recreated missing catbox .strm: %s", path.name)
-            recreated += 1
+        if not maintenance_held and not _maintenance_lock.acquire(blocking=False):
+            deferred = True
+            break
+        try:
+            current = db.get_virtual_item(item["token"])
+            if not current or current.get("strm_path") != strm_path:
+                log.info(
+                    "Not recreating %s: token %s is now bound to %s",
+                    path, item["token"], (current or {}).get("strm_path"),
+                )
+                continue
+            if path.exists():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if _write_strm(path, catbox.proxy_url(item["token"]), imdb_id=current.get("imdb_id")):
+                log.info("Recreated missing catbox .strm: %s", path.name)
+                recreated += 1
+        finally:
+            if not maintenance_held:
+                _maintenance_lock.release()
+    if deferred:
+        log.info("strm_generator catbox: maintenance is running, deferring the missing .strm rebuild to the next run")
     log.info("strm_generator catbox: %d missing .strm file(s) recreated from virtual_items", recreated)
     return recreated
 
 
-def run_once() -> int:
+def run_once(maintenance_held: bool = False) -> int:
     """Create any missing .strm files. In catbox mode uses virtual_items DB as
-    source of truth; otherwise scans TorBox mylist."""
+    source of truth; otherwise scans TorBox mylist. Pass maintenance_held=True
+    only from code that already holds _maintenance_lock."""
     if settings.get("CATBOX_MODE", False):
-        return _run_once_catbox()
+        return _run_once_catbox(maintenance_held=maintenance_held)
     log.info("strm_generator: scanning TorBox mylist")
     try:
         torrents = torbox_mod.list_torrents()
@@ -2615,9 +2644,9 @@ def run_once() -> int:
     return total
 
 
-def run_and_refresh() -> None:
+def run_and_refresh(maintenance_held: bool = False) -> None:
     """Run strm generation and trigger Jellyfin scan if any new files were created."""
-    new_files = run_once()
+    new_files = run_once(maintenance_held=maintenance_held)
     import nfo_generator
     nfo_generator.generate_all(lookup_missing=False)
     if new_files > 0:
