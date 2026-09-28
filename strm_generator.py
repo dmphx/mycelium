@@ -2962,6 +2962,21 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             log.debug("repair_strms: no .nfo imdb_id in %s  -  skipping", movie_dir.name)
             skipped += 1
             continue
+        # A folder without a .strm can be a leftover duplicate of the folder its
+        # item is bound to, for example "Title (2025)" beside the renamed
+        # "Title (2025) {imdb-tt...}". The name check above misses that case.
+        # Writing here would recreate the duplicate as a same-token orphan, so
+        # skip while the item's bound .strm lives in another folder.
+        bound = [
+            i.get("strm_path") for i in db.get_virtual_items_by_imdb(imdb_id, media_type)
+            if i.get("strm_path")
+        ]
+        elsewhere = [p for p in bound if Path(p).parent != movie_dir and Path(p).is_file()]
+        if elsewhere and not any(Path(p).parent == movie_dir for p in bound):
+            log.info("repair_strms: not recreating %s: its token is bound to %s",
+                     movie_dir.name, elsewhere[0])
+            skipped += 1
+            continue
         missing += 1
         expected_strm = movie_dir / f"{movie_dir.name}.strm"
         if _relink(imdb_id, expected_strm):
