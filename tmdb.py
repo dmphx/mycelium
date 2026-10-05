@@ -112,9 +112,37 @@ def search_aliases(imdb_id: str, media_type: str,
     return tuple(out)
 
 
+def _season_location(tmdb_id: int, season: int) -> tuple[int, int]:
+    # TMDB splits Bake Off at the BBC to Channel 4 move. Plex and UK
+    # releases retain continuous numbering: Channel 4 season 1 is series 8.
+    if int(tmdb_id) == 34549 and int(season) > 7:
+        return 87012, int(season) - 7
+    return tmdb_id, season
+
+
 def get_show_info(tmdb_id: int) -> dict | None:
-    """Return top-level show info including number_of_seasons."""
-    return _get(f"/tv/{tmdb_id}")
+    """Return show metadata in the library's continuous UK season order."""
+    original = _get(f"/tv/{tmdb_id}")
+    if not original or int(tmdb_id) != 34549:
+        return original
+    continuation = _get("/tv/87012")
+    if not continuation:
+        return original
+    merged = dict(original)
+    merged["number_of_seasons"] = 7 + int(continuation.get("number_of_seasons") or 0)
+    merged["seasons"] = list(original.get("seasons") or []) + [
+        dict(row, season_number=int(row["season_number"]) + 7)
+        for row in continuation.get("seasons") or []
+        if int(row.get("season_number") or 0) > 0
+    ]
+    for key in ("last_air_date", "status", "in_production"):
+        if key in continuation:
+            merged[key] = continuation[key]
+    for key in ("last_episode_to_air", "next_episode_to_air"):
+        episode = continuation.get(key)
+        merged[key] = (dict(episode, season_number=int(episode["season_number"]) + 7)
+                       if episode else None)
+    return merged
 
 
 def release_date(imdb_id: str | None = None, tmdb_id: int | None = None,
@@ -165,10 +193,11 @@ def display_title(imdb_id: str, media_type: str = "movie") -> str | None:
 
 def get_season_episodes(tmdb_id: int, season: int) -> list[dict]:
     """Return episode list for a season; each dict has episode_number and air_date."""
-    data = _get(f"/tv/{tmdb_id}/season/{season}")
+    source_id, source_season = _season_location(tmdb_id, season)
+    data = _get(f"/tv/{source_id}/season/{source_season}")
     if not data:
         return []
-    return data.get("episodes") or []
+    return [dict(row, season_number=season) for row in data.get("episodes") or []]
 
 
 def get_poster_path(imdb_id: str, media_type: str = "movie") -> str | None:
@@ -229,7 +258,8 @@ def get_episode_runtime_sec(imdb_id: str, season: int, episode: int) -> float | 
     tmdb_id = results[0].get("id")
     if not tmdb_id:
         return None
-    ep_data = _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
+    source_id, source_season = _season_location(tmdb_id, season)
+    ep_data = _get(f"/tv/{source_id}/season/{source_season}/episode/{episode}")
     if not ep_data:
         return None
     minutes = ep_data.get("runtime")
@@ -238,7 +268,8 @@ def get_episode_runtime_sec(imdb_id: str, season: int, episode: int) -> float | 
 
 def get_episode_still(tmdb_id: int, season: int, episode: int) -> str | None:
     """Return still_path for a TV episode, or None."""
-    data = _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
+    source_id, source_season = _season_location(tmdb_id, season)
+    data = _get(f"/tv/{source_id}/season/{source_season}/episode/{episode}")
     if not data:
         return None
     return data.get("still_path")
@@ -248,7 +279,8 @@ def get_episode_details(tmdb_id: int, season: int, episode: int) -> dict | None:
     """Return {title, overview, aired, still_path} for a TV episode, or None.
 
     One TMDB call, reused for both the .nfo sidecar and the episode still."""
-    data = _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
+    source_id, source_season = _season_location(tmdb_id, season)
+    data = _get(f"/tv/{source_id}/season/{source_season}/episode/{episode}")
     if not data:
         return None
     return {
