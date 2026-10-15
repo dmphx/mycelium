@@ -58,6 +58,7 @@ This is a public personal fork of corveck79/mycelium. Upstream attribution and l
 
 ## Explore further
 
+- [Documentation wiki](https://github.com/dmphx/mycelium/wiki)
 - [Upstream project](https://github.com/corveck79/mycelium)
 - [Documentation](docs/)
 - [Changelog](CHANGELOG.md)
