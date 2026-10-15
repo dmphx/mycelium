@@ -18,17 +18,25 @@ Mycelium connects the act of discovering something to watch with the work of mak
 
 *Existing Mycelium discovery screenshot retained from the project assets.*
 
+![mycelium product showcase. Existing captures and artwork are identified in the composition.](docs/readme/showcase.png)
+
 ## What the experience brings
 
 ### Keep discovery close
+
+![Illustrated feature: Keep discovery close.](docs/readme/feature-1.png)
 
 The application provides discovery, search, watchlists, and request views. The point is to give the next title a place in the workflow instead of keeping suggestions in an unrelated note or chat.
 
 ### Connect requests with the library
 
+![Illustrated feature: Connect requests with the library.](docs/readme/feature-2.png)
+
 Provider integration and the Catbox materialization flow connect selected titles with library entries. Configuration, authentication, provider limits, and failure states remain part of the operating story, rather than being hidden behind a promise that every request will be immediately playable.
 
 ### See the experimental boundaries
+
+![Illustrated feature: See the experimental boundaries.](docs/readme/feature-3.png)
 
 The fork includes additional work such as the experimental Plex Spore integration. The technical reference distinguishes normal operation, configuration, constraints, and work in progress; experimental paths are not presented as a general stable-release guarantee.
 
@@ -49,6 +57,8 @@ A title someone wants to watch can move through a defined request workflow rathe
 
 This is a public personal fork of corveck79/mycelium. Upstream attribution and licensing remain intact. Read the technical reference before deployment, particularly the provider limits, security configuration, and experimental features.
 
+
+![Explore mycelium and its maintained product guides.](docs/readme/next.png)
 
 ## Explore further
 
