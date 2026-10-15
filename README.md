@@ -1,7 +1,4 @@
-<picture>
-  <source media="(max-width: 600px)" srcset="docs/readme/hero-mobile.png">
-  <img src="docs/readme/hero.png" alt="mycelium: YOUR WATCHLIST. A CONNECTED LIBRARY. Self-hosted watchlist-to-library automation, connecting discovery and requests with a Jellyfin media library." width="100%">
-</picture>
+![mycelium: YOUR WATCHLIST. A CONNECTED LIBRARY. Self-hosted watchlist-to-library automation, connecting discovery and requests with a Jellyfin media library.](docs/readme/hero.png)
 
 # mycelium
 
@@ -37,10 +34,7 @@ The fork includes additional work such as the experimental Plex Spore integratio
 
 ## From the first step to the next one
 
-<picture>
-  <source media="(max-width: 600px)" srcset="docs/readme/workflow-mobile.png">
-  <img src="docs/readme/workflow.png" alt="Workflow: DISCOVER → REQUEST → MATERIALIZE → LIBRARY" width="100%">
-</picture>
+![Workflow: DISCOVER → REQUEST → MATERIALIZE → LIBRARY](docs/readme/workflow.png)
 
 1. **Discover.** Find a title through discovery or search.
 2. **Keep the request.** Add the title to the watchlist or request flow.
