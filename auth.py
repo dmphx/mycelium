@@ -34,6 +34,15 @@ import settings
 
 log = logging.getLogger(__name__)
 
+def _compat_route() -> bool:
+    """Exact Seerr-compat paths authenticate themselves (X-Api-Key) in their blueprint."""
+    try:
+        import seerr_compat
+    except Exception:
+        return False
+    return seerr_compat.is_enabled() and bool(seerr_compat.ROUTE_RE.match(request.path))
+
+
 _PUBLIC_PATHS = (
     "/webhook",
     "/torbox-webhook",
@@ -115,10 +124,29 @@ def _ip_in_trusted(remote: str | None) -> bool:
     return False
 
 
+def rate_limit_key() -> str:
+    """Limiter key: X-Real-IP only when the direct peer is a trusted proxy
+    (and the header is a valid IP), otherwise the socket address."""
+    peer = request.remote_addr or "unknown"
+    if _ip_in_trusted(peer):
+        real = (request.headers.get("X-Real-IP") or "").strip()
+        try:
+            return str(ipaddress.ip_address(real))
+        except ValueError:
+            pass
+    return peer
+
+
 def _proxy_user() -> str | None:
     if not settings.get("TRUSTED_PROXY_AUTH", False):
         return None
+    import config as _cfg
+    allowed = [h.strip().lower() for h in (_cfg.TRUSTED_PROXY_AUTH_HOSTS or "").split(",") if h.strip()]
+    if allowed and (request.host or "").split(":")[0].lower() not in allowed:
+        return None
     if not _ip_in_trusted(request.remote_addr):
+        return None
+    if _cfg.TRUSTED_PROXY_IDENTITY_NAMESPACE and not request.headers.get(_cfg.TRUSTED_PROXY_SUBJECT_HEADER):
         return None
     header = settings.get("TRUSTED_PROXY_USER_HEADER", "X-Forwarded-User")
     return request.headers.get(header) or None
@@ -142,6 +170,25 @@ def is_enabled() -> bool:
     return True
 
 
+def session_revoked() -> bool:
+    """True (and the session is cleared) if the session belongs to a native
+    user that has since been disabled or deleted. Legacy/proxy sessions with
+    no user_id are unaffected."""
+    uid = session.get("user_id")
+    if not uid:
+        return False
+    try:
+        import db
+        u = db.get_user(uid)
+    except Exception:
+        session.clear()
+        return True
+    if u is None or not u.get("enabled"):
+        session.clear()
+        return True
+    return False
+
+
 def current_user() -> str | None:
     if not is_enabled():
         return None
@@ -161,8 +208,11 @@ def current_user_record() -> dict | None:
     if uid:
         import db
         u = db.get_user(uid)
-        if u:
-            return u
+        if u is None or not u.get("enabled"):
+            # Deleted or disabled: never fall back to cookie-held role.
+            session.clear()
+            return None
+        return u
     user = current_user()
     if not user:
         return None
@@ -173,7 +223,23 @@ def current_user_record() -> dict | None:
                 "quota_monthly": 0, "enabled": 1, "webplayer_enabled": 1}
     # OIDC / trusted-proxy login: resolve or auto-provision a real DB user.
     import db
+    import config as _cfg
+    if _cfg.TRUSTED_PROXY_IDENTITY_NAMESPACE and _proxy_user():
+        subject = request.headers.get(_cfg.TRUSTED_PROXY_SUBJECT_HEADER, "")
+        if not subject or len(subject) > 512:
+            return None
+        u = db.provision_external_user("proxy", _cfg.TRUSTED_PROXY_IDENTITY_NAMESPACE,
+            subject, user, "proxy$disabled", (settings.get("AUTH_USERNAME", "admin"),))
+        if not u.get("enabled"):
+            return None
+        session["user_id"] = u["id"]
+        session["user"] = u["username"]
+        session["auth_source"] = "proxy"
+        return u
     u = db.get_user_by_username(user)
+    if u and db.has_external_identity(u["id"]):
+        # A Jellyfin-linked account is never claimable by a proxy header name.
+        return None
     if not u:
         # Bootstrap admin only during initial setup - once SETUP_COMPLETE is
         # set, deleting every user must not silently reopen an admin-grant
@@ -265,16 +331,31 @@ def require_auth(view):
     def wrapped(*args, **kwargs):
         if not is_enabled():
             return view(*args, **kwargs)
-        if session.get("user"):
-            return view(*args, **kwargs)
-        if _proxy_user():
-            session["user"] = _proxy_user()
+        if _authenticated():
             return view(*args, **kwargs)
         # Not authenticated
         if request.path.startswith("/ui/api/") or request.headers.get("Accept", "").startswith("application/json"):
             return jsonify(error="unauthorized"), 401
         return redirect(url_for("login_view", next=request.path))
     return wrapped
+
+
+def _authenticated() -> bool:
+    """Only accept a session/header after it resolves to an enabled account."""
+    try:
+        if session.get("user") and current_user_record():
+            return True
+        session.clear()
+        proxy_user = _proxy_user()
+        if proxy_user:
+            session["user"] = proxy_user
+            session["auth_source"] = "proxy"
+            if current_user_record():
+                return True
+    except Exception:
+        log.warning("Authentication account lookup failed")
+    session.clear()
+    return False
 
 
 def _enforce_basic_auth():
@@ -305,6 +386,8 @@ def install_before_request(app) -> None:
         if not is_enabled():
             return None
         path = request.path
+        if _compat_route():
+            return None
         # Public paths are always allowed
         for prefix in _PUBLIC_PATHS:
             if path == prefix or path.startswith(prefix + "/") or path == prefix.rstrip("/"):
@@ -323,11 +406,7 @@ def install_before_request(app) -> None:
                     return None
             except Exception:
                 pass
-        if session.get("user"):
-            return None
-        proxy_user = _proxy_user()
-        if proxy_user:
-            session["user"] = proxy_user
+        if _authenticated():
             return None
         if path.startswith("/ui/api/") or request.headers.get("Accept", "").startswith("application/json"):
             return jsonify(error="unauthorized"), 401

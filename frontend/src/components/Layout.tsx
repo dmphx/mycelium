@@ -9,11 +9,11 @@ const navItems = [
   { to: '/watchlist', label: 'Watchlist', icon: '★' },
   { to: '/search', label: 'Search', icon: '🔍' },
   { to: '/requests', label: 'My Requests', icon: '📋' },
-  { to: '/wanted', label: 'Wanted', icon: '⏳' },
   { to: '/settings', label: 'Settings', icon: '🔌' },
 ];
 
 const adminItems = [
+  { to: '/wanted', label: 'Wanted', icon: '⏳' },
   { to: '/admin', label: 'Admin', icon: '⚙️' },
   { to: '/manual', label: 'Manual', icon: '📖' },
 ];
@@ -286,4 +286,3 @@ function Breadcrumb({ path }: { path: string }) {
   const title = map[path] || 'Mycelium';
   return <h1 className="font-semibold text-lg">{title}</h1>;
 }
-

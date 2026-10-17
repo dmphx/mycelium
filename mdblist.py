@@ -62,6 +62,8 @@ def get_list_items(list_id: int | str, api_key: str) -> list[dict]:
 def sync_auto_request(user: dict) -> int:
     """Fetch items from all of the user's configured MDBList lists and queue new
     ones for download, capped so a large list can't flood TorBox in one sync."""
+    if not user.get("enabled") or not (user.get("role") == "admin" or user.get("auto_approve")):
+        return 0
     api_key = user.get("mdblist_api_key")
     if not api_key:
         return 0

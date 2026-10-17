@@ -625,3 +625,36 @@ If you use Mycelium or build on top of it, a mention or link back to [github.com
 <div align="center">
 <sub>built with python, sqlite, and far too many regexes · made for self-hosters by a self-hoster</sub>
 </div>
+
+## Jellyfin login (opt-in)
+
+`JELLYFIN_LOGIN_ENABLED=true` plus `JELLYFIN_AUTH_SERVER_ID` (ServerId from
+`<JELLYFIN_URL>/System/Info/Public`) adds a "Sign in with Jellyfin" form to `/login`.
+Code: `jellyfin_login.py`. Identity map: table `external_identities`
+(provider `jellyfin`, server_id = pinned id, subject = Jellyfin user GUID as lower-case
+32-hex without dashes) -> native `users.id`. Helpers in `db.py`:
+`get_user_by_external_identity`, `link_external_identity` (explicit, used by import only),
+`provision_external_user` (login path). New users are role `user`, `auto_approve=0`; role never
+comes from Jellyfin. Existing local/OIDC accounts are never merged by username.
+Tests: `tests/test_jellyfin_login.py`.
+
+## Seerr compatibility API (opt-in)
+
+`seerr_compat.py` serves `/api/v1/{status,request,search,movie/<id>,tv/<id>}` (GET) and
+`POST /api/v1/request` when `SEERR_COMPAT_ENABLED=true`, `SEERR_COMPAT_USER_ID` is an enabled
+native admin and `SEERR_API_KEY` is set. `X-Api-Key` is compared in constant time; browser
+sessions are never accepted. POST creates an approved native `user_requests` row for that admin
+(all TV seasons), starts processing once, and is idempotent per (owner, type, tmdb id). Rows
+without a `tt` IMDb id are never processed (400 "metadata identity unresolved").
+Set `SEERR_URL` empty in both environment and database settings to disable old Seerr polling.
+The limiter keys on `X-Real-IP`
+only when the direct peer is inside `TRUSTED_PROXY_NETWORKS`.
+
+For an existing proxy SSO account, configure `TRUSTED_PROXY_IDENTITY_NAMESPACE`
+and `TRUSTED_PROXY_SUBJECT_HEADER`, then explicitly link that provider subject
+with `db.link_external_identity(..., "proxy", namespace, subject)`. Restrict
+`TRUSTED_PROXY_AUTH_HOSTS` and the trusted networks to the actual proxy.
+OIDC uses provider `oidc`, the configured issuer and the verified token subject.
+Existing Jellyfin/local accounts are never claimed by matching SSO usernames.
+Imported administrators can link both SSO and Jellyfin identities to one native
+account. Disabled accounts stay disabled through every login path.

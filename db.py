@@ -305,6 +305,19 @@ CREATE TABLE IF NOT EXISTS user_requests (
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS external_identities (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider     TEXT    NOT NULL,
+    server_id    TEXT    NOT NULL,
+    subject      TEXT    NOT NULL,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT    NOT NULL DEFAULT '',
+    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    last_login   TEXT,
+    UNIQUE(provider, server_id, subject),
+    UNIQUE(provider, server_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_username             ON users(username);
 CREATE INDEX IF NOT EXISTS idx_watchlist_user             ON watchlist(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_requests_user_status  ON user_requests(user_id, status, created_at DESC);
@@ -2866,7 +2879,7 @@ def update_user(user_id: int, **fields) -> None:
         conn.execute(sql, vals)
 
 
-def upsert_oidc_user(username: str, role: str = "user") -> int:
+def upsert_oidc_user(username: str, role: str = "user", *, issuer: str = "", subject: str = "") -> int:
     """Provision (or refresh) an OIDC-authenticated user.
 
     Creates the row on first sign-in with a sentinel password hash that
@@ -2874,11 +2887,24 @@ def upsert_oidc_user(username: str, role: str = "user") -> int:
     impersonate them), and updates the role on subsequent sign-ins so
     changes to the upstream groups claim take effect immediately.
     """
+    if issuer or subject:
+        if not issuer or not subject:
+            raise ValueError("OIDC issuer and subject are required")
+        import settings
+        user = provision_external_user("oidc", issuer, subject, username, "oidc$disabled",
+                                       (settings.get("AUTH_USERNAME", "admin"),))
+        if not user.get("enabled"):
+            raise ValueError("account disabled")
+        update_user(user["id"], role=role)
+        return user["id"]
     with _connect() as conn:
         row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if row and conn.execute("SELECT 1 FROM external_identities WHERE user_id=?",
+                                (row["id"],)).fetchone():
+            raise ValueError("username belongs to an externally linked account")
         if row:
             conn.execute(
-                "UPDATE users SET role=?, enabled=1, auth_source='oidc' "
+                "UPDATE users SET role=? "
                 "WHERE id=? AND COALESCE(role, '') <> ?",
                 (role, row["id"], role),
             )
@@ -2901,6 +2927,125 @@ def upsert_oidc_user(username: str, role: str = "user") -> int:
                 (username, "oidc$" + "x" * 16, role),
             )
         return int(cur.lastrowid)
+
+
+def has_external_identity(user_id: int) -> bool:
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM external_identities WHERE user_id=?",
+                            (user_id,)).fetchone() is not None
+
+
+def get_user_by_external_identity(provider: str, server_id: str, subject: str) -> dict | None:
+    """Native user row mapped to (provider, server_id, subject), or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT u.* FROM external_identities e JOIN users u ON u.id = e.user_id
+               WHERE e.provider=? AND e.server_id=? AND e.subject=?""",
+            (provider, server_id, subject),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def link_external_identity(user_id: int, provider: str, server_id: str, subject: str,
+                            display_name: str = "") -> bool:
+    """Explicitly map an external identity to an EXISTING native user.
+
+    Used by the import/migration step only; never called from a login path.
+    Idempotent: returns True if the mapping now exists for this user (new or
+    already present). Raises ValueError if the user does not exist, or if the
+    subject or the user is already mapped to something different."""
+    with _connect() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+            raise ValueError("unknown user_id")
+        row = conn.execute(
+            "SELECT user_id FROM external_identities WHERE provider=? AND server_id=? AND subject=?",
+            (provider, server_id, subject),
+        ).fetchone()
+        if row:
+            if int(row["user_id"]) == int(user_id):
+                return True
+            raise ValueError("subject already linked to another user")
+        if conn.execute(
+            "SELECT 1 FROM external_identities WHERE provider=? AND server_id=? AND user_id=?",
+            (provider, server_id, user_id),
+        ).fetchone():
+            raise ValueError("user already linked to a different subject")
+        conn.execute(
+            """INSERT INTO external_identities (provider, server_id, subject, user_id, display_name)
+               VALUES (?, ?, ?, ?, ?)""",
+            (provider, server_id, subject, user_id, display_name),
+        )
+        return True
+
+
+def _free_username(conn, base: str, subject: str, reserved: tuple = ()) -> str:
+    """Pick a users.username that collides with nothing (case-insensitive)."""
+    def taken(name: str) -> bool:
+        return (name.lower() in {r.lower() for r in reserved if r}
+                or conn.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)",
+                                (name,)).fetchone() is not None)
+    base = (base or "").strip()[:48] or "user"
+    if not taken(base):
+        return base
+    short = "".join(ch for ch in subject if ch.isalnum())[:8] or "x"
+    cand = f"{base}~{short}"
+    n = 2
+    while taken(cand):
+        cand = f"{base}~{short}{n}"
+        n += 1
+    return cand
+
+
+def provision_external_user(provider: str, server_id: str, subject: str,
+                             display_name: str, password_hash_sentinel: str,
+                             reserved_usernames: tuple = ()) -> dict:
+    """Return the native user mapped to the identity, creating it if needed.
+
+    New users are role='user', auto_approve=0, quota 0, enabled=1. An existing
+    native user with the same username is NEVER reused or merged: the new
+    account gets a disambiguated username instead. The existing mapping (if
+    any) is returned untouched, so a Jellyfin rename keeps the same native
+    user and history. Insert of user + mapping is one transaction."""
+    existing = get_user_by_external_identity(provider, server_id, subject)
+    if existing:
+        with _connect() as conn:
+            conn.execute(
+                """UPDATE external_identities SET display_name=?,
+                   last_login=strftime('%Y-%m-%d %H:%M:%S','now')
+                   WHERE provider=? AND server_id=? AND subject=?""",
+                (display_name, provider, server_id, subject),
+            )
+        return existing
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """SELECT user_id FROM external_identities
+                   WHERE provider=? AND server_id=? AND subject=?""",
+                (provider, server_id, subject),
+            ).fetchone()
+            if row:
+                uid = int(row["user_id"])
+            else:
+                name = _free_username(conn, display_name, subject, reserved_usernames)
+                cur = conn.execute(
+                    """INSERT INTO users (username, password_hash, role, quota_monthly,
+                                          auto_approve, enabled)
+                       VALUES (?, ?, 'user', 0, 0, 1)""",
+                    (name, password_hash_sentinel),
+                )
+                uid = int(cur.lastrowid)
+                conn.execute(
+                    """INSERT INTO external_identities
+                       (provider, server_id, subject, user_id, display_name, last_login)
+                       VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M:%S','now'))""",
+                    (provider, server_id, subject, uid, display_name),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return get_user(uid)
 
 
 def touch_user_login(user_id: int) -> None:
@@ -2940,7 +3085,9 @@ def get_favorite_actors(user_id: int) -> list[dict]:
 
 def get_all_favorite_actors() -> list[dict]:
     with _connect() as conn:
-        rows = conn.execute("SELECT DISTINCT person_id, name FROM favorite_actors").fetchall()
+        rows = conn.execute("""SELECT DISTINCT f.person_id, f.name FROM favorite_actors f
+            JOIN users u ON u.id=f.user_id
+            WHERE u.enabled=1 AND (u.role='admin' OR u.auto_approve=1)""").fetchall()
         return [dict(r) for r in rows]
 
 
@@ -3013,6 +3160,41 @@ def get_user_requests(user_id: int | None = None, status: str | None = None,
     with _connect() as conn:
         rows = conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
+
+
+def list_user_requests_page(take: int, skip: int) -> tuple[list[dict], int]:
+    """Newest-first page of user_requests (all owners) with the library status."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM user_requests").fetchone()["n"]
+        rows = conn.execute(
+            """SELECT ur.*, u.username, r.status AS library_status
+               FROM user_requests ur
+               JOIN users u ON u.id = ur.user_id
+               LEFT JOIN requests r ON r.imdb_id = ur.imdb_id AND ur.imdb_id <> ''
+               ORDER BY ur.created_at DESC, ur.id DESC LIMIT ? OFFSET ?""",
+            (take, skip),
+        ).fetchall()
+        return [dict(r) for r in rows], int(total)
+
+
+def library_status_by_tmdb(media_type: str, tmdb_id: int) -> str | None:
+    with _connect() as conn:
+        row = conn.execute("""SELECT status FROM requests WHERE tmdb_id=?
+            AND media_type IN (?,?) ORDER BY (status='success') DESC, id DESC LIMIT 1""",
+            (tmdb_id, media_type, "series" if media_type == "tv" else media_type)).fetchone()
+        return row["status"] if row else None
+
+
+def find_active_user_request(user_id: int, media_type: str, tmdb_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM user_requests
+               WHERE user_id=? AND media_type=? AND tmdb_id=?
+                 AND status NOT IN ('denied', 'failed')
+               ORDER BY id DESC LIMIT 1""",
+            (user_id, media_type, tmdb_id),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def update_user_request_status(req_id: int, status: str, reviewed_by: int | None = None,

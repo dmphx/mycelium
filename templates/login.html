@@ -78,7 +78,27 @@
     {% endif %}
     {% endif %}
 
-    {% if password_enabled or not oidc_enabled %}
+    {% if jellyfin_enabled %}
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="method" value="jellyfin">
+      {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+      <div class="title" style="font-size:14px;margin-bottom:8px">Sign in with Jellyfin</div>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:12px">Use your existing Jellyfin username and password.</p>
+      <div class="field">
+        <label>Jellyfin username</label>
+        <input type="text" name="username" autocomplete="username" autofocus required>
+      </div>
+      <div class="field">
+        <label>Jellyfin password</label>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn" type="submit">Sign in with Jellyfin</button>
+    </form>
+    <div style="text-align:center;color:var(--muted);font-size:11px;margin:12px 0;letter-spacing:.08em;text-transform:uppercase">or local account</div>
+    {% endif %}
+
+    {% if password_enabled or jellyfin_enabled or not oidc_enabled %}
     <form method="post" action="/login">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}

@@ -2,16 +2,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 
 export default function Requests() {
-  const qc = useQueryClient();
   const { data: sessionData } = useQuery({ queryKey: ['session'], queryFn: api.session });
   const isAdmin = sessionData?.user?.role === 'admin';
   const { data, isLoading } = useQuery({ queryKey: ['my-requests'], queryFn: api.myRequests });
-  const deleteMut = useMutation({
-    mutationFn: (id: number) => api.deleteRequest(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['my-requests'] });
-    },
-  });
   if (isLoading) return <div className="text-muted">Loading…</div>;
   const items = data?.items || [];
   return (
@@ -34,7 +27,6 @@ export default function Requests() {
                 <th className="text-left py-2 px-3">Approval</th>
                 <th className="text-left py-2 px-3">Library</th>
                 <th className="text-left py-2 px-3">Requested</th>
-                <th className="text-right py-2 px-3"></th>
               </tr>
             </thead>
             <tbody>
@@ -49,17 +41,6 @@ export default function Requests() {
                     <LibraryPill status={r.library_status} />
                   </td>
                   <td className="py-2 px-3 text-muted text-xs">{r.created_at}</td>
-                  <td className="py-2 px-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() => { if (confirm(`Remove "${r.title}"?`)) deleteMut.mutate(r.id); }}
-                      disabled={deleteMut.isPending}
-                      className="px-2 py-1 rounded text-xs text-red-400 hover:bg-red-500/10 disabled:opacity-50"
-                      title="Delete request"
-                    >
-                      x
-                    </button>
-                  </td>
                 </tr>
               ))}
             </tbody>
@@ -67,7 +48,7 @@ export default function Requests() {
         )}
       </section>
 
-      <FailedRequestsPanel />
+      {isAdmin && <FailedRequestsPanel />}
     </div>
   );
 }
@@ -204,7 +185,7 @@ function PendingApprovalsPanel() {
 
 function StatusPill({ status }: { status: string }) {
   const cls =
-    status === 'approved' ? 'bg-ok/20 text-ok' :
+    status === 'approved' || status === 'completed' ? 'bg-ok/20 text-ok' :
     status === 'denied' ? 'bg-red-500/20 text-red-400' :
     status === 'failed' ? 'bg-red-500/20 text-red-400' :
     'bg-amber/20 text-amber';

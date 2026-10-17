@@ -31,7 +31,7 @@ def _safe_next_path(nxt: str | None, default: str = "/ui") -> str:
     parts = urlsplit(nxt)
     if parts.scheme or parts.netloc:
         return default
-    if not nxt.startswith("/") or nxt.startswith("//"):
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
         return default
     return nxt
 
@@ -114,13 +114,17 @@ def install(app: Flask) -> None:
 
         try:
             import db as _db
-            uid = _db.upsert_oidc_user(username, role=role)
+            subject = str((user_info or {}).get("sub") or "")
+            if not subject:
+                raise ValueError("missing subject")
+            uid = _db.upsert_oidc_user(username, role=role,
+                                      issuer=cfg.OIDC_ISSUER_URL, subject=subject)
             _db.touch_user_login(uid)
         except Exception as exc:
             log.warning("OIDC: user provisioning failed for %s: %s", username, exc)
             return redirect(url_for("login_view", error="oidc"))
 
-        session["user"] = username
+        session["user"] = _db.get_user(uid)["username"]
         session["user_id"] = uid
         session["role"] = role
         session["auth_source"] = "oidc"

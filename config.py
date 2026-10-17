@@ -84,9 +84,18 @@ PROWLARR_ENABLED  = _env("PROWLARR_ENABLED", "false").lower() in ("1", "true", "
 
 JELLYFIN_URL = _env("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = _env("JELLYFIN_API_KEY", "")
+# Jellyfin-backed dashboard login (default off). The pin is the Jellyfin
+# ServerId (GET /System/Info/Public); logins are refused if the server answers
+# with a different id, so a misrouted JELLYFIN_URL cannot mint sessions.
+JELLYFIN_LOGIN_ENABLED = _env("JELLYFIN_LOGIN_ENABLED", "false").lower() in ("1", "true", "yes")
+JELLYFIN_AUTH_SERVER_ID = _env("JELLYFIN_AUTH_SERVER_ID", "")
 
 SEERR_URL = _env("SEERR_URL", "")
 SEERR_API_KEY = _env("SEERR_API_KEY", "")
+# Opt-in internal Seerr-compatible API (/api/v1/...) for the Discord/Onyx Media
+# clients. Env-only. Requests are attributed to one explicit native admin user.
+SEERR_COMPAT_ENABLED = _env("SEERR_COMPAT_ENABLED", "false").lower() in ("1", "true", "yes")
+SEERR_COMPAT_USER_ID = _env("SEERR_COMPAT_USER_ID", "")
 
 TMDB_API_KEY = _env("TMDB_API_KEY", "")
 
@@ -470,6 +479,11 @@ TRUSTED_PROXY_NETWORKS = _env(
 # ── OIDC (native single sign-on, opt-in) ──────────────────────────────────────
 # Works with Authelia, Authentik, Keycloak, Google Workspace, Auth0, Okta, etc.
 # Register a redirect URI of <public-url>/oidc/callback at your provider.
+# Env-only comma list of Host values on which trusted-proxy identity headers are
+# honoured; empty = any host (legacy). Set it so a public host ignores the header.
+TRUSTED_PROXY_AUTH_HOSTS = _env("TRUSTED_PROXY_AUTH_HOSTS", "")
+TRUSTED_PROXY_IDENTITY_NAMESPACE = _env("TRUSTED_PROXY_IDENTITY_NAMESPACE", "")
+TRUSTED_PROXY_SUBJECT_HEADER = _env("TRUSTED_PROXY_SUBJECT_HEADER", "X-Forwarded-Sub")
 OIDC_ENABLED = _env("OIDC_ENABLED", "false").lower() in ("1", "true", "yes")
 OIDC_ISSUER_URL = _env("OIDC_ISSUER_URL", "")
 OIDC_CLIENT_ID = _env("OIDC_CLIENT_ID", "")

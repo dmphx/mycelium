@@ -1,6 +1,7 @@
 export type MediaType = 'movie' | 'tv';
 
 export interface TmdbItem {
+  imdb_id?: string;
   tmdb_id: number;
   media_type: MediaType;
   title: string;
@@ -64,6 +65,7 @@ export interface WatchlistItem {
   title: string;
   poster_path: string | null;
   added_at: string;
+  library_status?: string | null;
 }
 
 export interface UserRecord {

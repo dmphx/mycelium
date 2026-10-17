@@ -57,7 +57,7 @@ def test_sync_auto_request_returns_zero_without_api_key():
 
 
 def test_sync_auto_request_respects_cap_and_dedup(monkeypatch):
-    user = {"mdblist_api_key": "key", "mdblist_list_ids": "1"}
+    user = {"enabled": 1, "auto_approve": 1, "mdblist_api_key": "key", "mdblist_list_ids": "1"}
     items = [
         {"imdb_id": "tt1", "tmdb_id": 1, "media_type": "movie", "title": "A"},
         {"imdb_id": "tt2", "tmdb_id": 2, "media_type": "movie", "title": "B"},

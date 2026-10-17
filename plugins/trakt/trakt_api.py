@@ -304,6 +304,9 @@ def auto_request_watchlist(user_id: int, access_token: str) -> int:
     """Queue new Trakt watchlist items for download (not just add to the browsing
     watchlist), capped per call so a large imported watchlist can't flood TorBox's
     createtorrent quota in one run. Returns the number of items newly queued."""
+    user = db.get_user(user_id)
+    if not user or not user.get("enabled") or not (user.get("role") == "admin" or user.get("auto_approve")):
+        return 0
     import threading
     import processor
     import settings as _settings

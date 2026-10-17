@@ -4,6 +4,13 @@ import { api } from '../api';
 import type { WantedMovie, WantedEpisode } from '../types';
 
 export default function Wanted() {
+  const { data, isLoading } = useQuery({ queryKey: ['session'], queryFn: api.session });
+  if (isLoading) return <Spinner />;
+  if (data?.user?.role !== 'admin') return <Empty>Administrator access required.</Empty>;
+  return <AdminWanted />;
+}
+
+function AdminWanted() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<'movies' | 'episodes' | 'playback'>('movies');
 

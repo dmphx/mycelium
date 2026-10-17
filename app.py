@@ -212,8 +212,9 @@ def _inject_csrf_token():
 # Rate limiter  -  applied selectively to auth endpoints.
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import auth as _auth_for_limiter
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=_auth_for_limiter.rate_limit_key,
     app=app,
     default_limits=[],  # opt-in per route
     storage_uri="memory://",
@@ -225,6 +226,8 @@ if not LITE_MODE:
 
 import auth
 import oidc
+import jellyfin_login
+import seerr_compat
 auth.install_before_request(app)
 oidc.install(app)
 
@@ -236,6 +239,7 @@ def login_view():
                             next=request.args.get("next", ""),
                             oidc_enabled=oidc.is_enabled(),
                             oidc_provider=oidc.provider_name(),
+                            jellyfin_enabled=jellyfin_login.is_enabled(),
                             password_enabled=bool(cfg.AUTH_ENABLED or
                                                    __import__("settings").get("AUTH_PASSWORD_HASH", "")))
 
@@ -247,8 +251,13 @@ def login_submit():
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     nxt = request.form.get("next") or "/"
-    if not nxt.startswith("/") or nxt.startswith("//"):
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
         nxt = "/"
+    if request.form.get("method") == "jellyfin":
+        _session.clear()
+        if jellyfin_login.login(username, password, _session):
+            return redirect(nxt)
+        return redirect(url_for("login_view", error="1", next=nxt))
     if auth.attempt_login(username, password):
         _session["user"] = username
         return redirect(nxt)
@@ -1578,21 +1587,25 @@ def ui_api_webhook_secret():
 
 
 @app.get("/ui/api/stats")
+@auth.require_role("admin")
 def ui_api_stats():
     return jsonify(stats.get_overview())
 
 
 @app.get("/ui/api/storage")
+@auth.require_role("admin")
 def ui_api_storage():
     return jsonify(folders=stats.get_storage_breakdown(30))
 
 
 @app.get("/ui/api/activity")
+@auth.require_role("admin")
 def ui_api_activity():
     return jsonify(events=db.get_activity(50))
 
 
 @app.get("/ui/api/torbox-list")
+@auth.require_role("admin")
 def ui_api_torbox_list():
     try:
         items = torbox.list_torrents()
@@ -2369,6 +2382,7 @@ def spore_stream_proxy(token: str):
 
 
 @app.get("/ui/api/virtual-items")
+@auth.require_role("admin")
 def ui_api_virtual_items():
     items = db.get_all_virtual_items()
     return jsonify(items=[{
@@ -2415,6 +2429,7 @@ def ui_api_re_resolve(token: str):
 
 
 @app.get("/ui/api/playability-state")
+@auth.require_role("admin")
 def ui_api_playability_state():
     """Return degraded items with 3+ consecutive failures."""
     items = db.get_degraded_items(min_failures=3)
@@ -2422,6 +2437,7 @@ def ui_api_playability_state():
 
 
 @app.get("/ui/api/integrity")
+@auth.require_role("admin")
 def ui_api_integrity():
     """Read-only data-integrity scan: surfaces empty/malformed imdb_id,
     missing hashes, duplicate content and orphan playability rows."""
@@ -2429,6 +2445,7 @@ def ui_api_integrity():
 
 
 @app.get("/ui/api/zilean/status")
+@auth.require_role("admin")
 def ui_api_zilean_status():
     """Status of the native Zilean index (mode, hash count, last sync/import)."""
     mode = _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE)
@@ -2645,6 +2662,7 @@ def ui_settings_reset(key: str):
 # ── Robustness endpoints ──────────────────────────────────────────────────────
 
 @app.get("/ui/api/orphans")
+@auth.require_role("admin")
 def ui_api_orphans():
     return jsonify(library_sync.orphans())
 
@@ -2711,14 +2729,24 @@ def ui_quota_check():
     return redirect(url_for("ui_dashboard") + "#overview")
 
 
+_seerr_bp = seerr_compat.create_blueprint(
+    db, tmdb,
+    lambda title, imdb_id, mt, tmdb_id: _kick_off_processing(title, imdb_id, mt, tmdb_id),
+    APP_VERSION)
+_csrf.exempt(_seerr_bp)
+app.register_blueprint(_seerr_bp)
+
+
 # ── Retry queue + show overrides + metrics + TorBox usage ─────────────────────
 
 @app.get("/ui/api/retry-queue")
+@auth.require_role("admin")
 def ui_api_retry_queue():
     return jsonify(items=db.get_pending_retries())
 
 
 @app.get("/ui/api/requests/all")
+@auth.require_role("admin")
 def ui_api_all_requests():
     rows = db.get_recent(5000)
     return jsonify(items=rows)
@@ -2736,6 +2764,7 @@ def ui_api_request_status():
 
 
 @app.get("/ui/api/requests/failed")
+@auth.require_role("admin")
 def ui_api_failed_requests():
     rows = [r for r in db.get_recent(500) if r.get("status") == "failed"]
     return jsonify(items=rows)
@@ -2778,6 +2807,7 @@ def ui_api_delete_request(row_id: int):
 
 
 @app.get("/ui/api/torbox-usage")
+@auth.require_role("admin")
 def ui_api_torbox_usage():
     summary = torbox.get_usage_summary()
     user = torbox.get_user_info() or {}
@@ -2785,6 +2815,7 @@ def ui_api_torbox_usage():
 
 
 @app.get("/ui/api/metrics-summary")
+@auth.require_role("admin")
 def ui_api_metrics_summary():
     return jsonify(
         quality=db.get_metric_summary("quality_added", days=30),
@@ -3119,9 +3150,11 @@ def ui_api_discover_add():
     seasons = payload.get("seasons") or None
     if not tmdb_id or not title:
         return jsonify(error="tmdb_id and title required"), 400
+    if media_type not in ("movie", "tv"):
+        return jsonify(error="invalid media type"), 400
 
     imdb_id = tmdb.tmdb_to_imdb(tmdb_id, media_type=media_type)
-    if not imdb_id:
+    if not seerr_compat.IMDB_RE.match(imdb_id or ""):
         return jsonify(error="could not resolve imdb_id"), 400
 
     user_rec = auth.current_user_record()
@@ -3145,6 +3178,9 @@ def _kick_off_processing(title: str, imdb_id: str, media_type: str,
                           monitor_mode: str = "all",
                           seasons: list[int] | None = None) -> None:
     from webhook_parser import MediaRequest
+    if not seerr_compat.IMDB_RE.match(imdb_id or ""):
+        log.warning("not processing %r: no usable IMDb id", title)
+        return
     if media_type == "tv":
         try:
             show = tmdb.get_show_info(tmdb_id) if tmdb_id else None
@@ -3273,6 +3309,10 @@ def ui_api_user_request_approve(req_id: int):
     r = db.get_user_request(req_id)
     if not r:
         return jsonify(error="not found"), 404
+    if r["status"] != "pending":
+        return jsonify(error="request already reviewed"), 409
+    if not seerr_compat.IMDB_RE.match(r.get("imdb_id") or ""):
+        return jsonify(error="metadata identity unresolved"), 400
     db.update_user_request_status(req_id, "approved",
                                    reviewed_by=(rec or {}).get("id"))
     _kick_off_processing(r["title"], r["imdb_id"], r["media_type"], r.get("tmdb_id"))
@@ -3361,6 +3401,7 @@ def ui_api_wanted_episode_search(episode_id: int):
 
 
 @app.get("/ui/api/search-trace/<path:content_key>")
+@auth.require_role("admin")
 def ui_api_search_trace(content_key: str):
     return jsonify(db.get_search_trace(content_key))
 
@@ -3540,6 +3581,7 @@ def ui_api_library_series_episodes():
 
 
 @app.get("/ui/api/torbox-quota")
+@auth.require_role("admin")
 def ui_api_torbox_quota():
     """createtorrent usage in the last hour, broken down by reason  -  explains
     why TorBox 429 rate limits are being hit."""
@@ -3856,6 +3898,7 @@ def ui_api_jellyfin_items():
 
 
 @app.get("/ui/api/spore-minfo/<token>")
+@auth.require_role("admin")
 def spore_minfo_api(token: str):
     """Return .minfo sidecar data for a token as plain text key=value pairs.
 
@@ -3879,6 +3922,7 @@ def spore_minfo_api(token: str):
 
 @app.post("/ui/api/backfill-nfo")
 @auth.require_auth
+@auth.require_role("admin")
 def ui_api_backfill_nfo():
     """Add/update <fileinfo><streamdetails> in all existing NFO files.
 
