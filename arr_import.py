@@ -7,6 +7,7 @@ For each Sonarr series: upsert into monitored_series so the regular monitor
 will pull all (monitored) seasons + episodes.
 """
 import logging
+import re
 import threading
 import time
 
@@ -148,6 +149,10 @@ def import_sonarr(only_monitored: bool = True) -> dict:
                         seasons = list(range(1, (show.get("number_of_seasons") or 1) + 1))
                     else:
                         seasons = [1]
+                # Sonarr can return an IMDb placeholder instead of a display title.
+                if re.fullmatch(r"tt\d{7,}", title) and tmdb_id:
+                    show = tmdb.get_show_info(tmdb_id) or {}
+                    title = show.get("name") or title
                 db.upsert_monitored_series(imdb_id, tmdb_id, title, seasons)
                 existing.add(imdb_id)
                 _status["added"] += 1

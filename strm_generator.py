@@ -1,4 +1,5 @@
 import logging
+from redact import safe_exc
 import os
 import re
 import struct
@@ -32,6 +33,8 @@ _EP_LOOSE_RE = re.compile(r'(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(?:[Ee][Pp]?[\s
 # Standalone absolute episode tag with no season, e.g. "E0052", "EP283".
 # The lookbehind rejects the E of a seasonal "S01E05" (preceded by a digit).
 _ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(?:P(?:ISODE)?)?[\s._-]*(\d{2,4})(?![A-Za-z0-9])', re.IGNORECASE)
+_SEASON_WORD_RE = re.compile(r'\bSeason\s+(\d{1,2})\b', re.IGNORECASE)
+_SEASON_RE = re.compile(r'\bS(\d{1,2})\b', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -280,6 +283,15 @@ def _parse_info(torrent_name: str, file_name: str) -> dict | None:
             title = (_safe(_strip_junk(source[:ep_m.start()]).strip())
                      or _title_before_season(torrent_name))
             return {'type': 'episode', 'title': title or 'Unknown', 'season': season, 'episode': episode}
+
+    # A season-only name describes a pack, not a movie. Preserve file-first
+    # episode parsing above, and require a title before the season marker.
+    for source in (_clean(torrent_name), _clean(file_base)):
+        season_m = _SEASON_RE.search(source) or _SEASON_WORD_RE.search(source)
+        if season_m:
+            title = _safe(_strip_junk(source[:season_m.start()]).strip())
+            if title:
+                return {"type": "series", "title": title, "season": int(season_m.group(1))}
 
     # Movie: find year
     for source in (_clean(torrent_name), _clean(file_base)):
@@ -2353,8 +2365,7 @@ def process_torrent(item: dict, canonical_title: str | None = None,
                           torrent_name, existing['strm_path'])
                 return 0
 
-    is_series = bool(_EP_RE.search(_clean(torrent_name)) or
-                     re.search(r'\bS\d{1,2}\b', torrent_name, re.IGNORECASE))
+    is_series = (_parse_info(torrent_name, torrent_name) or {}).get('type') in ('episode', 'series')
     if not is_series and _TRAILER_RE.search(_clean(torrent_name)):
         log.debug("Skipping trailer torrent %s (%s)", torrent_id, torrent_name)
         return 0
@@ -2374,7 +2385,7 @@ def process_torrent(item: dict, canonical_title: str | None = None,
         file_id = f.get('id')
         file_name = f.get('name') or ''
         info = _parse_info(torrent_name, file_name)
-        if info is None:
+        if info is None or info['type'] == 'series':
             log.warning("Cannot determine placement: torrent=%r file=%r", torrent_name, file_name)
             continue
         if canonical_title and info['type'] != 'movie':
@@ -2479,7 +2490,7 @@ def scan_torbox_library() -> dict:
             if not guess:
                 skipped += 1
                 continue
-            media_type = 'series' if guess['type'] == 'episode' else 'movie'
+            media_type = 'series' if guess['type'] in ('episode', 'series') else 'movie'
             imdb_id = None
             try:
                 if media_type == 'movie':
@@ -2637,7 +2648,7 @@ def run_once(maintenance_held: bool = False) -> int:
     try:
         torrents = torbox_mod.list_torrents()
     except Exception as exc:
-        log.error("strm_generator: mylist failed: %s", exc)
+        log.error("strm_generator: mylist failed: %s", safe_exc(exc))
         return 0
     total = sum(process_torrent(t) for t in torrents)
     log.info("strm_generator: %d new .strm file(s) created", total)
@@ -2655,7 +2666,7 @@ def run_and_refresh(maintenance_held: bool = False) -> None:
     try:
         _self_heal_sample()
     except Exception as exc:
-        log.debug("Self-heal sample failed: %s", exc)
+        log.debug("Self-heal sample failed: %s", safe_exc(exc))
 
 
 def migrate_to_canonical_names() -> dict:

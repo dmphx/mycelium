@@ -5,6 +5,7 @@ and picks which of their lists to sync. Unlike Trakt this has no OAuth flow -
 MDBList uses a single long-lived API key per account.
 """
 import logging
+from redact import safe_exc
 import time
 
 import requests
@@ -31,7 +32,7 @@ def get_user_lists(api_key: str) -> list[dict]:
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as exc:
-        log.warning("MDBList get_user_lists failed: %s", exc)
+        log.warning("MDBList get_user_lists failed: %s", safe_exc(exc))
         return []
 
 
@@ -43,7 +44,7 @@ def get_list_items(list_id: int | str, api_key: str) -> list[dict]:
         r.raise_for_status()
         data = r.json() or {}
     except Exception as exc:
-        log.warning("MDBList get_list_items(%s) failed: %s", list_id, exc)
+        log.warning("MDBList get_list_items(%s) failed: %s", list_id, safe_exc(exc))
         return []
     out = []
     for kind, media_type in (("movies", "movie"), ("shows", "series")):

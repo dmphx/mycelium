@@ -91,7 +91,7 @@ if not (cfg.AUTH_ENABLED or cfg.OIDC_ENABLED or cfg.TRUSTED_PROXY_AUTH or cfg.IN
     )
     _sys.exit(1)
 
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3-onyx"
 
 with open(_path.join(_path.dirname(__file__), "releases.json"), encoding="utf-8") as _f:
     RELEASES: list[dict] = _json.load(_f)
@@ -768,13 +768,6 @@ scheduler = _start_scheduler()
 if not LITE_MODE:
     plugin_loader.register_jobs(scheduler)
 
-if cfg.SPORE_ENABLED:
-    try:
-        import spore_server
-        spore_server.start(port=cfg.SPORE_PORT)
-    except Exception as _spore_exc:
-        log.warning("Mycelium Spore server failed to start: %s", _spore_exc)
-
 # Fast-start cache in dedicated subdir so media root stays clean
 _fsh_cache_dir = cfg.SPORE_MEDIA_PATH + "/.fsh"
 try:
@@ -1385,6 +1378,8 @@ def ui_sync_movies():
 
 @app.get("/ui/logs")
 def ui_logs():
+    if not auth.is_admin():
+        abort(403)
     return jsonify(lines=log_buffer.get_lines(100))
 
 
@@ -2507,6 +2502,8 @@ def ui_blacklist_clear(info_hash: str):
 @app.post("/ui/backup-now")
 @auth.require_role("admin")
 def ui_backup_now():
+    if not auth.is_admin():
+        abort(403)
     threading.Thread(target=backup.run, name="backup-manual", daemon=True).start()
     flash("DB backup started", "ok")
     return redirect(url_for("ui_dashboard"))
@@ -2514,6 +2511,8 @@ def ui_backup_now():
 
 @app.get("/ui/api/backups")
 def ui_api_backups():
+    if not auth.is_admin():
+        abort(403)
     return jsonify(backups=backup.list_backups())
 
 

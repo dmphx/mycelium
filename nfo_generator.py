@@ -348,9 +348,18 @@ def generate_all(*, lookup_missing: bool = True) -> dict:
     consume TMDB quota and CPU again after every TorBox event.
     """
     media = Path(MEDIA_PATH)
-    items_by_title = {m["title"]: m["imdb_id"] for m in db.get_media_items()}
+    media_items = db.get_media_items()
+    items_by_title = {m["title"]: m["imdb_id"] for m in media_items}
     # Secondary lookup: imdb_id → title (canonical)
-    monitored_by_imdb = {s["imdb_id"]: s["title"] for s in db.get_all_monitored_series()}
+    monitored = db.get_all_monitored_series()
+    monitored_by_imdb = {s["imdb_id"]: s["title"] for s in monitored}
+    # Preserve imported, unmonitored shows without letting a movie with the
+    # same title supply the TV identity. Monitored rows take precedence.
+    series_by_title = {
+        m["title"]: m["imdb_id"] for m in media_items
+        if m.get("media_type") in ("series", "tv")
+    }
+    series_by_title.update({s["title"]: s["imdb_id"] for s in monitored})
 
     movies = series = 0
 
@@ -409,7 +418,7 @@ def generate_all(*, lookup_missing: bool = True) -> dict:
             if nfo_path.exists():
                 continue
 
-            imdb_id = items_by_title.get(folder.name)
+            imdb_id = series_by_title.get(folder.name)
             if (not imdb_id or imdb_id.startswith("unknown_")) and not lookup_missing:
                 continue
             if not imdb_id or imdb_id.startswith("unknown_"):
