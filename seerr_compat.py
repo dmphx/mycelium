@@ -15,6 +15,7 @@ import threading
 from flask import Blueprint, jsonify, request
 
 import config as cfg
+import library_status
 
 # Exact paths served (checked by auth.py so unknown /api/v1 paths get no bypass).
 ROUTE_RE = re.compile(r"^/api/v1/(status|request|search|movie/\d+|tv/\d+)$")
@@ -68,11 +69,10 @@ def _request_json(row: dict) -> dict:
             "seasons": [{"seasonNumber": s} for s in seasons]}
 
 
-def _media_info(db, imdb_id: str | None) -> dict | None:
+def _media_info(db, imdb_id: str | None, kind: str) -> dict | None:
     if not imdb_id:
         return None
-    r = db.get_request_by_imdb(imdb_id)
-    st = _library_media_status((r or {}).get("status"))
+    st = _library_media_status(library_status.by_imdb([imdb_id]).get((kind, imdb_id)))
     return {"status": st} if st else None
 
 
@@ -155,7 +155,7 @@ def create_blueprint(db, tmdb, kick_off, version: str) -> Blueprint:
         if not d:
             return jsonify(message="not found"), 404
         out = {"id": tmdb_id, "overview": d.get("overview", ""), "posterPath": d.get("poster_path")}
-        mi = _media_info(db, d.get("imdb_id"))
+        mi = _media_info(db, d.get("imdb_id"), kind)
         if mi:
             out["mediaInfo"] = mi
         if kind == "tv":
@@ -191,7 +191,7 @@ def create_blueprint(db, tmdb, kick_off, version: str) -> Blueprint:
             existing = db.find_active_user_request(owner["id"], kind, tmdb_id)
             if existing:
                 existing["username"] = owner["username"]
-                existing["library_status"] = (db.get_request_by_imdb(existing["imdb_id"]) or {}).get("status")
+                library_status.enrich([existing])
                 return jsonify(_request_json(existing)), 200
             try:
                 d = tmdb.details(kind, tmdb_id)
@@ -209,7 +209,7 @@ def create_blueprint(db, tmdb, kick_off, version: str) -> Blueprint:
         kick_off(title, imdb_id, kind, tmdb_id)
         row = db.get_user_request(rid)
         row["username"] = owner["username"]
-        row["library_status"] = (db.get_request_by_imdb(imdb_id) or {}).get("status")
+        library_status.enrich([row])
         return jsonify(_request_json(row)), 201
 
     return bp

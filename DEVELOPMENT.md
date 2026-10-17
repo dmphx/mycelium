@@ -640,6 +640,15 @@ Tests: `tests/test_jellyfin_login.py`.
 
 ## Seerr compatibility API (opt-in)
 
+Library badges use the same read-only presence check in discovery, details,
+watchlists, requests and the compatibility API. An indexed virtual item with a
+stream path takes precedence over an older failed processing attempt. Resolver
+placeholders without a path do not count as library entries. This means the
+title is indexed, not that its upstream stream has just passed a playback test.
+Original processing status and errors remain in the database; reading a status
+does not retry downloads or rewrite history. TMDB lookups include media type so
+a movie cannot inherit the status of a TV series with the same numeric ID.
+
 `seerr_compat.py` serves `/api/v1/{status,request,search,movie/<id>,tv/<id>}` (GET) and
 `POST /api/v1/request` when `SEERR_COMPAT_ENABLED=true`, `SEERR_COMPAT_USER_ID` is an enabled
 native admin and `SEERR_API_KEY` is set. `X-Api-Key` is compared in constant time; browser

@@ -122,3 +122,18 @@ def test_reads_contract_and_no_processing(env):
     assert c.get("/api/v1/request?sort=modified", headers=H).status_code == 400
     assert kicks == []
     assert c.get("/api/v1/settings", headers=H).status_code == 404
+
+
+def test_indexed_library_wins_over_failed_attempt_in_all_bot_reads(env):
+    c, db, admin, kicks, _ = env
+    rid = db.insert_request("Example", "tt0133093", "movie", tmdb_id=603)
+    db.update_request(rid, "failed", error="previous attempt")
+    db.insert_virtual_item("token", "hash", "", "Example", "movie",
+                           strm_path="/library/Example.strm", imdb_id="tt0133093")
+    db.create_user_request(admin, "tt0133093", 603, "movie", "Example", status="approved")
+    request = c.get("/api/v1/request", headers=H).json["results"][0]
+    assert request["status"] == 5 and request["media"]["status"] == 5
+    assert c.get("/api/v1/movie/603", headers=H).json["mediaInfo"]["status"] == 5
+    assert c.get("/api/v1/search?query=Example", headers=H).json["results"][0]["mediaInfo"]["status"] == 5
+    assert db.get_request_by_imdb("tt0133093")["status"] == "failed"
+    assert kicks == []

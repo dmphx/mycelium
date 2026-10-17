@@ -23,6 +23,7 @@ import health
 import identity_repair
 import jellyfin
 import library_sync
+import library_status
 import log_buffer
 import monitor
 import notify
@@ -2764,14 +2765,16 @@ def ui_api_request_status():
     row = db.get_request_by_imdb(imdb_id)
     if not row:
         return jsonify(status="not_found")
-    return jsonify(status=row.get("status"), imdb_id=imdb_id)
+    library_status.enrich([row])
+    return jsonify(status=row.get("library_status"), imdb_id=imdb_id)
 
 
 @app.get("/ui/api/requests/failed")
 @auth.require_role("admin")
 def ui_api_failed_requests():
     rows = [r for r in db.get_recent(500) if r.get("status") == "failed"]
-    return jsonify(items=rows)
+    library_status.enrich(rows)
+    return jsonify(items=[r for r in rows if r.get("library_status") == "failed"])
 
 
 @app.post("/ui/api/requests/<int:row_id>/retry")
@@ -2885,60 +2888,25 @@ def ui_api_discover_search():
     return jsonify(results=results)
 
 
-_STATUS_PRIORITY = {"success": 0, "available": 0, "wanted": 1, "pending": 2, "upcoming": 3, "failed": 4}
-
-
 def _enrich_library_status(items: list[dict]) -> None:
-    """Add library_status and imdb_id to TMDB result dicts by checking all tables with tmdb_id."""
-    tmdb_ids = [it["tmdb_id"] for it in items if it.get("tmdb_id")]
-    if not tmdb_ids:
-        return
-    ph = ",".join("?" * len(tmdb_ids))
-    with db._connect() as conn:
-        rows = conn.execute(f"""
-            SELECT tmdb_id, status FROM requests WHERE tmdb_id IN ({ph})
-            UNION ALL
-            SELECT w.tmdb_id, r.status
-            FROM watchlist w JOIN requests r ON r.imdb_id = w.imdb_id
-            WHERE w.tmdb_id IN ({ph})
-            UNION ALL
-            SELECT ms.tmdb_id, r.status
-            FROM monitored_series ms JOIN requests r ON r.imdb_id = ms.imdb_id
-            WHERE ms.tmdb_id IN ({ph})
-            UNION ALL
-            SELECT ur.tmdb_id, COALESCE(r.status, ur.status)
-            FROM user_requests ur LEFT JOIN requests r ON r.imdb_id = ur.imdb_id
-            WHERE ur.tmdb_id IN ({ph})
-        """, tmdb_ids * 4).fetchall()
-        # Fetch imdb_ids from library so PosterCard can show watched badges
-        imdb_rows = conn.execute(
-            f"SELECT tmdb_id, imdb_id FROM requests WHERE tmdb_id IN ({ph}) AND imdb_id IS NOT NULL",
-            tmdb_ids,
-        ).fetchall()
-        # Also from trakt_watched for items watched but not in library
-        rec = auth.current_user_record()
-        trakt_imdb_rows = []
-        if rec and rec.get("id"):
-            try:
-                trakt_imdb_rows = conn.execute(
-                    f"SELECT tmdb_id, imdb_id FROM trakt_watched WHERE user_id=? AND tmdb_id IN ({ph}) AND imdb_id IS NOT NULL",
-                    [rec["id"]] + tmdb_ids,
-                ).fetchall()
-            except Exception:
-                pass
-    status_map: dict[int, str] = {}
-    for r in rows:
-        tid, st = r["tmdb_id"], r["status"]
-        prev = status_map.get(tid)
-        if prev is None or _STATUS_PRIORITY.get(st, 9) < _STATUS_PRIORITY.get(prev, 9):
-            status_map[tid] = st
-    imdb_map = {r["tmdb_id"]: r["imdb_id"] for r in imdb_rows}
-    for r in trakt_imdb_rows:
-        imdb_map.setdefault(r["tmdb_id"], r["imdb_id"])
-    for it in items:
-        it["library_status"] = status_map.get(it.get("tmdb_id"))
-        if not it.get("imdb_id"):
-            it["imdb_id"] = imdb_map.get(it.get("tmdb_id"))
+    """Use the same indexed-library status as details and request history."""
+    library_status.enrich(items)
+    # Watched-only titles may have no library identity yet.
+    missing = [it for it in items if it.get("tmdb_id") and not it.get("imdb_id")]
+    rec = auth.current_user_record()
+    if missing and rec and rec.get("id"):
+        ids = [it["tmdb_id"] for it in missing]
+        with db._connect() as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='trakt_watched'").fetchone():
+                return
+            rows = conn.execute(
+                f"SELECT tmdb_id, media_type, imdb_id FROM trakt_watched "
+                f"WHERE user_id=? AND tmdb_id IN ({','.join('?' for _ in ids)})",
+                [rec["id"]] + ids,
+            ).fetchall()
+        watched = {(library_status.media_kind(r["media_type"]), r["tmdb_id"]): r["imdb_id"] for r in rows}
+        for item in missing:
+            item["imdb_id"] = watched.get((library_status.media_kind(item.get("media_type")), item["tmdb_id"]))
 
 
 def _filter_by_language(items: list[dict]) -> list[dict]:
@@ -3126,18 +3094,8 @@ def ui_api_discover_details():
     detail = tmdb.details(media, tmdb_id, region=region)
     if not detail:
         return jsonify(error="not found"), 404
-    imdb_id = detail.get("imdb_id")
-    if imdb_id:
-        vi = db.get_virtual_items_by_imdb(imdb_id)
-        if vi:
-            detail["library_status"] = "available"
-        else:
-            with db._connect() as conn:
-                row = conn.execute(
-                    "SELECT status FROM requests WHERE imdb_id=?", (imdb_id,)
-                ).fetchone()
-            if row:
-                detail["library_status"] = row["status"]
+    detail = dict(detail, media_type=media, tmdb_id=tmdb_id)
+    library_status.enrich([detail])
     return jsonify(detail)
 
 
@@ -3227,11 +3185,6 @@ def ui_api_watchlist_get():
     if imdb_ids:
         with db._connect() as conn:
             ph = ",".join("?" * len(imdb_ids))
-            rows = conn.execute(
-                f"SELECT imdb_id, status FROM requests WHERE imdb_id IN ({ph})",
-                imdb_ids,
-            ).fetchall()
-            lib_map = {r["imdb_id"]: r["status"] for r in rows}
             # Enrich poster_path from poster_cache for items missing it
             poster_rows = conn.execute(
                 f"SELECT imdb_id, poster_path FROM poster_cache WHERE imdb_id IN ({ph})",
@@ -3239,12 +3192,9 @@ def ui_api_watchlist_get():
             ).fetchall()
             poster_map = {r["imdb_id"]: r["poster_path"] for r in poster_rows}
         for w in items:
-            w["library_status"] = lib_map.get(w.get("imdb_id"))
             if not w.get("poster_path") and w.get("imdb_id"):
                 w["poster_path"] = poster_map.get(w["imdb_id"])
-    else:
-        for w in items:
-            w["library_status"] = None
+    library_status.enrich(items)
     return jsonify(items=items)
 
 
@@ -3287,20 +3237,7 @@ def ui_api_user_requests():
         items = db.get_user_requests(user_id=rec["id"], status=status)
     else:
         items = db.get_user_requests(status=status)
-    imdb_ids = {r["imdb_id"] for r in items}
-    if imdb_ids:
-        with db._connect() as conn:
-            ph = ",".join("?" * len(imdb_ids))
-            rows = conn.execute(
-                f"SELECT imdb_id, status FROM requests WHERE imdb_id IN ({ph})",
-                list(imdb_ids),
-            ).fetchall()
-            lib_map = {r["imdb_id"]: r["status"] for r in rows}
-        for r in items:
-            r["library_status"] = lib_map.get(r["imdb_id"])
-    else:
-        for r in items:
-            r["library_status"] = None
+    library_status.enrich(items)
     return jsonify(items=items)
 
 
@@ -3436,35 +3373,22 @@ def ui_api_identity_repair_run():
 
 @app.get("/ui/api/library/status-map")
 def ui_api_library_status_map():
-    """Map of tmdb_id -> library status for badge display on poster cards."""
-    with db._connect() as conn:
-        rows = conn.execute("""
-            SELECT tmdb_id, status FROM requests WHERE tmdb_id IS NOT NULL
-            UNION
-            SELECT w.tmdb_id, r.status
-            FROM watchlist w
-            JOIN requests r ON r.imdb_id = w.imdb_id
-            WHERE w.tmdb_id IS NOT NULL
-            UNION
-            SELECT ms.tmdb_id, r.status
-            FROM monitored_series ms
-            JOIN requests r ON r.imdb_id = ms.imdb_id
-            WHERE ms.tmdb_id IS NOT NULL
-            UNION
-            SELECT ur.tmdb_id,
-                   COALESCE(r.status, ur.status) AS status
-            FROM user_requests ur
-            LEFT JOIN requests r ON r.imdb_id = ur.imdb_id
-            WHERE ur.tmdb_id IS NOT NULL
-        """).fetchall()
-    return jsonify({str(r["tmdb_id"]): r["status"] for r in rows})
+    """Legacy poster-status map, using the same library presence as details."""
+    rows = library_status.by_tmdb()
+    result = {f"{kind}:{tid}": row["status"] for (kind, tid), row in rows.items()}
+    # Numeric-only keys are safe only when movie and TV identities do not collide.
+    for (kind, tid), row in rows.items():
+        other = "tv" if kind == "movie" else "movie"
+        if (other, tid) not in rows:
+            result[str(tid)] = row["status"]
+    return jsonify(result)
 
 
 @app.get("/ui/api/library/movies")
 def ui_api_library_movies():
-    """Return all movie requests with status info, reconciling stale wanted status."""
-    db.reconcile_wanted_movies()
+    """Return movie library presence without rewriting processing history."""
     rows = db.get_recent(10000)
+    library_status.enrich(rows)
     seen = set()
     items = []
     for r in rows:
@@ -3479,7 +3403,8 @@ def ui_api_library_movies():
             "imdb_id": imdb,
             "tmdb_id": r.get("tmdb_id"),
             "quality": r.get("quality"),
-            "status": r.get("status"),
+            "status": r.get("library_status"),
+            "processing_status": r.get("status"),
             "source": r.get("source"),
             "created_at": r.get("created_at"),
             "year": r.get("year"),

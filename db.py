@@ -3174,15 +3174,16 @@ def list_user_requests_page(take: int, skip: int) -> tuple[list[dict], int]:
                ORDER BY ur.created_at DESC, ur.id DESC LIMIT ? OFFSET ?""",
             (take, skip),
         ).fetchall()
-        return [dict(r) for r in rows], int(total)
+        items = [dict(r) for r in rows]
+    import library_status
+    library_status.enrich(items)
+    return items, int(total)
 
 
 def library_status_by_tmdb(media_type: str, tmdb_id: int) -> str | None:
-    with _connect() as conn:
-        row = conn.execute("""SELECT status FROM requests WHERE tmdb_id=?
-            AND media_type IN (?,?) ORDER BY (status='success') DESC, id DESC LIMIT 1""",
-            (tmdb_id, media_type, "series" if media_type == "tv" else media_type)).fetchone()
-        return row["status"] if row else None
+    import library_status
+    row = library_status.by_tmdb([tmdb_id]).get((library_status.media_kind(media_type), tmdb_id))
+    return row["status"] if row else None
 
 
 def find_active_user_request(user_id: int, media_type: str, tmdb_id: int) -> dict | None:
