@@ -658,3 +658,17 @@ OIDC uses provider `oidc`, the configured issuer and the verified token subject.
 Existing Jellyfin/local accounts are never claimed by matching SSO usernames.
 Imported administrators can link both SSO and Jellyfin identities to one native
 account. Disabled accounts stay disabled through every login path.
+
+## Deployment branding
+
+Set the environment-only `APP_NAME`, `APP_LOGO_URL` and `APP_FAVICON_URL` to
+replace the visible identity. Mount artwork read-only under
+`/app/static/branding` and use same-origin `/static/branding/...` URLs. A full
+horizontal logo works best; preserve its aspect ratio. Version the URLs when
+replacing an asset to refresh browser caches.
+
+Login, setup, the classic admin header and the React sidebar share this
+configuration. The page title and favicon are rendered before the app mounts.
+A custom logo hides the upstream branded login background. With no custom
+configuration, the upstream identity remains. This does not rename technical
+service names or alter authentication, requests or library data.

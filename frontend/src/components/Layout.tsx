@@ -1,3 +1,5 @@
+import Brand from './Brand';
+import { appName } from '../branding';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -41,23 +43,7 @@ export default function Layout() {
         `}
       >
         <div className="px-5 py-5 flex items-center gap-3 border-b border-border">
-          <svg width="28" height="28" viewBox="0 0 40 40" aria-hidden="true">
-            <g stroke="#22d3ee" strokeWidth="1.5" opacity="0.7">
-              <line x1="10" y1="20" x2="30" y2="10"/>
-              <line x1="10" y1="20" x2="30" y2="30"/>
-              <line x1="30" y1="10" x2="30" y2="30"/>
-              <line x1="20" y1="5"  x2="10" y2="20"/>
-              <line x1="20" y1="35" x2="10" y2="20"/>
-            </g>
-            <circle cx="10" cy="20" r="3.5" fill="#0d9488"/>
-            <circle cx="30" cy="10" r="3"   fill="#22d3ee"/>
-            <circle cx="30" cy="30" r="3"   fill="#22d3ee"/>
-            <circle cx="20" cy="5"  r="2.2" fill="#5eead4"/>
-            <circle cx="20" cy="35" r="2.2" fill="#5eead4"/>
-          </svg>
-          <span className="font-mono font-bold tracking-wide text-lg text-white">
-            myc<span className="text-accent-2">3</span>l<span className="text-accent-2">1</span>um
-          </span>
+          <Brand className="h-11 w-full object-left" />
         </div>
         <nav className="py-3">
           <SidebarSection title="Browse" items={navItems} onClick={() => setDrawerOpen(false)} />
@@ -283,6 +269,6 @@ function Breadcrumb({ path }: { path: string }) {
     '/manual': 'Manual',
     '/login': 'Sign in',
   };
-  const title = map[path] || 'Mycelium';
+  const title = map[path] || appName;
   return <h1 className="font-semibold text-lg">{title}</h1>;
 }

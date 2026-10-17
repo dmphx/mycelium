@@ -11,6 +11,12 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str:
     return value or ""
 
 
+# Deployment branding. These are environment-only, not user-editable settings.
+APP_NAME = _env("APP_NAME", "myc3l1um")
+APP_LOGO_URL = _env("APP_LOGO_URL")
+APP_FAVICON_URL = _env("APP_FAVICON_URL", "/static/mycelium-icon.svg")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":

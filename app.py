@@ -206,7 +206,11 @@ def _security_headers(response):
 
 @app.context_processor
 def _inject_csrf_token():
-    return {"csrf_token": generate_csrf}
+    return {"csrf_token": generate_csrf, "brand": {
+        "name": cfg.APP_NAME,
+        "logo_url": cfg.APP_LOGO_URL,
+        "favicon_url": cfg.APP_FAVICON_URL,
+    }}
 
 
 # Rate limiter  -  applied selectively to auth endpoints.
@@ -4074,6 +4078,10 @@ def _spa_index():
     html = html.replace(
         '<meta name="csrf-token" content="" />',
         f'<meta name="csrf-token" content="{token}" />',
+    )
+    html = html.replace(
+        '<meta name="app-branding" content="" />',
+        render_template("branding_head.html"),
     )
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
