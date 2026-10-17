@@ -11,6 +11,8 @@ import type {
   WantedEpisode,
   PersonDetail,
   SearchTrace,
+  MaintenanceJob,
+  MaintenanceJobId,
 } from './types';
 
 export const csrfToken = (): string => {
@@ -50,6 +52,16 @@ async function http<T>(url: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  maintenanceStatus: () => http<{ jobs: MaintenanceJob[] }>('/ui/api/maintenance'),
+  runMaintenance: (id: MaintenanceJobId) => {
+    const routes: Record<MaintenanceJobId, string> = {
+      migrate_canonical: '/ui/api/migrate-canonical',
+      cleanup_duplicates: '/ui/api/cleanup-duplicate-strms',
+      repair_strms: '/ui/api/repair-strms',
+      scan_torbox: '/ui/api/torbox/scan-library',
+    };
+    return http<{ run_status: string; message: string | null }>(routes[id], { method: 'POST' });
+  },
   // Discovery
   search: (q: string) =>
     http<{ results: TmdbItem[] }>(`/ui/api/discover/search?q=${encodeURIComponent(q)}`),

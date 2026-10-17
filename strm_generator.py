@@ -2686,7 +2686,8 @@ def migrate_to_canonical_names() -> dict:
     """
     if not _maintenance_lock.acquire(blocking=False):
         log.warning("migrate_to_canonical_names: maintenance already running  -  skipping")
-        return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0, "no_imdb": 0}
+        return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0,
+                "no_imdb": 0, "deferred": "maintenance_busy"}
     try:
         return _migrate_to_canonical_names_locked()
     finally:
@@ -2699,7 +2700,8 @@ def _migrate_to_canonical_names_locked() -> dict:
 
     root = Path(MEDIA_PATH) / "movies"
     if not root.exists():
-        return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0, "no_imdb": 0}
+        return {"scanned": 0, "renamed": 0, "merged": 0, "skipped": 0, "errors": 0,
+                "no_imdb": 0, "deferred": "media_unavailable"}
 
     def _read_imdb(folder: Path) -> str | None:
         for nfo in folder.glob("*.nfo"):
@@ -2880,7 +2882,7 @@ def repair_expired_strms(media_type: str = "movie") -> dict:
     if not _maintenance_lock.acquire(blocking=False):
         log.warning("repair_expired_strms: maintenance already running  -  skipping")
         return {"scanned": 0, "ok": 0, "missing_strm": 0, "orphaned_tokens": 0,
-                "relinked": 0, "requeued": 0, "skipped": 0}
+                "relinked": 0, "requeued": 0, "skipped": 0, "deferred": "maintenance_busy"}
     try:
         return _repair_expired_strms_locked(media_type)
     finally:
@@ -2897,9 +2899,9 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
     root = media / sub
     if not root.is_dir():
         return {"scanned": 0, "ok": 0, "missing_strm": 0, "orphaned_tokens": 0,
-                "relinked": 0, "requeued": 0, "skipped": 0}
+                "relinked": 0, "requeued": 0, "skipped": 0, "deferred": "media_unavailable"}
 
-    scanned = ok = missing = orphaned = relinked = requeued = skipped = 0
+    scanned = ok = missing = orphaned = relinked = requeued = skipped = errors = 0
 
     def _nfo_imdb(folder: Path) -> str | None:
         for nfo in folder.glob("*.nfo"):
@@ -2917,13 +2919,14 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
                 pass
         return None
 
-    def _requeue(imdb_id: str, title: str, strm_path: Path | None) -> None:
+    def _requeue(imdb_id: str, title: str, strm_path: Path | None) -> bool:
         """Delete broken .strm (if any) and kick off processor."""
+        nonlocal errors
         if strm_path and strm_path.exists():
             try:
                 strm_path.unlink()
             except Exception:
-                pass
+                errors += 1
         try:
             import processor as _proc
             from webhook_parser import MediaRequest as _MR
@@ -2931,8 +2934,11 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             req = _MR(title=title, media_type=media_type, imdb_id=imdb_id, seasons=[])
             _t.Thread(target=_proc.process, args=(req,),
                       name=f"repair-{imdb_id}", daemon=True).start()
+            return True
         except Exception as exc:
             log.warning("repair_strms: requeue failed for %s: %s", imdb_id, exc)
+            errors += 1
+            return False
 
     def _relink(imdb_id: str, strm_path: Path) -> bool:
         """Write/rewrite strm_path to the catbox proxy URL for imdb_id. Returns True on success."""
@@ -2994,8 +3000,8 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             relinked += 1
         else:
             log.info("repair_strms: no virtual_item for %s  -  requeuing", movie_dir.name)
-            _requeue(imdb_id, movie_dir.name, None)
-            requeued += 1
+            if _requeue(imdb_id, movie_dir.name, None):
+                requeued += 1
 
     # ── Pass 2: existing .strm files that are broken ──────────────────────────
     for strm_path in root.rglob("*.strm"):
@@ -3004,6 +3010,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
             url = strm_path.read_text(encoding="utf-8").strip()
         except Exception:
             skipped += 1
+            errors += 1
             continue
 
         # Valid catbox proxy URL  -  verify token is in DB.
@@ -3027,8 +3034,8 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
         if _relink(imdb_id, strm_path):
             relinked += 1
         else:
-            _requeue(imdb_id, movie_folder.name, strm_path)
-            requeued += 1
+            if _requeue(imdb_id, movie_folder.name, strm_path):
+                requeued += 1
 
     log.info(
         "repair_strms: missing=%d ok=%d orphaned=%d relinked=%d requeued=%d skipped=%d",
@@ -3037,7 +3044,7 @@ def _repair_expired_strms_locked(media_type: str = "movie") -> dict:
     return {
         "scanned": scanned, "ok": ok, "missing_strm": missing,
         "orphaned_tokens": orphaned, "relinked": relinked,
-        "requeued": requeued, "skipped": skipped,
+        "requeued": requeued, "skipped": skipped, "errors": errors,
     }
 
 
@@ -3047,7 +3054,8 @@ def cleanup_duplicate_strms() -> dict:
     token has an imdb_id set in virtual_items."""
     if not _maintenance_lock.acquire(blocking=False):
         log.warning("cleanup_duplicate_strms: maintenance already running  -  skipping")
-        return {"scanned": 0, "cleaned": 0, "skipped": 0}
+        return {"scanned": 0, "cleaned": 0, "skipped": 0, "errors": 0,
+                "deferred": "maintenance_busy"}
     try:
         return _cleanup_duplicate_strms_locked()
     finally:
@@ -3057,9 +3065,10 @@ def cleanup_duplicate_strms() -> dict:
 def _cleanup_duplicate_strms_locked() -> dict:
     root = Path(MEDIA_PATH) / "movies"
     if not root.exists():
-        return {"scanned": 0, "cleaned": 0, "skipped": 0}
+        return {"scanned": 0, "cleaned": 0, "skipped": 0, "errors": 0,
+                "deferred": "media_unavailable"}
 
-    scanned = cleaned = skipped = 0
+    scanned = cleaned = skipped = errors = 0
 
     for movie_dir in root.iterdir():
         if not movie_dir.is_dir():
@@ -3105,6 +3114,7 @@ def _cleanup_duplicate_strms_locked() -> dict:
                 except Exception as exc:
                     log.warning("cleanup_duplicate_strms: could not rename %s: %s", keep, exc)
                     skipped += 1
+                    errors += 1
                     continue
 
         # Remove all other .strm files and their .nfo sidecars
@@ -3117,15 +3127,17 @@ def _cleanup_duplicate_strms_locked() -> dict:
                     nfo.unlink()
                 except Exception as exc:
                     log.warning("cleanup_duplicate_strms: could not remove %s: %s", nfo, exc)
+                    errors += 1
             try:
                 s.unlink()
                 log.info("cleanup_duplicate_strms: removed extra strm %s in %s", s.name, movie_dir.name)
                 cleaned += 1
             except Exception as exc:
                 log.warning("cleanup_duplicate_strms: could not remove %s: %s", s, exc)
+                errors += 1
 
     log.info("cleanup_duplicate_strms: scanned=%d cleaned=%d skipped=%d", scanned, cleaned, skipped)
-    return {"scanned": scanned, "cleaned": cleaned, "skipped": skipped}
+    return {"scanned": scanned, "cleaned": cleaned, "skipped": skipped, "errors": errors}
 
 
 def _self_heal_sample(sample_size: int = 10) -> None:

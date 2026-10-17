@@ -25,6 +25,7 @@ import jellyfin
 import library_sync
 import library_status
 import log_buffer
+import maintenance
 import monitor
 import notify
 import processor
@@ -485,6 +486,7 @@ def _spore_flip_worker() -> None:
 
 
 def _start_scheduler() -> BackgroundScheduler:
+    maintenance.initialize()
     # job_defaults: every interval job gets +/-60s jitter to avoid stampede when
     # multiple long-running jobs hit the same minute mark.
     scheduler = BackgroundScheduler(
@@ -561,7 +563,8 @@ def _start_scheduler() -> BackgroundScheduler:
 
     if CATBOX_MODE:
         scheduler.add_job(
-            strm_generator.repair_expired_strms,
+            lambda: maintenance.run("repair_strms", strm_generator.repair_expired_strms,
+                                    source="scheduled"),
             trigger="interval", hours=6,
             id="strm_repair", next_run_time=None,
         )
@@ -1492,6 +1495,21 @@ def api_generate_nfos():
     return jsonify(ok=True, started="generate_nfos")
 
 
+@app.get("/ui/api/maintenance")
+@auth.require_role("admin")
+def ui_api_maintenance():
+    response = jsonify(maintenance.status(scheduler))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _run_maintenance(job_id, task, **kwargs):
+    try:
+        return jsonify(maintenance.run(job_id, task, **kwargs))
+    except maintenance.MaintenanceFailed as exc:
+        return jsonify(error=str(exc)), 500
+
+
 @app.post("/ui/api/repair-strms")
 @_csrf.exempt
 @_browser_csrf
@@ -1504,8 +1522,8 @@ def ui_api_repair_strms():
     """
     if not auth.is_admin():
         return jsonify(error="unauthorized"), 401
-    result = strm_generator.repair_expired_strms(media_type="movie")
-    return jsonify(**result)
+    return _run_maintenance("repair_strms", strm_generator.repair_expired_strms,
+                            media_type="movie")
 
 
 @app.post("/ui/api/torbox/scan-library")
@@ -1516,8 +1534,7 @@ def ui_api_torbox_scan_library():
     TMDB where possible."""
     if not auth.is_admin():
         return jsonify(error="unauthorized"), 401
-    result = strm_generator.scan_torbox_library()
-    return jsonify(**result)
+    return _run_maintenance("scan_torbox", strm_generator.scan_torbox_library)
 
 
 @app.post("/ui/api/spore/backfill")
@@ -1546,8 +1563,7 @@ def ui_api_migrate_canonical():
     """Rename all movie folders to TMDB canonical names and merge duplicates."""
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
-    result = strm_generator.migrate_to_canonical_names()
-    return jsonify(**result)
+    return _run_maintenance("migrate_canonical", strm_generator.migrate_to_canonical_names)
 
 
 @app.post("/ui/api/cleanup-duplicate-strms")
@@ -1558,8 +1574,7 @@ def ui_api_cleanup_duplicate_strms():
     """Remove extra .strm files from folders that have more than one."""
     if not auth.is_admin():
         return jsonify(error="admin required"), 403
-    result = strm_generator.cleanup_duplicate_strms()
-    return jsonify(**result)
+    return _run_maintenance("cleanup_duplicates", strm_generator.cleanup_duplicate_strms)
 
 
 @app.post("/ui/api/series-backfill")

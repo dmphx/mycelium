@@ -71,6 +71,24 @@ that streams directly from TorBox or RealDebrid. No FUSE, no rclone, no local do
 | **SPA** | `/` | Discover, Library, Watchlist, multi-user request management |
 | **Admin** | `/admin` | Two tabs: **Dashboard** (users, Radarr/Sonarr import, Auto-approve, genre tabs, maintenance) and **Classic** (overview, blacklist, repair, settings, logs) |
 
+The Dashboard maintenance panel reads `/ui/api/maintenance` (admin only). It
+shows the actual in-process repair schedule, next run, last successful run and
+latest counters. Canonical migration, duplicate-file cleanup and TorBox import
+remain manual; the existing six-hour Catbox repair job shares tracking with its
+manual button. This does not add schedules or run maintenance on page load.
+
+`maintenance_runs` stores manual/scheduled starts and outcomes in the existing
+SQLite database. History begins when this version is installed; it is not
+reconstructed from logs. Only allowlisted integer counters and fixed reason
+codes are saved, never exception text, URLs or tokens. Busy/missing-library
+deferrals, reported item errors and exceptions do not advance last success.
+The single app/scheduler worker marks unfinished runs as completion unknown
+after restart, without retrying them. Keep the existing one-worker deployment
+contract. History retains the latest 100 rows per action plus its last success.
+Completion means the pass returned without reported errors; skipped entries and
+requeued processing remain visible and are not a playback guarantee. General
+daily cleanup is a separate task and is not credited as running these buttons.
+
 **Works with:**
 
 | Media server | Notes |

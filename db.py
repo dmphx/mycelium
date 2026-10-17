@@ -114,6 +114,20 @@ CREATE TABLE IF NOT EXISTS cleanup_runs (
     unfixable   INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    duration_seconds REAL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    note_code   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_runs_job
+    ON maintenance_runs(job_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS activity_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     event       TEXT    NOT NULL,

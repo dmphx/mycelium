@@ -173,3 +173,27 @@ export interface SearchTrace {
   } | null;
   candidates: SearchCandidate[];
 }
+export type MaintenanceJobId = 'migrate_canonical' | 'cleanup_duplicates' | 'repair_strms' | 'scan_torbox';
+
+export interface MaintenanceRun {
+  id: number;
+  source: 'manual' | 'scheduled';
+  status: 'running' | 'succeeded' | 'partial' | 'failed' | 'deferred' | 'interrupted';
+  started_at: string;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  result: Record<string, number>;
+  message: string | null;
+}
+
+export interface MaintenanceJob {
+  id: MaintenanceJobId;
+  schedule: {
+    mode: 'manual' | 'automatic' | 'disabled' | 'paused';
+    interval_seconds: number | null;
+    next_run_at: string | null;
+  };
+  last_run: MaintenanceRun | null;
+  active_run: MaintenanceRun | null;
+  last_success_at: string | null;
+}
