@@ -8,21 +8,24 @@ import PersonModal from './PersonModal';
 import { usePluginSlot } from '../hooks/usePluginSlots';
 import { useWatched } from '../hooks/useWatched';
 
-export default function DetailModal({
-  tmdbId,
-  mediaType,
-  onClose,
-  onSelectItem,
-}: {
+type DetailModalProps = {
   tmdbId: number | null;
   mediaType: MediaType | null;
   onClose: () => void;
   onSelectItem: (item: TmdbItem) => void;
-}) {
+};
+
+export default function DetailModal(props: DetailModalProps) {
+  // Each title owns its scope, polling and nested dialogs. Changing titles must
+  // never carry an in-flight request or selected seasons into the next title.
+  return <DetailContent key={`${props.mediaType}:${props.tmdbId}`} {...props} />;
+}
+
+function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModalProps) {
   const queryClient = useQueryClient();
   const open = tmdbId !== null && mediaType !== null;
 
-  const { data: detail, isLoading } = useQuery({
+  const { data: detail, isLoading, isError, refetch } = useQuery({
     queryKey: ['detail', mediaType, tmdbId],
     queryFn: () => api.details(mediaType!, tmdbId!),
     enabled: open,
@@ -194,8 +197,16 @@ export default function DetailModal({
         </button>
 
         <div className={`p-6 sm:p-8 ${backdrop ? '-mt-32 relative' : ''}`}>
-          {isLoading || !detail ? (
-            <div className="text-muted text-center py-12">Loading…</div>
+          {isError ? (
+            <div className="py-12 text-center space-y-3" role="alert">
+              <p className="text-muted">Title details could not be loaded.</p>
+              <button type="button" onClick={() => void refetch()}
+                className="min-h-11 px-4 rounded-lg border border-border hover:bg-white/5">
+                Retry details
+              </button>
+            </div>
+          ) : isLoading || !detail ? (
+            <div className="text-muted text-center py-12" role="status">Loading title details...</div>
           ) : (
             <div className="flex flex-col sm:flex-row gap-6">
               <div className="flex-shrink-0 w-40 sm:w-52 mx-auto sm:mx-0 aspect-[2/3] rounded-lg overflow-hidden bg-bg">
