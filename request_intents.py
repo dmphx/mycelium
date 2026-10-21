@@ -101,7 +101,8 @@ _SCHEMA = (
 
 def init_schema(conn) -> None:
     """Additive and idempotent: only CREATE ... IF NOT EXISTS, no data changes."""
-    for stmt in _SCHEMA:
+    import intent_snapshots
+    for stmt in _SCHEMA + intent_snapshots.SCHEMA:
         conn.execute(stmt)
 
 
@@ -301,13 +302,20 @@ def replay_lookup(user_id: int, payload, idempotency_key: str) -> dict | None:
 # ── admission ────────────────────────────────────────────────────────────────
 
 def admit(user_id: int, payload, idempotency_key: str, metadata: dict | None = None,
-          raw_body: bytes | None = None) -> dict:
+          raw_body: bytes | None = None, resolved: dict | None = None) -> dict:
     """Admit one intent. Returns a receipt; raises IntentError otherwise.
 
     metadata ({title, imdb_id}) must be server-resolved. It is only needed when a
     new request row is created, so replays and coalesced requests do not need it.
     raw_body is the exact verified request body bytes, or None when the caller has
-    none; the stored raw hash is then NULL and is never derived from the payload."""
+    none; the stored raw hash is then NULL and is never derived from the payload.
+
+    resolved is the server-side intent_metadata.resolve() result. It is validated
+    only when a new request would be created (after replay and coalescing), before
+    quota or any write, and then stored as an immutable snapshot in the same
+    transaction. The freshness of resolved is the trusted caller's responsibility.
+    Without it the legacy metadata-only behaviour is unchanged and no snapshot is
+    stored."""
     key = _check_key(idempotency_key)
     norm = normalize_payload(payload)
     sem = semantic_hash(norm)
@@ -319,7 +327,7 @@ def admit(user_id: int, payload, idempotency_key: str, metadata: dict | None = N
         try:
             with _tx() as conn:
                 return _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json,
-                                     scope_hash, metadata)
+                                     scope_hash, metadata, resolved, norm)
         except sqlite3.IntegrityError as exc:
             if "UNIQUE" not in str(exc):
                 raise
@@ -328,7 +336,8 @@ def admit(user_id: int, payload, idempotency_key: str, metadata: dict | None = N
     raise AssertionError("unreachable")
 
 
-def _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json, scope_hash, metadata):
+def _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json, scope_hash, metadata,
+                  resolved=None, norm=None):
     user = _user(conn, user_id)
     replay = _replay(conn, user_id, key, sem)
     if replay is not None:
@@ -344,7 +353,20 @@ def _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json, scope_
                VALUES (?, ?, ?, ?, ?, 'existing_request')""",
             (user_id, key, sem, raw, existing["request_id"]))
         return _receipt(conn, existing["request_id"], "existing_request")
-    md = _check_metadata(metadata)
+    snap = None
+    if resolved is not None:
+        import intent_snapshots
+        try:
+            snap = intent_snapshots.build(resolved, norm, sem)
+        except intent_snapshots.SnapshotError as exc:
+            raise IntentError(exc.code, exc.status, exc.message) from None
+        md = {"title": snap["title"], "imdb_id": snap["imdb_id"]}
+        if metadata is not None:
+            given = _check_metadata(metadata)
+            if given != md:
+                raise IntentError("invalid_metadata", 400, "metadata disagrees with resolved")
+    else:
+        md = _check_metadata(metadata)
     is_admin = user["role"] == "admin"
     quota = int(user["quota_monthly"] or 0)
     if quota > 0 and not is_admin:
@@ -364,7 +386,7 @@ def _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json, scope_
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (user_id, md["imdb_id"], media["tmdb_id"], media["type"], md["title"], seasons_csv, status))
     rid = int(cur.lastrowid)
-    cutoff = datetime.now(timezone.utc).date().isoformat()
+    cutoff = snap["cutoff"] if snap else datetime.now(timezone.utc).date().isoformat()
     conn.execute(
         """INSERT INTO request_intents (request_id, user_id, media_type, tmdb_id, imdb_id, title,
                scope_kind, scope_json, scope_hash, future_cutoff, processing_state)
@@ -377,9 +399,82 @@ def _admit_locked(conn, user_id, key, sem, raw, media, scope, scope_json, scope_
                                             request_id, outcome)
            VALUES (?, ?, ?, ?, ?, 'created')""",
         (user_id, key, sem, raw, rid))
+    if snap:
+        _store_snapshot(conn, rid, snap)
     if approved:
         conn.execute("INSERT INTO request_outbox (request_id) VALUES (?)", (rid,))
     return _receipt(conn, rid, "created")
+
+
+def _store_snapshot(conn, rid: int, snap: dict) -> None:
+    conn.execute(
+        """INSERT INTO request_metadata_snapshot (request_id, snapshot_json, predicate_json,
+               snapshot_hash, predicate_hash, accepted_hash, input_hash, cutoff, catalog_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (rid, snap["snapshot_json"], snap["predicate_json"], snap["snapshot_hash"],
+         snap["predicate_hash"], snap["accepted_hash"], snap["input_hash"], snap["cutoff"],
+         len(snap["episodes"])))
+    conn.executemany(
+        """INSERT INTO request_episode_state (request_id, season, episode, tmdb_episode_id,
+               name, runtime_min, air_date, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(rid, e["season"], e["episode"], e["tmdb_episode_id"], e["name"], e["runtime_min"],
+          e["air_date"], e["state"]) for e in snap["episodes"]])
+    conn.executemany(
+        """INSERT INTO request_episode_observation (request_id, season, episode,
+               tmdb_episode_id, name, runtime_min, air_date, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'admission')""",
+        [(rid, e["season"], e["episode"], e["tmdb_episode_id"], e["name"], e["runtime_min"],
+          e["air_date"]) for e in snap["episodes"]])
+
+
+def admit_resolved(user_id: int, payload, idempotency_key: str, resolved: dict,
+                   raw_body: bytes | None = None) -> dict:
+    """admit() for trusted routes that always carry a server-resolved snapshot.
+    Replays and coalesced requests still succeed without network, because the route
+    calls replay_lookup/find_active first and only resolves on a miss."""
+    if not isinstance(resolved, dict):
+        raise IntentError("resolved_required", 400, "resolved metadata required")
+    return admit(user_id, payload, idempotency_key, None, raw_body, resolved)
+
+
+def find_active(user_id: int, payload) -> dict | None:
+    """Receipt of this owner's active intent for the same canonical input, or None.
+    Read-only; lets a route skip the metadata network call for a coalesce."""
+    norm = normalize_payload(payload)
+    scope_hash = _sha(_canon(norm["scope"]))
+    import db
+    with db._connect() as conn:
+        _user(conn, user_id)
+        row = conn.execute(
+            """SELECT request_id FROM request_intents
+               WHERE user_id=? AND media_type=? AND tmdb_id=? AND scope_hash=? AND active=1""",
+            (user_id, norm["media"]["type"], norm["media"]["tmdb_id"], scope_hash)).fetchone()
+        return _receipt(conn, row["request_id"], "existing_request") if row else None
+
+
+def get_snapshot(user_id: int, request_id: int) -> dict | None:
+    """Internal (not HTTP) view of the stored snapshot for the enabled owner, or None
+    for a missing or foreign request or one admitted without a snapshot."""
+    _rid(request_id)
+    import db
+    with db._connect() as conn:
+        _user(conn, user_id)
+        row = conn.execute(
+            """SELECT s.* FROM request_metadata_snapshot s
+               JOIN request_intents i ON i.request_id = s.request_id
+               WHERE s.request_id=? AND i.user_id=?""", (request_id, user_id)).fetchone()
+        if row is None:
+            return None
+        eps = conn.execute(
+            """SELECT season, episode, tmdb_episode_id, name, runtime_min, air_date, state
+               FROM request_episode_state WHERE request_id=? ORDER BY season, episode""",
+            (request_id,)).fetchall()
+        return {"snapshot": json.loads(row["snapshot_json"]),
+                "predicate": json.loads(row["predicate_json"]),
+                "hashes": {"snapshot": row["snapshot_hash"], "predicate": row["predicate_hash"],
+                           "accepted": row["accepted_hash"], "input": row["input_hash"]},
+                "cutoff": row["cutoff"], "catalog_count": row["catalog_count"],
+                "episodes": [dict(e) for e in eps]}
 
 
 # ── review ───────────────────────────────────────────────────────────────────
