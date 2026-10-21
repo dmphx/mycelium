@@ -472,6 +472,8 @@ def init() -> None:
         request_intents.init_schema(conn)
         import integration_auth
         integration_auth.init_schema(conn)
+        import integration_personalization
+        integration_personalization.init_schema(conn)
         conn.commit()
     _migrate()
     integrity_check()

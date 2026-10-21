@@ -143,7 +143,7 @@ def test_me_capabilities_and_envelope(env):
     assert d["viewer"] == {"id": env.uid, "display_name": "synthetic-viewer"}
     assert d["policy"]["request_approval"] == "required"
     assert d["policy"]["monthly_quota"] == {"limit": None, "used": 0, "remaining": None}
-    assert d["operations"] == ["me.read", "genre-tabs.read", "requests.read"]
+    assert d["operations"] == ["me.read", "genre-tabs.read", "follows.read", "requests.read"]
     c = call(env, path="/integration/v1/capabilities").get_json()["data"]
     assert c["operations"] == d["operations"]
     assert c["limits"] == {"request_body_bytes": 65536, "authorization_bytes": 6144,
@@ -270,9 +270,8 @@ def test_uniform_404_and_explicit_405(env):
 
 
 UNQUALIFIED = [
-    ("GET", "/integration/v1/follows", "watchlist:read"), ("GET", "/integration/v1/watchlist?limit=5", "watchlist:read"),
+    ("GET", "/integration/v1/watchlist?limit=5", "watchlist:read"),
     ("GET", "/integration/v1/issues", "issues:read"), ("GET", "/integration/v1/issues/7", "issues:read"),
-    ("POST", "/integration/v1/follows/5", "watchlist:write"), ("DELETE", "/integration/v1/follows/5", "watchlist:write"),
     ("POST", "/integration/v1/watchlist", "watchlist:write"), ("DELETE", "/integration/v1/watchlist", "watchlist:write"),
     ("POST", "/integration/v1/requests", "requests:write"), ("POST", "/integration/v1/availability", "availability:read"),
     ("POST", "/integration/v1/playback-contexts", "playback-contexts:write"),
@@ -650,7 +649,7 @@ def test_all_catalog_routes_stay_disabled_by_default(catalog_env):
 
 def test_catalog_dynamic_capabilities_and_safe_config_failures(catalog_env, monkeypatch):
     env, calls = catalog_env
-    expected = set(api.catalog.BASE_OPERATIONS + api.catalog.CATALOG_OPERATIONS)
+    expected = set(api.catalog.BASE_OPERATIONS + api.catalog.CATALOG_OPERATIONS + ("follows.read", "follows.write"))
     capabilities = call(env, path="/integration/v1/capabilities").get_json()["data"]
     me = call(env).get_json()["data"]
     assert set(capabilities["operations"]) == set(me["operations"]) == expected
@@ -666,7 +665,7 @@ def test_catalog_dynamic_capabilities_and_safe_config_failures(catalog_env, monk
         raise OSError("private configuration path")
     monkeypatch.setattr(env.db, "get_setting", failure)
     c = call(env, path="/integration/v1/capabilities").get_json()["data"]
-    assert c["operations"] == list(api.catalog.BASE_OPERATIONS)
+    assert c["operations"] == ["me.read", "follows.read", "requests.read"]
     assert call(env).status_code == 200
     assert call(env, path="/integration/v1/requests", scope="requests:read").status_code == 200
     response = call(env, path="/integration/v1/genre-tabs")
@@ -697,3 +696,117 @@ def test_catalog_http_outage_missing_size_and_capability_stability(catalog_env, 
         for n in range(1, 6)]})
     response = call(env, path="/integration/v1/catalog/search?q=a")
     assert response.status_code == 503 and not response.get_json()["error"]["retryable"]
+
+
+FOLLOW_ROUTES = [("GET", "/integration/v1/follows", "watchlist:read"),
+                 ("POST", "/integration/v1/follows/9", "watchlist:write"),
+                 ("DELETE", "/integration/v1/follows/9", "watchlist:write")]
+
+
+@pytest.mark.parametrize("method,path,scope", FOLLOW_ROUTES)
+def test_signed_follows_boundary_before_metadata(catalog_env, method, path, scope):
+    env, calls = catalog_env
+    body = b"{}" if method != "GET" else b""
+    idem = "synthetic_follow_boundary" if body else None
+    kwargs = {"body": body, "scope": scope, "idem": idem}
+    with env.client.session_transaction() as session:
+        session["user_id"] = env.uid
+    assert call(env, method, path, sign=False, **kwargs).status_code == 401
+    assert call(env, method, path, **dict(kwargs, scope="catalog:read")).status_code == 403
+    assert call(env, method, path, role="service", **dict(kwargs, scope="readers:write")).status_code == 401
+    assert call(env, method, path, raw_env=False, **kwargs).status_code == 503
+    assert call(env, method, path, target="/integration/v1/me", **kwargs).status_code == 401
+    assert call(env, method, path, body_sha256="0" * 64, **kwargs).status_code == 401
+    env.db.update_user(env.uid, enabled=0)
+    assert call(env, method, path, **kwargs).status_code == 403
+    env.db.update_user(env.uid, enabled=1)
+    assert calls == []
+    signed = token(env.keys["viewer"], "v1", method=method, target=path, **kwargs)
+    headers = {"Authorization": "Bearer " + signed}
+    if body:
+        headers.update({"Idempotency-Key": idem, "Content-Type": "application/json"})
+    good = env.client.open(path, method=method, data=body or None, headers=headers, environ_overrides={"RAW_URI": path})
+    assert good.status_code == 200, good.get_json()
+    assert good.headers["Cache-Control"] == "no-store" and "Set-Cookie" not in good.headers
+    replay = env.client.open(path, method=method, data=body or None, headers=headers, environ_overrides={"RAW_URI": path})
+    assert replay.status_code == 401 and len(calls) == (1 if method == "POST" else 0)
+
+
+@pytest.mark.parametrize("body", [b'{"name":"Caller"}', b'{"owner":1}', b'{"profile_url":"https://example.test/a"}',
+    b'{"automatic_requests":false}', b'{"person_id":9}', b'[]', b'{"a":1,"a":2}', b'{"a":NaN}'])
+def test_follows_exact_body_before_fetch(catalog_env, body):
+    env, calls = catalog_env
+    response = call(env, "POST", "/integration/v1/follows/9", body=body, scope="watchlist:write",
+                    idem="synthetic_follow_body_0001")
+    assert response.status_code == 400 and calls == []
+
+
+@pytest.mark.parametrize("path,status", [("/integration/v1/follows/2147483648", 400),
+    ("/integration/v1/follows/0", 404), ("/integration/v1/follows/09", 404),
+    ("/integration/v1/follows/9?owner=1", 400), ("/integration/v1/follows/9/", 400)])
+def test_follows_exact_path_language_and_id(catalog_env, path, status):
+    env, calls = catalog_env
+    response = call(env, "POST", path, body=b"{}", scope="watchlist:write", idem="synthetic_follow_path_0001")
+    assert response.status_code == status and calls == []
+
+
+def test_signed_follows_historical_receipts_and_fresh_jti(catalog_env):
+    env, calls = catalog_env
+    env.db.add_favorite_actor(env.uid, 12, "Legacy automatic favorite")
+    assert call(env, path="/integration/v1/follows", scope="watchlist:read").get_json()["data"] == {
+        "items": [], "complete": True, "automatic_requests": False}
+    def write(method="POST", path="/integration/v1/follows/9", idem="synthetic_follow_history_1", body=b"{}"):
+        return call(env, method, path, body=body, scope="watchlist:write", idem=idem)
+    original = write()
+    assert original.status_code == 200
+    assert original.get_json()["data"] == {"person_id": 9, "following": True, "automatic_requests": False}
+    assert write(body=b" { } ").get_json()["data"] == original.get_json()["data"]
+    assert len(calls) == 1
+    assert write(method="DELETE").status_code == 409
+    assert write(path="/integration/v1/follows/10").status_code == 409
+    assert write(method="DELETE", idem="synthetic_follow_history_2").get_json()["data"]["following"] is False
+    assert write().get_json()["data"] == original.get_json()["data"]
+    assert call(env, path="/integration/v1/follows", scope="watchlist:read").get_json()["data"]["items"] == []
+    assert len(calls) == 1 and len(env.db.get_favorite_actors(env.uid)) == 1
+    env.db.update_user(env.uid, enabled=0)
+    assert write().status_code == 403
+
+
+def test_follows_configuration_and_source_failure_do_not_disable_catalog(catalog_env):
+    import config
+    env, calls = catalog_env
+    config.TMDB_API_KEY = ""
+    capabilities = call(env, path="/integration/v1/capabilities").get_json()["data"]
+    assert "follows.read" in capabilities["operations"] and "follows.write" in capabilities["incomplete"]
+    response = call(env, "POST", "/integration/v1/follows/9", body=b"{}", scope="watchlist:write",
+                    idem="synthetic_follow_no_key_1")
+    assert response.status_code == 503 and calls == []
+    assert call(env, "DELETE", "/integration/v1/follows/9", body=b"{}", scope="watchlist:write",
+                idem="synthetic_follow_no_key_2").status_code == 200
+    config.TMDB_API_KEY = "synthetic-catalog-key"
+    with env.db._connect() as conn:
+        conn.execute("DROP TABLE integration_saved_people")
+    c = call(env, path="/integration/v1/capabilities").get_json()["data"]
+    assert not {"follows.read", "follows.write"} & set(c["operations"])
+    assert "catalog.search" in c["operations"] and "requests.read" in c["operations"]
+    assert call(env).status_code == 200
+    response = call(env, path="/integration/v1/follows", scope="watchlist:read")
+    assert response.status_code == 503
+    assert "integration_saved_people" not in response.get_data(as_text=True)
+
+
+def test_follows_provider_failure_is_not_success_or_capability_change(catalog_env, monkeypatch):
+    import tmdb_checked as tc
+    env, _ = catalog_env
+    expected = call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"]
+    for exception, status, retryable in ((tc.TmdbNotFound("not_found"), 404, False),
+                                       (tc.TmdbUnavailable("upstream_unreachable"), 503, True),
+                                       (tc.TmdbUnavailable("bad_json"), 503, False)):
+        def fail(*args):
+            raise exception
+        monkeypatch.setattr(tc, "fetch", fail)
+        response = call(env, "POST", "/integration/v1/follows/9", body=b"{}", scope="watchlist:write",
+                        idem="synthetic_follow_failure_1")
+        assert response.status_code == status and response.get_json()["error"]["retryable"] is retryable
+        assert call(env, path="/integration/v1/follows", scope="watchlist:read").get_json()["data"]["items"] == []
+        assert call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"] == expected

@@ -1,7 +1,7 @@
 # Integration API v1: signed receiver contract
 
-Status: signed HTTP boundary, current actor/request reads, and catalog metadata reads
-are implemented. Mutation and authority-bearing operations remain unqualified. The
+Status: signed HTTP boundary, current actor/request reads, catalog metadata reads and
+isolated non-automatic saved people are implemented. Watchlist and authority-bearing operations remain unqualified. The
 feature is off unless `INTEGRATION_ENABLED=true`; this milestone does not qualify deployment.
 
 ## Configuration (environment only)
@@ -222,11 +222,14 @@ kind. Unknown availability is never inferred as missing.
     "items": "[{media_type:movie|tv,genre_id:int,name:string,year_from:int|null,year_to:int|null}]"
   },
   "follows_get": {
-    "items": "[{person_id:int,name:string,profile_url?:HTTPS}]"
+    "items": "[{person_id:int,name:string,profile_url?:HTTPS}]",
+    "complete": "boolean; false whenever bounded/truncated; never implicit completeness",
+    "automatic_requests": false
   },
   "follows_post_delete": {
     "person_id": "int",
-    "following": "boolean"
+    "following": "boolean",
+    "automatic_requests": false
   },
   "watchlist_get": {
     "items": "Title[] with watchlist_id:int and added_at:UTC ISO8601",
@@ -336,8 +339,8 @@ no leading zero).
 | GET `/genres` | catalog:read | type (required) | implemented |
 | GET `/providers` | catalog:read | type (required), region | implemented |
 | GET `/genre-tabs`, `/people/<id>` | catalog:read | none | implemented |
-| GET `/follows` | watchlist:read | none | 503 |
-| POST, DELETE `/follows/<id>` | watchlist:write | none | 503 (not advertised) |
+| GET `/follows` | watchlist:read | none | implemented; isolated saved people |
+| POST, DELETE `/follows/<id>` | watchlist:write | none | implemented; exact body `{}` |
 | GET `/watchlist` | watchlist:read | list | 503 |
 | POST, DELETE `/watchlist` | watchlist:write | none | 503 |
 | POST `/requests` | requests:write | none | 503 |
@@ -354,7 +357,10 @@ list: base `me.read` and `requests.read`, plus locally configured implemented ca
 Affected operations remain in sorted `incomplete` when configuration is invalid or cannot
 be read. Genre tabs operate independently of the TMDB key; details require a valid native
 region. Capabilities perform no provider probes, and provider outages do not remove support.
-Following a person is not advertised because existing favorite-actor rows trigger automatic requests.
+Follows use a separate non-automatic saved-person source. Read support requires a healthy
+source; write support additionally requires locally valid metadata configuration and the
+result store. GET, DELETE and historical retries can work without metadata configuration.
+Personalization readiness failures do not disable catalog or base reads.
 
 Catalog orchestration, exact upstream paths, strict query/region/tab validation, failure
 mapping and retry policy are documented in [integration-catalog.md](integration-catalog.md).
@@ -382,3 +388,63 @@ public-key fixture and `MYCELIUM_INTEGRATION_CONTRACT` to the reviewed route pro
 These optional checks skip when their inputs are absent; skips are not release evidence.
 Synthetic HTTP fixture results do not qualify raw production-edge framing, catalog
 policy, library grants or repair activation.
+
+## Saved people and historical personalization results (C2c1)
+
+The signed follows facade uses only `integration_saved_people`. It never reads, copies,
+writes or changes `favorite_actors`, whose existing automatic-request consumers remain
+unchanged. Every follows response includes `automatic_requests: false`. Watchlist GET,
+POST and DELETE remain unqualified and unadvertised; there is no legacy-row hydration,
+metadata migration, identity-hint change or new processor/request/quota/outbox/grant path.
+
+POST and DELETE `/follows/<person_id>` require body exactly `{}`. The canonical path
+provides the strict integer identity 1..2147483647; all caller fields, including owner,
+name, image, person_id and automatic flags, are rejected. Existing signed raw body,
+Idempotency-Key, scope and native actor binding rules apply without new claims or routes.
+Native admin status permits no cross-owner operation or request-policy override.
+
+A new POST resolves checked raw `/person/<id>` with
+`append_to_response=combined_credits` through the existing person builder. Only person_id,
+name and optional validated profile_url are retained. Existing validated membership and
+historical result retries avoid provider calls; DELETE never fetches. Actual missing
+persons are 404; outages and malformed metadata use the catalog's safe 503 classification.
+Capabilities perform no provider probes, and outages do not remove implementation support.
+
+Metadata resolution happens outside a SQLite write transaction. `BEGIN IMMEDIATE` then
+rechecks the native enabled owner, replay binding, current membership and capacity before
+atomically changing membership and inserting the success receipt. Failures roll back both.
+No legacy helper that commits or opens a nested transaction is used. Every list/replay
+reads the enabled owner and owned data in one explicit read transaction.
+
+The list returns at most 200 people ordered by person_id. Its same-transaction lookahead
+of 201 proves `complete: true` only if no source rows are omitted. A genuine empty source
+returns empty items with complete true; source failures return 503 rather than empty data.
+Membership is capped at 1000 per owner. Existing-member operations and replays do not
+consume another membership slot; DELETE remains available subject to durable result capacity.
+
+`integration_personalization_results` reserves a shared namespace for follows and future
+watchlist operations, separate from request-intent idempotency. The semantic hash binds
+resource, action and normalized identity; the exact signed raw-body digest is stored
+separately. Same-owner/key/same-operation retries return the original immutable success
+data, even with differently spaced equivalent JSON and a fresh signed assertion. Changed
+identity, resource or POST-versus-DELETE conflicts with 409. Transport assertion replay
+still returns 401. Different owners have independent key namespaces.
+
+Receipts describe historical committed operations, not current membership. Replaying an
+old POST after a newer DELETE returns the original following=true receipt without adding
+membership again. Clients must refetch the follows list after mutation receipts. Different
+keys serialize by commit order; there is no client-time ordering promise.
+
+Results survive membership deletion and process restart. They are immutable and retained
+until native owner deletion, with guards against update, deletion and replacement that
+still permit owner cascade. There is no TTL, automatic eviction or key recycling. Limits
+are 100000 result records per owner and 1000000 globally. Capacity failures are safe
+nonretryable 503 and do not mutate membership when a result cannot be persisted. Existing
+receipt replays remain available at capacity. Only successful committed results are stored;
+metadata or validation failures leave no membership/result pair. No JWT, token or private
+key is stored in either table.
+
+Deterministic temporary-SQLite and signed HTTP tests cover ownership, enabled rechecks,
+historical replay, concurrency, rollback, retention/cascade, bounds, metadata failures,
+source corruption and unchanged legacy consumers. These checks do not qualify deployment,
+public edge behavior or final browser acceptance.
