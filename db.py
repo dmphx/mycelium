@@ -2967,29 +2967,75 @@ def link_external_identity(user_id: int, provider: str, server_id: str, subject:
     Used by the import/migration step only; never called from a login path.
     Idempotent: returns True if the mapping now exists for this user (new or
     already present). Raises ValueError if the user does not exist, or if the
-    subject or the user is already mapped to something different."""
+    subject or the user is already mapped to something different. The check and
+    the insert run in one write transaction, and a concurrent writer that wins
+    the race is re-read so the loser gets the same answer as a serial caller."""
     with _connect() as conn:
-        if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
-            raise ValueError("unknown user_id")
-        row = conn.execute(
-            "SELECT user_id FROM external_identities WHERE provider=? AND server_id=? AND subject=?",
-            (provider, server_id, subject),
-        ).fetchone()
-        if row:
-            if int(row["user_id"]) == int(user_id):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = _link_external_identity_locked(conn, user_id, provider, server_id,
+                                                    subject, display_name)
+            conn.execute("COMMIT")
+            return result
+        except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
+            # Lost a race on a UNIQUE index: classify against the committed state.
+            with _connect() as c2:
+                row = c2.execute(
+                    "SELECT user_id FROM external_identities WHERE provider=? AND server_id=? AND subject=?",
+                    (provider, server_id, subject)).fetchone()
+            if row and int(row["user_id"]) == int(user_id):
                 return True
-            raise ValueError("subject already linked to another user")
-        if conn.execute(
-            "SELECT 1 FROM external_identities WHERE provider=? AND server_id=? AND user_id=?",
-            (provider, server_id, user_id),
-        ).fetchone():
+            if row:
+                raise ValueError("subject already linked to another user")
             raise ValueError("user already linked to a different subject")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def _link_external_identity_locked(conn, user_id: int, provider: str, server_id: str,
+                                    subject: str, display_name: str) -> bool:
+    if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+        raise ValueError("unknown user_id")
+    row = conn.execute(
+        "SELECT user_id FROM external_identities WHERE provider=? AND server_id=? AND subject=?",
+        (provider, server_id, subject),
+    ).fetchone()
+    if row:
+        if int(row["user_id"]) == int(user_id):
+            return True
+        raise ValueError("subject already linked to another user")
+    if conn.execute(
+        "SELECT 1 FROM external_identities WHERE provider=? AND server_id=? AND user_id=?",
+        (provider, server_id, user_id),
+    ).fetchone():
+        raise ValueError("user already linked to a different subject")
+    conn.execute(
+        """INSERT INTO external_identities (provider, server_id, subject, user_id, display_name)
+           VALUES (?, ?, ?, ?, ?)""",
+        (provider, server_id, subject, user_id, display_name),
+    )
+    return True
+
+
+def resolve_oidc_identity(issuer: str, subject: str) -> dict | None:
+    """Read-only lookup of the native user linked to an exact OIDC (issuer, subject).
+    Never creates, merges or touches anything; username and email play no part."""
+    if not issuer or not subject:
+        return None
+    return get_user_by_external_identity("oidc", issuer, subject)
+
+
+def touch_oidc_login(user_id: int, issuer: str, subject: str, display_name: str = "") -> None:
+    """Record an accepted OIDC sign-in. Call only after admission succeeded."""
+    with _connect() as conn:
         conn.execute(
-            """INSERT INTO external_identities (provider, server_id, subject, user_id, display_name)
-               VALUES (?, ?, ?, ?, ?)""",
-            (provider, server_id, subject, user_id, display_name),
-        )
-        return True
+            """UPDATE external_identities SET last_login=strftime('%Y-%m-%d %H:%M:%S','now'),
+               display_name=COALESCE(NULLIF(?, ''), display_name)
+               WHERE provider='oidc' AND server_id=? AND subject=? AND user_id=?""",
+            (display_name, issuer, subject, user_id))
+    touch_user_login(user_id)
 
 
 def _free_username(conn, base: str, subject: str, reserved: tuple = ()) -> str:

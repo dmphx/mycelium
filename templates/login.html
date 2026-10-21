@@ -68,6 +68,8 @@
 
     {% if error == 'oidc' %}
       <div class="err">SSO sign-in failed. Try again or use password.</div>
+    {% elif error == 'oidc_unlinked' %}
+      <div class="err">This sign-in is not linked to an account here. Ask an administrator for access.</div>
     {% elif error %}
       <div class="err">Invalid credentials.</div>
     {% endif %}

@@ -504,6 +504,24 @@ OIDC_GROUPS_CLAIM = _env("OIDC_GROUPS_CLAIM", "groups")
 OIDC_ADMIN_GROUP  = _env("OIDC_ADMIN_GROUP", "admins")
 
 
+def _env_choice(name: str, default: str, allowed: tuple) -> str:
+    """Environment-only enum. An unrecognised value refuses to start (fail closed)."""
+    raw = os.environ.get(name)
+    value = default if raw is None or raw.strip() == "" else raw.strip()
+    if value not in allowed:
+        raise RuntimeError(f"Environment variable {name} must be one of {', '.join(allowed)}")
+    return value
+
+
+# linked_only: a sign-in must match an identity link that already exists.
+# provision: an unknown identity gets a new ordinary user (role user, no auto approve).
+OIDC_ADMISSION_MODE = _env_choice("OIDC_ADMISSION_MODE", "linked_only", ("linked_only", "provision"))
+# preserve: the stored role is never rewritten by a sign-in.
+# groups: the role is set exactly from OIDC_ADMIN_GROUP membership on every sign-in,
+# including demotion when the group is gone.
+OIDC_ROLE_POLICY = _env_choice("OIDC_ROLE_POLICY", "preserve", ("preserve", "groups"))
+
+
 def configure_logging() -> None:
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL, logging.INFO),
