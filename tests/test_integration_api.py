@@ -60,6 +60,7 @@ def env(monkeypatch, tmp_path, keys):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "t.db"))
     import config
     config.DB_PATH = str(tmp_path / "t.db")
+    config.TMDB_API_KEY = ""
     import db
     db.init()
     import auth
@@ -142,9 +143,9 @@ def test_me_capabilities_and_envelope(env):
     assert d["viewer"] == {"id": env.uid, "display_name": "synthetic-viewer"}
     assert d["policy"]["request_approval"] == "required"
     assert d["policy"]["monthly_quota"] == {"limit": None, "used": 0, "remaining": None}
-    assert d["operations"] == ["me.read", "requests.read"]
+    assert d["operations"] == ["me.read", "genre-tabs.read", "requests.read"]
     c = call(env, path="/integration/v1/capabilities").get_json()["data"]
-    assert c["operations"] == ["me.read", "requests.read"]
+    assert c["operations"] == d["operations"]
     assert c["limits"] == {"request_body_bytes": 65536, "authorization_bytes": 6144,
                            "request_episodes": 500, "request_seasons": 100, "list_page_size": 100}
     assert c["incomplete"] == sorted(c["incomplete"]) and "requests.write" in c["incomplete"] \
@@ -269,12 +270,6 @@ def test_uniform_404_and_explicit_405(env):
 
 
 UNQUALIFIED = [
-    ("GET", "/integration/v1/catalog/search?page=1&q=a&type=tv", "catalog:read"),
-    ("GET", "/integration/v1/catalog/rails/trending?type=all&window=week", "catalog:read"),
-    ("GET", "/integration/v1/catalog/movie/603", "catalog:read"),
-    ("GET", "/integration/v1/catalog/tv/1399/seasons/0", "catalog:read"),
-    ("GET", "/integration/v1/genres?type=tv", "catalog:read"), ("GET", "/integration/v1/providers", "catalog:read"),
-    ("GET", "/integration/v1/genre-tabs", "catalog:read"), ("GET", "/integration/v1/people/9", "catalog:read"),
     ("GET", "/integration/v1/follows", "watchlist:read"), ("GET", "/integration/v1/watchlist?limit=5", "watchlist:read"),
     ("GET", "/integration/v1/issues", "issues:read"), ("GET", "/integration/v1/issues/7", "issues:read"),
     ("POST", "/integration/v1/follows/5", "watchlist:write"), ("DELETE", "/integration/v1/follows/5", "watchlist:write"),
@@ -291,7 +286,9 @@ def test_unqualified_operations_503_without_side_effects(env, monkeypatch, metho
         raise AssertionError("must not be called")
     monkeypatch.setattr(env.ri, "admit", boom)
     import tmdb
+    import tmdb_checked
     monkeypatch.setattr(tmdb, "_get", boom)
+    monkeypatch.setattr(tmdb_checked, "fetch", boom)
     before = (len(env.ri.list_for_user(env.uid, 50)), len(env.db.get_watchlist(env.uid)),
               len(env.db.get_favorite_actors(env.uid)))
     body = BODY if method in ("POST", "DELETE") else b""
@@ -440,7 +437,9 @@ def test_registry_matches_the_frozen_proposal():
                 seen.add(hit[0].name)
     assert {x.name for x in api.ROUTES} - seen == set()
     assert {r.name for r in api.ROUTES if r.role == "service"} == {"readers"}
-    assert set(api.ADVERTISED) == {"me.read", "requests.read"}
+    assert set(api.ADVERTISED) == set(api.catalog.BASE_OPERATIONS)
+    assert set(api.catalog.CATALOG_OPERATIONS) <= {r.handler for r in api.ROUTES}
+    assert {r.scope for r in api.ROUTES if r.handler in api.catalog.CATALOG_OPERATIONS} == {"catalog:read"}
 
 
 def test_real_application_signed_boundary(tmp_path):
@@ -524,3 +523,177 @@ print('REAL_APPLICATION_BOUNDARY_PASS')
                             env=env, capture_output=True, text=True, timeout=45)
     assert result.returncode == 0 and 'REAL_APPLICATION_BOUNDARY_PASS' in result.stdout, \
         result.stdout[-1000:] + result.stderr[-2000:]
+
+
+@pytest.fixture()
+def catalog_env(env, monkeypatch):
+    import config
+    import tmdb_checked as tc
+    config.TMDB_API_KEY = "synthetic-catalog-key"
+    calls = []
+
+    def fetch(path, params=None):
+        from test_integration_catalog_service import detail
+        calls.append((path, params))
+        if path.startswith("/search/") or path.startswith("/trending/") or path.endswith("/popular"):
+            return {"page": (params or {}).get("page", 1), "total_pages": 0, "results": []}
+        if path.startswith("/genre/"):
+            return {"genres": []}
+        if path.startswith("/watch/providers/"):
+            return {"results": []}
+        if path.startswith("/person/"):
+            return {"id": 9, "name": "Person", "combined_credits": {"cast": [], "crew": []}}
+        if path == "/tv/1399":
+            return {"id": 1399, "seasons": [{"season_number": 0, "episode_count": 0}]}
+        if path == "/tv/1399/season/0":
+            return {"id": 25, "season_number": 0, "episodes": []}
+        if path == "/movie/603":
+            return detail()
+        raise AssertionError("unexpected catalog fetch")
+
+    monkeypatch.setattr(tc, "fetch", fetch)
+    return env, calls
+
+
+CATALOG_PATHS = [
+    ("/integration/v1/catalog/search?q=a", 1),
+    ("/integration/v1/catalog/rails/trending?type=all&window=week", 1),
+    ("/integration/v1/catalog/movie/603", 1),
+    ("/integration/v1/catalog/tv/1399/seasons/0", 2),
+    ("/integration/v1/genres?type=tv", 1),
+    ("/integration/v1/providers?type=movie", 1),
+    ("/integration/v1/genre-tabs", 0),
+    ("/integration/v1/people/9", 1),
+]
+
+
+@pytest.mark.parametrize("path,count", CATALOG_PATHS)
+def test_catalog_http_envelope_and_fetch_count(catalog_env, path, count):
+    env, calls = catalog_env
+    before = (len(env.ri.list_for_user(env.uid, 50)), len(env.db.get_watchlist(env.uid)),
+              len(env.db.get_favorite_actors(env.uid)))
+    response = call(env, path=path)
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert set(body) == {"api_version", "data", "meta"} and body["api_version"] == "1"
+    assert set(body["meta"]) == {"correlation_id", "generated_at"}
+    assert response.headers["Cache-Control"] == "no-store" and "Set-Cookie" not in response.headers
+    assert len(calls) == count
+    assert (len(env.ri.list_for_user(env.uid, 50)), len(env.db.get_watchlist(env.uid)),
+            len(env.db.get_favorite_actors(env.uid))) == before
+    assert not {"availability", "entitlement", "can_play", "in_library"} & body["data"].keys()
+
+
+@pytest.mark.parametrize("path,count", CATALOG_PATHS)
+def test_each_catalog_route_auth_before_fetch(catalog_env, path, count):
+    env, calls = catalog_env
+    with env.client.session_transaction() as session:
+        session["user_id"] = env.uid
+    assert call(env, path=path, sign=False).status_code == 401
+    assert call(env, path=path, scope="requests:read").status_code == 403
+    assert call(env, path=path, role="service", scope="readers:write").status_code == 401
+    assert call(env, path=path, raw_env=False).status_code == 503
+    assert call(env, path=path, target="/integration/v1/me").status_code == 401
+    assert call(env, path=path, body=b"{}").status_code == 400
+    env.db.update_user(env.uid, enabled=0)
+    assert call(env, path=path).status_code == 403
+    env.db.update_user(env.uid, enabled=1)
+    assert call(env, path=path, sub="44444444444444448444444444444444").status_code == 403
+    assert calls == []
+    tok = token(env.keys["viewer"], "v1", target=path)
+    headers = {"Authorization": "Bearer " + tok}
+    good = env.client.get(path, headers=headers, environ_overrides={"RAW_URI": path})
+    assert good.status_code == 200
+    replay = env.client.get(path, headers=headers, environ_overrides={"RAW_URI": path})
+    assert replay.status_code == 401 and len(calls) == count
+
+
+@pytest.mark.parametrize("raw", [
+    "/integration/v1/catalog/search?q=%C0%AF", "/integration/v1/catalog/search?q=%FF",
+    "/integration/v1/catalog/search?q=%41", "/integration/v1/catalog/search?q=%c3%a9",
+    "/integration/v1/catalog/search?q=a&q=b", "/integration/v1/catalog/search?type=tv&q=a",
+    "/integration/v1/catalog/search?q=a+b", "/integration/v1/catalog/search?q=a&unknown=1",
+    "/integration/v1/catalog/movie/603?region=NL", "/integration/v1/providers",
+    "/integration/v1/catalog/rails/trending?region=NL", "/integration/v1/catalog/rails/upcoming?type=tv",
+])
+def test_catalog_http_invalid_queries_never_fetch(catalog_env, raw):
+    env, calls = catalog_env
+    response = call(env, path="/integration/v1/me", raw=raw)
+    assert response.status_code == 400 and calls == []
+
+
+def test_catalog_uses_only_verified_raw_query_and_region(catalog_env):
+    env, calls = catalog_env
+    response = call(env, path="/integration/v1/catalog/search?q=wrong", raw="/integration/v1/catalog/search?q=%2541")
+    assert response.status_code == 200 and calls[-1][1]["query"] == "%41"
+    env.db.update_user(env.uid, region="US")
+    response = call(env, path="/integration/v1/catalog/movie/603", headers={"X-Region": "NL"})
+    assert response.get_json()["data"]["watch_providers"]["region"] == "US"
+    env.db.update_user(env.uid, region="invalid")
+    before = len(calls)
+    response = call(env, path="/integration/v1/catalog/movie/603")
+    assert response.status_code == 503 and err(response) == "preference_invalid" and len(calls) == before
+    response = call(env, path="/integration/v1/providers?type=movie")
+    assert response.status_code == 400 and err(response) == "region_required" and len(calls) == before
+    response = call(env, path="/integration/v1/providers?region=NL&type=movie")
+    assert response.status_code == 200 and response.get_json()["data"]["region"] == "NL"
+
+
+def test_all_catalog_routes_stay_disabled_by_default(catalog_env):
+    env, calls = catalog_env
+    api.STATE.settings = None
+    for path, _count in CATALOG_PATHS:
+        response = call(env, path=path)
+        assert response.status_code == 404 and err(response) == "not_found"
+    assert calls == []
+
+
+def test_catalog_dynamic_capabilities_and_safe_config_failures(catalog_env, monkeypatch):
+    env, calls = catalog_env
+    expected = set(api.catalog.BASE_OPERATIONS + api.catalog.CATALOG_OPERATIONS)
+    capabilities = call(env, path="/integration/v1/capabilities").get_json()["data"]
+    me = call(env).get_json()["data"]
+    assert set(capabilities["operations"]) == set(me["operations"]) == expected
+    assert set(capabilities["incomplete"]) == set(api.OPERATION_NAMES) - expected
+    assert "requests.write" in capabilities["incomplete"] and calls == []
+    env.db.set_setting("DISCOVER_GENRE_TABS", "broken")
+    c = call(env, path="/integration/v1/capabilities").get_json()["data"]
+    assert "genre-tabs.read" not in c["operations"] and "catalog.search" in c["operations"]
+    r = call(env, path="/integration/v1/genre-tabs")
+    assert r.status_code == 503 and r.get_json()["error"]["retryable"] is False
+
+    def failure(key):
+        raise OSError("private configuration path")
+    monkeypatch.setattr(env.db, "get_setting", failure)
+    c = call(env, path="/integration/v1/capabilities").get_json()["data"]
+    assert c["operations"] == list(api.catalog.BASE_OPERATIONS)
+    assert call(env).status_code == 200
+    assert call(env, path="/integration/v1/requests", scope="requests:read").status_code == 200
+    response = call(env, path="/integration/v1/genre-tabs")
+    assert response.status_code == 503 and response.get_json()["error"]["retryable"] is True
+    response = call(env, path="/integration/v1/catalog/search?q=a")
+    assert response.status_code == 503 and calls == []
+    assert "private" not in response.get_data(as_text=True)
+
+
+def test_catalog_http_outage_missing_size_and_capability_stability(catalog_env, monkeypatch):
+    import tmdb_checked as tc
+    env, calls = catalog_env
+    expected = call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"]
+    def outage(*args):
+        raise tc.TmdbUnavailable("upstream_unreachable")
+    monkeypatch.setattr(tc, "fetch", outage)
+    response = call(env, path="/integration/v1/catalog/search?q=a")
+    assert response.status_code == 503 and response.get_json()["error"]["retryable"] is True
+    assert response.headers["Retry-After"] == "1"
+    assert call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"] == expected
+    def missing(*args):
+        raise tc.TmdbNotFound("not_found")
+    monkeypatch.setattr(tc, "fetch", missing)
+    assert call(env, path="/integration/v1/catalog/movie/603").status_code == 404
+    assert call(env, path="/integration/v1/catalog/search?q=a").status_code == 503
+    monkeypatch.setattr(tc, "fetch", lambda *a: {"page": 1, "total_pages": 1, "results": [
+        {"id": n, "media_type": "movie", "title": "Synthetic", "overview": "x" * 200000}
+        for n in range(1, 6)]})
+    response = call(env, path="/integration/v1/catalog/search?q=a")
+    assert response.status_code == 503 and not response.get_json()["error"]["retryable"]

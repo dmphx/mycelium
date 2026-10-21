@@ -1,9 +1,8 @@
 """Signed integration API facade: the HTTP boundary only.
 
-Foundation, not a full release. Implemented: GET me, capabilities, requests (list and
-one). Every other allowlisted operation authenticates and then answers 503
-capability_unqualified. Nothing here searches, calls a provider, or writes anything
-beyond the replay store.
+Implemented: GET me, capabilities, requests (list and one), and catalog metadata
+reads through integration_catalog_service. Other allowlisted operations authenticate
+and answer 503 capability_unqualified. No mutation beyond the replay store.
 
 Authentication is the receiver in integration_auth.py. This blueprint never reads the
 browser session or cookies, never trusts forwarded-URI headers, and never builds the
@@ -33,6 +32,7 @@ from werkzeug.routing import BaseConverter
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import integration_auth as ia
+import integration_catalog_service as catalog
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +53,6 @@ OPERATION_NAMES = (
     "requests.read", "requests.write", "playback-contexts.write", "issues.read", "issues.write",
 )
 ADVERTISED = ("me.read", "requests.read")
-INCOMPLETE = tuple(sorted(set(OPERATION_NAMES) - set(ADVERTISED)))
 
 _ID = r"[1-9][0-9]{0,9}"
 _RID = r"[1-9][0-9]{0,15}"
@@ -83,14 +82,14 @@ def _r(name, methods, pattern, scope, keys=_NONE, role=ia.VIEWER, handler="unqua
 ROUTES: tuple[Route, ...] = (
     _r("me", "GET", "/me", "catalog:read", handler="me"),
     _r("capabilities", "GET", "/capabilities", "catalog:read", handler="capabilities"),
-    _r("catalog.search", "GET", "/catalog/search", "catalog:read", frozenset({"q", "page", "type"})),
-    _r("catalog.rails", "GET", "/catalog/rails/(" + _RAILS + ")", "catalog:read", _RAIL_KEYS),
-    _r("catalog.details", "GET", "/catalog/(movie|tv)/" + _ID, "catalog:read"),
-    _r("catalog.seasons", "GET", "/catalog/tv/" + _ID + "/seasons/(0|[1-9][0-9]{0,3})", "catalog:read"),
-    _r("genres", "GET", "/genres", "catalog:read", frozenset({"type"})),
-    _r("providers", "GET", "/providers", "catalog:read", frozenset({"type", "region"})),
-    _r("genre-tabs", "GET", "/genre-tabs", "catalog:read"),
-    _r("people", "GET", "/people/" + _ID, "catalog:read"),
+    _r("catalog.search", "GET", "/catalog/search", "catalog:read", frozenset({"q", "page", "type"}), handler="catalog.search"),
+    _r("catalog.rails", "GET", "/catalog/rails/(" + _RAILS + ")", "catalog:read", _RAIL_KEYS, handler="catalog.rails"),
+    _r("catalog.details", "GET", "/catalog/(movie|tv)/(" + _ID + ")", "catalog:read", handler="catalog.details"),
+    _r("catalog.seasons", "GET", "/catalog/tv/(" + _ID + ")/seasons/(0|[1-9][0-9]{0,3})", "catalog:read", handler="catalog.seasons"),
+    _r("genres", "GET", "/genres", "catalog:read", frozenset({"type"}), handler="genres.read"),
+    _r("providers", "GET", "/providers", "catalog:read", frozenset({"type", "region"}), handler="providers.read"),
+    _r("genre-tabs", "GET", "/genre-tabs", "catalog:read", handler="genre-tabs.read"),
+    _r("people", "GET", "/people/(" + _ID + ")", "catalog:read", handler="people.read"),
     _r("follows.read", "GET", "/follows", "watchlist:read"),
     _r("follows.write", "POST/DELETE", "/follows/" + _ID, "watchlist:write"),
     _r("watchlist.read", "GET", "/watchlist", "watchlist:read", _LIST_KEYS),
@@ -340,13 +339,25 @@ def _me(vr, found) -> Response:  # noqa: ARG001
             "monthly_quota": {"limit": limit, "used": used,
                               "remaining": None if limit is None else max(0, limit - used)},
         },
-        "operations": list(ADVERTISED),
+        "operations": _operations(user),
     })
 
 
 def _capabilities(vr, found) -> Response:  # noqa: ARG001
-    return ok({"operations": list(ADVERTISED), "limits": dict(LIMITS),
-               "incomplete": list(INCOMPLETE)})
+    operations = _operations(vr.user)
+    return ok({"operations": operations, "limits": dict(LIMITS),
+               "incomplete": sorted(set(OPERATION_NAMES) - set(operations))})
+
+
+def _operations(user):
+    supported = catalog.operations(user)
+    return [name for name in OPERATION_NAMES if name in supported]
+
+
+def _catalog_handler(operation):
+    def handler(vr, found):
+        return ok(catalog.execute(operation, vr.target, vr.user, found.groups()))
+    return handler
 
 
 def _query(target: str) -> dict:
@@ -406,3 +417,4 @@ def _requests_get(vr, found) -> Response:
 
 _HANDLERS = {"me": _me, "capabilities": _capabilities, "requests_list": _requests_list,
              "requests_get": _requests_get, "unqualified": _unqualified}
+_HANDLERS.update({operation: _catalog_handler(operation) for operation in catalog.CATALOG_OPERATIONS})
