@@ -1,8 +1,8 @@
 """Signed integration API facade: the HTTP boundary only.
 
 Implemented: GET me, capabilities, requests (list and one), and catalog metadata
-reads through integration_catalog_service. Other allowlisted operations authenticate
-and answer 503 capability_unqualified. No mutation beyond the replay store.
+reads through integration_catalog_service, and isolated non-automatic saved people.
+Other allowlisted operations authenticate and answer 503 capability_unqualified.
 
 Authentication is the receiver in integration_auth.py. This blueprint never reads the
 browser session or cookies, never trusts forwarded-URI headers, and never builds the
@@ -33,6 +33,7 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 import integration_auth as ia
 import integration_catalog_service as catalog
+import integration_personalization as personalization
 
 log = logging.getLogger(__name__)
 
@@ -90,8 +91,8 @@ ROUTES: tuple[Route, ...] = (
     _r("providers", "GET", "/providers", "catalog:read", frozenset({"type", "region"}), handler="providers.read"),
     _r("genre-tabs", "GET", "/genre-tabs", "catalog:read", handler="genre-tabs.read"),
     _r("people", "GET", "/people/(" + _ID + ")", "catalog:read", handler="people.read"),
-    _r("follows.read", "GET", "/follows", "watchlist:read"),
-    _r("follows.write", "POST/DELETE", "/follows/" + _ID, "watchlist:write"),
+    _r("follows.read", "GET", "/follows", "watchlist:read", handler="follows_read"),
+    _r("follows.write", "POST/DELETE", "/follows/(" + _ID + ")", "watchlist:write", handler="follows_write"),
     _r("watchlist.read", "GET", "/watchlist", "watchlist:read", _LIST_KEYS),
     _r("watchlist.write", "POST/DELETE", "/watchlist", "watchlist:write"),
     _r("requests.list", "GET", "/requests", "requests:read", _LIST_KEYS, handler="requests_list"),
@@ -351,7 +352,17 @@ def _capabilities(vr, found) -> Response:  # noqa: ARG001
 
 def _operations(user):
     supported = catalog.operations(user)
+    supported.update(personalization.operations(user["id"], metadata_ready="people.read" in supported))
     return [name for name in OPERATION_NAMES if name in supported]
+
+
+def _follows_read(vr, found):
+    return ok(personalization.list_saved_people(vr.user["id"]))
+
+
+def _follows_write(vr, found):
+    return ok(personalization.mutate_saved_person(vr.user["id"], vr.method, int(found.group(1)),
+                                                vr.body, vr.idempotency_key, vr.body_sha256))
 
 
 def _catalog_handler(operation):
@@ -416,5 +427,6 @@ def _requests_get(vr, found) -> Response:
 
 
 _HANDLERS = {"me": _me, "capabilities": _capabilities, "requests_list": _requests_list,
-             "requests_get": _requests_get, "unqualified": _unqualified}
+             "requests_get": _requests_get, "unqualified": _unqualified,
+             "follows_read": _follows_read, "follows_write": _follows_write}
 _HANDLERS.update({operation: _catalog_handler(operation) for operation in catalog.CATALOG_OPERATIONS})
