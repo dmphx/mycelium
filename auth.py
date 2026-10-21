@@ -385,6 +385,10 @@ def install_before_request(app) -> None:
     def _enforce():
         if not is_enabled():
             return None
+        if request.endpoint == "integration_v1.dispatch":
+            # Exact endpoint only: the signed-assertion receiver authenticates this
+            # route itself and never reads the browser session.
+            return None
         path = request.path
         if _compat_route():
             return None

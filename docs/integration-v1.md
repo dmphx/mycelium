@@ -291,3 +291,84 @@ kind. Unknown availability is never inferred as missing.
   ]
 }
 ```
+
+## HTTP boundary (`integration_api.py`)
+
+A single blueprint (`integration_v1`, endpoint `integration_v1.dispatch`) owns every
+`/integration/v1` path. It is the only endpoint the global login gate lets through, by
+exact endpoint name. CSRF protection is exempted for this blueprint only. The blueprint
+never reads the browser session or cookies, never sets a cookie, and answers `404`
+exactly like an unknown route while `INTEGRATION_ENABLED` is off.
+
+The signed target is the server-owned WSGI variable `RAW_URI`. If it is missing or not an
+origin-form `/integration/v1...` target the answer is `503 raw_target_unavailable`.
+`X-Original-URI`, `X-Forwarded-*` headers and the decoded path are never used. Any alias
+(`//`, `%2F`, dot segments, trailing slash, unsorted or lowercase-escaped queries) is a
+`400`; there are no redirects (`merge_slashes` and `strict_slashes` are off). `HEAD`,
+`OPTIONS`, `PUT` and `PATCH` answer `405` with `Allow: GET, POST, DELETE`; there is no CORS.
+Request bodies are read with a hard bound of 65537 bytes (a larger `Content-Length` is
+refused first) and never parsed by the framework. WSGI folds duplicate headers before this
+code runs, so duplicate-header framing at the real edge is still to be qualified;
+comma-folded security headers fail closed.
+
+Order of operations: method, enabled, raw target, canonical form, route lookup (uniform
+404), receiver verification (this consumes the `jti`), per-viewer rate limit, handler.
+A refused or unqualified request therefore still consumes its assertion; retry with a new
+one. The rate limit is an in-memory token bucket (burst 60, 20 per second, at most 2048
+tracked viewers) and answers `429` with `Retry-After`.
+
+### Route, scope and query map
+
+All routes use the viewer keyring except `POST /readers` (service keyring, `readers:write`).
+`list` keys are `before_id` (positive integer, at most 16 digits) and `limit` (1 to 100,
+no leading zero).
+
+| Method and path | Scope | Query keys | Status |
+|---|---|---|---|
+| GET `/me` | catalog:read | none | implemented |
+| GET `/capabilities` | catalog:read | none | implemented |
+| GET `/requests` | requests:read | list | implemented |
+| GET `/requests/<id>` | requests:read | none | implemented (foreign and missing are the same 404) |
+| GET `/catalog/search` | catalog:read | q, page, type | 503 |
+| GET `/catalog/rails/<rail>` | catalog:read | type, region, window, provider_id, genre_id, year_from, year_to, page | 503 |
+| GET `/catalog/(movie\|tv)/<id>`, `/catalog/tv/<id>/seasons/<n>` | catalog:read | none | 503 |
+| GET `/genres` | catalog:read | type | 503 |
+| GET `/providers` | catalog:read | type, region | 503 |
+| GET `/genre-tabs`, `/people/<id>` | catalog:read | none | 503 |
+| GET `/follows` | watchlist:read | none | 503 |
+| POST, DELETE `/follows/<id>` | watchlist:write | none | 503 (not advertised) |
+| GET `/watchlist` | watchlist:read | list | 503 |
+| POST, DELETE `/watchlist` | watchlist:write | none | 503 |
+| POST `/requests` | requests:write | none | 503 |
+| POST `/availability` | availability:read | none | 503 |
+| POST `/playback-contexts` | playback-contexts:write | none | 503 |
+| GET `/issues`, `/issues/<id>` | issues:read | list, none | 503 |
+| POST `/issues` | issues:write | none | 503 |
+| POST `/readers` | readers:write (service) | none | 503 |
+
+A `503 capability_unqualified` (`retryable: false`) is returned only after a valid signed
+request; it performs no database write other than the replay store and makes no catalog,
+provider or search call. `GET /capabilities` advertises only `me.read` and `requests.read`;
+every other operation name is listed under `incomplete` in sorted order. Following a person
+is not advertised because existing favorite-actor rows trigger automatic requests.
+
+`GET /me` re-reads the native user row and returns the id, a display name (the username
+when no safe display name exists), the approval policy (`automatic` for administrators and
+auto-approve users) and the UTC calendar-month request count (denied requests excluded).
+A quota of 0 or an administrator gives `limit` and `remaining` of `null`.
+
+`GET /requests` fetches `limit + 1` rows and returns `next_before_id` only when more rows
+exist. Receipts always carry `availability` as unknown in every field.
+
+### Verification inputs
+
+The receiver tests use generated synthetic RSA keys and temporary SQLite databases.
+The application boundary test runs real startup, authentication, CSRF, the default
+identity resolver and replay store in an isolated subprocess with network access
+disabled. Browser cookies cannot replace or change the assertion actor.
+
+Cross-language qualification additionally sets `MYCELIUM_WIRE_VECTORS` to the pinned
+public-key fixture and `MYCELIUM_INTEGRATION_CONTRACT` to the reviewed route proposal.
+These optional checks skip when their inputs are absent; skips are not release evidence.
+Synthetic HTTP fixture results do not qualify raw production-edge framing, catalog
+policy, library grants or repair activation.

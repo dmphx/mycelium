@@ -2756,6 +2756,12 @@ _seerr_bp = seerr_compat.create_blueprint(
 _csrf.exempt(_seerr_bp)
 app.register_blueprint(_seerr_bp)
 
+# Signed integration API: bearer assertions only, no cookies or CSRF tokens. Disabled
+# (answers 404) unless INTEGRATION_ENABLED is set.
+import integration_api
+_csrf.exempt(integration_api.bp)
+app.register_blueprint(integration_api.bp)
+
 
 # ── Retry queue + show overrides + metrics + TorBox usage ─────────────────────
 
