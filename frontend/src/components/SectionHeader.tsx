@@ -8,12 +8,12 @@ export default function SectionHeader({
   action?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-end justify-between mb-3">
-      <div>
-        <h2 className="text-xl font-bold">{title}</h2>
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+      <div className="min-w-0">
+        <h2 className="text-lg font-semibold tracking-[-0.025em]">{title}</h2>
         {subtitle && <p className="text-sm text-muted mt-0.5">{subtitle}</p>}
       </div>
-      {action && <div className="flex gap-2">{action}</div>}
+      {action && <div className="flex max-w-full flex-wrap gap-2">{action}</div>}
     </div>
   );
 }

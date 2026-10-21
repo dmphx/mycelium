@@ -1,274 +1,140 @@
-import Brand from './Brand';
-import { appName } from '../branding';
+import { useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import Brand from './Brand';
+import Icon, { type IconName } from './Icon';
+import { appName } from '../branding';
 import { api } from '../api';
+import type { SessionInfo } from '../types';
 
-const navItems = [
-  { to: '/', label: 'Discover', icon: '✨', exact: true },
-  { to: '/library', label: 'Library', icon: '📚' },
-  { to: '/watchlist', label: 'Watchlist', icon: '★' },
-  { to: '/search', label: 'Search', icon: '🔍' },
-  { to: '/requests', label: 'My Requests', icon: '📋' },
-  { to: '/settings', label: 'Settings', icon: '🔌' },
+type NavigationItem = { to: string; label: string; icon: IconName; exact?: boolean };
+const navItems: NavigationItem[] = [
+  { to: '/', label: 'Discover', icon: 'discover', exact: true },
+  { to: '/library', label: 'Library', icon: 'library' },
+  { to: '/watchlist', label: 'Watchlist', icon: 'watchlist' },
+  { to: '/search', label: 'Search', icon: 'search' },
+  { to: '/requests', label: 'My requests', icon: 'requests' },
+  { to: '/settings', label: 'Settings', icon: 'settings' },
 ];
-
-const adminItems = [
-  { to: '/wanted', label: 'Wanted', icon: '⏳' },
-  { to: '/admin', label: 'Admin', icon: '⚙️' },
-  { to: '/manual', label: 'Manual', icon: '📖' },
+const adminItems: NavigationItem[] = [
+  { to: '/wanted', label: 'Wanted', icon: 'wanted' },
+  { to: '/admin', label: 'Admin', icon: 'admin' },
+  { to: '/manual', label: 'Manual', icon: 'manual' },
 ];
+const routeTitle = (path: string) => [...navItems, ...adminItems].find(item => item.to === path)?.label || appName;
 
 export default function Layout() {
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawer = useRef<HTMLDialogElement>(null);
   const location = useLocation();
-  const { data: session } = useQuery({
-    queryKey: ['session'],
-    queryFn: api.session,
-    staleTime: 60_000,
-  });
+  const session = useQuery({ queryKey: ['session'], queryFn: api.session, staleTime: 60_000 });
+  const showAdmin = session.data?.user?.role === 'admin' || session.data?.authenticated === false;
+  const close = () => setDrawerOpen(false);
 
-  const isAdmin = session?.user?.role === 'admin';
-  const showAdmin = isAdmin || !session?.authenticated;  // bootstrap visible
+  useEffect(() => {
+    const dialog = drawer.current;
+    if (!dialog) return;
+    if (!drawerOpen) { if (dialog.open) dialog.close(); return; }
+    const oldOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    dialog.showModal();
+    return () => { if (dialog.open) dialog.close(); document.body.style.overflow = oldOverflow; };
+  }, [drawerOpen]);
+  useEffect(close, [location.pathname]);
+  useEffect(() => {
+    const wide = window.matchMedia('(min-width: 1024px)');
+    const resize = () => { if (wide.matches) close(); };
+    wide.addEventListener('change', resize);
+    return () => wide.removeEventListener('change', resize);
+  }, []);
 
-  return (
-    <div className="min-h-screen flex bg-bg text-white">
-      {/* Sidebar (desktop) + Drawer (mobile) */}
-      <aside
-        className={`
-          fixed lg:sticky top-0 left-0 h-screen w-56 bg-card border-r border-border z-40
-          transition-transform duration-200
-          ${drawerOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0
-        `}
-      >
-        <div className="px-5 py-5 flex items-center gap-3 border-b border-border">
-          <Brand className="h-11 w-full object-left" />
-        </div>
-        <nav className="py-3">
-          <SidebarSection title="Browse" items={navItems} onClick={() => setDrawerOpen(false)} />
-          {showAdmin && (
-            <SidebarSection title="Manage" items={adminItems} onClick={() => setDrawerOpen(false)} />
-          )}
-        </nav>
-        <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-border text-xs text-muted">
-          {session?.user ? (
-            <div className="flex items-center justify-between">
-              <span>👤 {session.user.username}</span>
-              <a href="/logout" className="hover:text-white">Log out</a>
-            </div>
-          ) : (
-            <a href="/login" className="hover:text-white">Sign in</a>
-          )}
-          <div className="mt-2 text-center text-[10px] opacity-50">v0.6.0-beta</div>
-        </div>
-      </aside>
-      {/* Drawer overlay */}
-      {drawerOpen && (
-        <div
-          className="fixed inset-0 bg-black/50 z-30 lg:hidden"
-          onClick={() => setDrawerOpen(false)}
-        />
-      )}
-
-      {/* Main content */}
-      <div className="flex-1 min-w-0 flex flex-col">
-        <header className="sticky top-0 z-20 bg-bg/80 backdrop-blur border-b border-border">
-          <div className="flex items-center gap-3 px-4 lg:px-8 py-3">
-            <button
-              className="lg:hidden p-2 -ml-2 hover:bg-card rounded text-white"
-              onClick={() => setDrawerOpen(true)}
-              aria-label="Open menu"
-            >
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
-              </svg>
-            </button>
-            <Breadcrumb path={location.pathname} />
-            <TopbarSearch />
-            <div className="ml-auto flex items-center gap-2">
-              {session?.user && <RegionPicker region={session.user.region || 'NL'} />}
-            </div>
-          </div>
-        </header>
-        <main className="flex-1 px-4 lg:px-8 py-6">
-          <Outlet />
-        </main>
-      </div>
+  const sidebar = (mobile: boolean) => <div className="flex min-h-0 h-full flex-col">
+    <div className="flex min-h-[92px] items-center justify-between gap-3 px-5">
+      <NavLink to="/" onClick={close} aria-label={`${appName} home`} className="flex min-h-11 min-w-0 items-center">
+        <Brand className="h-9 max-w-[174px] object-left" />
+      </NavLink>
+      {mobile && <button type="button" aria-label="Close navigation" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-field bg-control" onClick={close}><Icon name="close" /></button>}
     </div>
-  );
+    <nav aria-label={mobile ? 'Mobile navigation' : 'Main navigation'} className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+      <SidebarSection title="Your media" items={navItems} onClick={close} />
+      {showAdmin && <SidebarSection title="Manage" items={adminItems} onClick={close} />}
+    </nav>
+    <div className="mx-3 border-t border-border px-2 pb-5 pt-4">
+      {session.data?.user ? <div className="flex min-w-0 items-center gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border bg-control text-xs" aria-hidden="true">{Array.from(session.data.user.username)[0]?.toUpperCase()}</span>
+        <div className="min-w-0 flex-1"><div className="truncate text-sm" title={session.data.user.username}>{session.data.user.username}</div><div className="mt-0.5 text-xs text-muted">{session.data.user.role === 'admin' ? 'Administrator' : 'Personal account'}</div></div>
+        <a href="/logout" aria-label="Log out" title="Log out" className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-lg text-muted hover:bg-control hover:text-white"><Icon name="logout" /></a>
+      </div> : session.isPending ? <p role="status" className="text-sm text-muted">Loading account...</p> : session.isError ? <p className="text-sm text-muted">Account unavailable</p> : <a href="/login" className="flex min-h-11 items-center text-sm text-muted hover:text-white">Sign in</a>}
+      <div className="mt-4 text-[11px] text-muted">Requests and discovery</div>
+    </div>
+  </div>;
+
+  return <div className="flex min-h-screen bg-bg text-[#f5f4f1]">
+    <a href="#main-content" className="sr-only z-[500] rounded-lg bg-accent px-4 py-3 text-accent-ink focus:not-sr-only focus:fixed focus:left-4 focus:top-4">Skip to content</a>
+    <aside className="sticky top-0 hidden h-dvh w-[232px] shrink-0 border-r border-border bg-card lg:block">{sidebar(false)}</aside>
+    <dialog ref={drawer} className="navigation-dialog" aria-label="Navigation" onCancel={close} onClose={close} onClick={event => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) close();
+    }}>{sidebar(true)}</dialog>
+    <div className="flex min-w-0 flex-1 flex-col">
+      <header className="sticky top-0 z-20 border-b border-border bg-bg/95 backdrop-blur-md">
+        <div className="mx-auto flex min-h-[76px] max-w-[1680px] flex-wrap items-center gap-3 px-4 py-3 sm:px-6 lg:gap-6 lg:px-8">
+          <button type="button" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-field bg-control lg:hidden" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-haspopup="dialog" aria-expanded={drawerOpen}><Icon name="menu" size={20} /></button>
+          <nav aria-label="Breadcrumb" className="hidden min-w-0 items-center gap-3 text-xs text-muted sm:flex"><span>{appName}</span><Icon name="chevron-right" size={12} /><span className="whitespace-nowrap text-white">{routeTitle(location.pathname)}</span></nav>
+          <div className="min-w-0 flex-1 sm:ml-auto sm:max-w-md"><TopbarSearch /></div>
+          {session.data?.user && <RegionPicker region={session.data.user.region || 'NL'} />}
+        </div>
+      </header>
+      <main id="main-content" tabIndex={-1} className="mx-auto w-full max-w-[1680px] min-w-0 flex-1 px-4 py-7 sm:px-6 lg:px-8 lg:py-8">
+        <h1 className="sr-only">{routeTitle(location.pathname)}</h1>
+        {session.isError && <div role="alert" className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-danger/40 bg-card p-3 text-sm"><span>Could not load your account.</span><button type="button" onClick={() => session.refetch()} className="min-h-11 rounded-lg border border-field px-3">Try again</button></div>}
+        <Outlet />
+      </main>
+    </div>
+  </div>;
 }
 
 function TopbarSearch() {
   const navigate = useNavigate();
   const [q, setQ] = useState('');
-
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (q.trim()) navigate(`/search?q=${encodeURIComponent(q.trim())}`);
-  };
-
-  return (
-    <form onSubmit={submit} className="hidden sm:block flex-1 max-w-sm">
-      <div className="relative">
-        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted text-sm pointer-events-none">🔍</span>
-        <input
-          type="search"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="Search movies and series..."
-          className="w-full bg-card border border-border rounded-lg pl-9 pr-3 py-1.5 text-sm
-                     placeholder:text-muted focus:outline-none focus:border-accent"
-        />
-      </div>
-    </form>
-  );
+  return <form role="search" onSubmit={event => { event.preventDefault(); if (q.trim()) navigate(`/search?q=${encodeURIComponent(q.trim())}`); }}>
+    <label className="relative block">
+      <span className="sr-only">Search movies and series</span>
+      <Icon name="search" size={17} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+      <input type="search" value={q} onChange={event => setQ(event.target.value)} placeholder="Search movies and series" className="min-h-11 w-full min-w-0 rounded-lg border border-field bg-control py-2 pl-10 pr-3 text-sm placeholder:text-muted" />
+    </label>
+  </form>;
 }
 
-function SidebarSection({
-  title,
-  items,
-  onClick,
-}: {
-  title: string;
-  items: { to: string; label: string; icon: string; exact?: boolean; external?: boolean }[];
-  onClick: () => void;
-}) {
-  return (
-    <div className="mb-2">
-      {title && (
-        <div className="px-5 pt-3 pb-1 text-[10px] uppercase tracking-wider text-muted font-semibold">
-          {title}
-        </div>
-      )}
-      {items.map((item) =>
-        item.external ? (
-          <a
-            key={item.to}
-            href={item.to}
-            onClick={onClick}
-            className="flex items-center gap-3 px-5 py-2 text-sm transition relative text-muted hover:text-white hover:bg-bg"
-          >
-            <span className="text-base">{item.icon}</span>
-            <span>{item.label}</span>
-          </a>
-        ) : (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.exact}
-            onClick={onClick}
-            className={({ isActive }) =>
-              `flex items-center gap-3 px-5 py-2 text-sm transition relative
-               ${isActive
-                  ? 'text-white bg-accent/10 before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-accent'
-                  : 'text-muted hover:text-white hover:bg-bg'
-                }`
-            }
-          >
-            <span className="text-base">{item.icon}</span>
-            <span>{item.label}</span>
-          </NavLink>
-        )
-      )}
-    </div>
-  );
+function SidebarSection({ title, items, onClick }: { title: string; items: NavigationItem[]; onClick: () => void }) {
+  return <section className="mb-6"><h2 className="mb-2 px-3 text-[10px] font-medium uppercase tracking-[0.12em] text-muted">{title}</h2>
+    <div className="space-y-1">{items.map(item => <NavLink key={item.to} to={item.to} end={item.exact} onClick={onClick} className={({ isActive }) => `flex min-h-11 items-center gap-3 rounded-lg border px-3 text-[13px] transition-colors ${isActive ? 'border-white/15 bg-white/[0.075] text-white' : 'border-transparent text-muted hover:bg-control hover:text-white'}`}><Icon name={item.icon} size={18} /><span>{item.label}</span></NavLink>)}</div>
+  </section>;
 }
 
-const REGIONS: { code: string; flag: string; name: string }[] = [
-  { code: 'NL', flag: '\u{1F1F3}\u{1F1F1}', name: 'Netherlands' },
-  { code: 'BE', flag: '\u{1F1E7}\u{1F1EA}', name: 'Belgium' },
-  { code: 'ZA', flag: '\u{1F1FF}\u{1F1E6}', name: 'South Africa' },
-  { code: 'US', flag: '\u{1F1FA}\u{1F1F8}', name: 'United States' },
-  { code: 'GB', flag: '\u{1F1EC}\u{1F1E7}', name: 'United Kingdom' },
-  { code: 'DE', flag: '\u{1F1E9}\u{1F1EA}', name: 'Germany' },
-  { code: 'FR', flag: '\u{1F1EB}\u{1F1F7}', name: 'France' },
-  { code: 'ES', flag: '\u{1F1EA}\u{1F1F8}', name: 'Spain' },
-  { code: 'IT', flag: '\u{1F1EE}\u{1F1F9}', name: 'Italy' },
-  { code: 'AU', flag: '\u{1F1E6}\u{1F1FA}', name: 'Australia' },
-  { code: 'CA', flag: '\u{1F1E8}\u{1F1E6}', name: 'Canada' },
-  { code: 'BR', flag: '\u{1F1E7}\u{1F1F7}', name: 'Brazil' },
-  { code: 'IN', flag: '\u{1F1EE}\u{1F1F3}', name: 'India' },
-  { code: 'JP', flag: '\u{1F1EF}\u{1F1F5}', name: 'Japan' },
-  { code: 'KR', flag: '\u{1F1F0}\u{1F1F7}', name: 'South Korea' },
-  { code: 'SE', flag: '\u{1F1F8}\u{1F1EA}', name: 'Sweden' },
-  { code: 'NO', flag: '\u{1F1F3}\u{1F1F4}', name: 'Norway' },
-  { code: 'DK', flag: '\u{1F1E9}\u{1F1F0}', name: 'Denmark' },
-  { code: 'PT', flag: '\u{1F1F5}\u{1F1F9}', name: 'Portugal' },
-  { code: 'PL', flag: '\u{1F1F5}\u{1F1F1}', name: 'Poland' },
+const REGIONS = [
+  ['NL', 'Netherlands'], ['BE', 'Belgium'], ['ZA', 'South Africa'], ['US', 'United States'], ['GB', 'United Kingdom'],
+  ['DE', 'Germany'], ['FR', 'France'], ['ES', 'Spain'], ['IT', 'Italy'], ['AU', 'Australia'], ['CA', 'Canada'],
+  ['BR', 'Brazil'], ['IN', 'India'], ['JP', 'Japan'], ['KR', 'South Korea'], ['SE', 'Sweden'], ['NO', 'Norway'],
+  ['DK', 'Denmark'], ['PT', 'Portugal'], ['PL', 'Poland'],
 ];
 
 function RegionPicker({ region }: { region: string }) {
-  const [open, setOpen] = useState(false);
   const queryClient = useQueryClient();
   const mutation = useMutation({
-    mutationFn: (code: string) => api.setRegion(code),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['session'] });
-      queryClient.invalidateQueries({ queryKey: ['trending'] });
-      queryClient.invalidateQueries({ queryKey: ['popular'] });
-      queryClient.invalidateQueries({ queryKey: ['top-rated'] });
-      queryClient.invalidateQueries({ queryKey: ['now-playing'] });
-      queryClient.invalidateQueries({ queryKey: ['upcoming'] });
-      queryClient.invalidateQueries({ queryKey: ['providers'] });
-      queryClient.invalidateQueries({ queryKey: ['by-provider'] });
+    mutationFn: api.setRegion,
+    onSuccess: (_data, code) => {
+      queryClient.setQueryData<SessionInfo>(['session'], old => old?.user ? { ...old, user: { ...old.user, region: code } } : old);
+      queryClient.invalidateQueries();
     },
   });
-
-  const current = REGIONS.find((r) => r.code === region);
-  const flag = current?.flag || region;
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 px-2 py-1 rounded border border-border hover:border-accent/50 text-sm transition"
-        title={current?.name || region}
-      >
-        <span className="text-base">{flag}</span>
-        <span className="text-xs text-muted">{region}</span>
-      </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full mt-1 z-50 bg-card border border-border rounded-lg shadow-xl overflow-hidden w-48 max-h-64 overflow-y-auto">
-            {REGIONS.map((r) => (
-              <button
-                key={r.code}
-                type="button"
-                onClick={() => {
-                  mutation.mutate(r.code);
-                  setOpen(false);
-                }}
-                className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition
-                  ${r.code === region ? 'bg-accent/10 text-white' : 'text-muted hover:text-white hover:bg-bg'}`}
-              >
-                <span>{r.flag}</span>
-                <span>{r.name}</span>
-                <span className="ml-auto text-[10px] opacity-50">{r.code}</span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function Breadcrumb({ path }: { path: string }) {
-  const map: Record<string, string> = {
-    '/': 'Discover',
-    '/library': 'Library',
-    '/watchlist': 'Watchlist',
-    '/search': 'Search',
-    '/requests': 'My Requests',
-    '/wanted': 'Wanted',
-    '/settings': 'Settings',
-    '/admin': 'Admin',
-    '/manual': 'Manual',
-    '/login': 'Sign in',
-  };
-  const title = map[path] || appName;
-  return <h1 className="font-semibold text-lg">{title}</h1>;
+  return <div className="relative shrink-0">
+    <label className="relative block"><span className="sr-only">Catalog region</span>
+      <select value={region} onChange={event => { if (mutation.isPending) return; mutation.reset(); mutation.mutate(event.target.value); }} className="min-h-11 w-[72px] appearance-none rounded-lg border border-field bg-control py-2 pl-3 pr-6 text-transparent" aria-busy={mutation.isPending}>
+        {!REGIONS.some(([code]) => code === region) && <option value={region} className="text-white">{region}</option>}
+        {REGIONS.map(([code, name]) => <option key={code} value={code} className="text-white">{code} · {name}</option>)}
+      </select><span aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-xs font-medium">{region}</span><Icon name="chevron-down" size={12} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted" />
+    </label>
+    {mutation.isError && <p role="alert" className="absolute right-0 top-full z-30 mt-2 w-60 max-w-[85vw] rounded-lg border border-danger/50 bg-card p-3 text-xs shadow-xl">Could not update the catalog region. Try again.</p>}
+  </div>;
 }

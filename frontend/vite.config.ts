@@ -35,6 +35,7 @@ export default defineConfig({
   resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   base: '/',
   build: {
+    assetsInlineLimit: 0,
     outDir: '../static/app',
     emptyOutDir: true,
     assetsDir: 'assets',

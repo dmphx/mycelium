@@ -68,6 +68,7 @@ COPY plugins/ ./plugins/
 COPY scripts/rebuild_enrichment_queue.py ./scripts/rebuild_enrichment_queue.py
 COPY templates/ ./templates/
 COPY docs/ ./docs/
+COPY LICENSE ./LICENSE
 # Built SPA from stage 1 (Vite writes to ../static/app relative to frontend/)
 COPY --from=frontend /static/app/ ./static/app/
 # Also copy pre-built SPA if present (skips npm build when static/app/ is tracked)
