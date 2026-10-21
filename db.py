@@ -468,6 +468,8 @@ def init() -> None:
             if stmt:
                 conn.execute(stmt)
         _dedup_requests(conn)
+        import request_intents
+        request_intents.init_schema(conn)
         conn.commit()
     _migrate()
     integrity_check()
