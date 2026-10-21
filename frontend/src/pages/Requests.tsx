@@ -1,50 +1,43 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
+import Icon from '../components/Icon';
+
+const controlStyle = 'min-h-11 px-4 py-2 rounded-xl border border-field bg-control text-sm hover:bg-raised disabled:opacity-50';
 
 export default function Requests() {
   const { data: sessionData } = useQuery({ queryKey: ['session'], queryFn: api.session });
   const isAdmin = sessionData?.user?.role === 'admin';
-  const { data, isLoading } = useQuery({ queryKey: ['my-requests'], queryFn: api.myRequests });
-  if (isLoading) return <div className="text-muted">Loading…</div>;
+  const { data, isLoading, isError, isFetching, refetch } = useQuery({ queryKey: ['my-requests'], queryFn: api.myRequests });
   const items = data?.items || [];
   return (
-    <div className="space-y-8">
+    <div className="min-w-0 space-y-8">
       {isAdmin && <PendingApprovalsPanel />}
-      <section>
-        <h2 className="text-lg font-bold mb-3">My requests</h2>
-        {items.length === 0 ? (
-          <div className="text-center py-8">
-            <div className="text-5xl mb-3">📋</div>
-            <h2 className="text-lg font-semibold mb-1">No requests yet</h2>
-            <p className="text-muted text-sm">Anything you add from Discover shows up here.</p>
+      <section aria-labelledby="my-requests-heading" className="space-y-4">
+        <h2 id="my-requests-heading" className="text-lg font-semibold">My requests</h2>
+        {isError && <QueryError message={data ? 'Could not refresh your requests. Previous results are still shown.' : 'Could not load your requests.'}
+          busy={isFetching} onRetry={() => void refetch()} />}
+        {isLoading ? <p className="text-muted text-sm py-6" role="status">Loading your requests…</p> : items.length === 0 ? !isError && (
+          <div className="text-center rounded-xl border border-border bg-card px-5 py-12">
+            <Icon name="requests" size={28} className="mx-auto mb-4 text-muted" />
+            <h3 className="text-lg font-semibold mb-1">No requests yet</h3>
+            <p className="text-muted text-sm">Requests you submit will appear here.</p>
           </div>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="text-xs text-muted uppercase border-b border-border">
-              <tr>
-                <th className="text-left py-2 px-3">Title</th>
-                <th className="text-left py-2 px-3">Type</th>
-                <th className="text-left py-2 px-3">Approval</th>
-                <th className="text-left py-2 px-3">Library</th>
-                <th className="text-left py-2 px-3">Requested</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((r: any) => (
-                <tr key={r.id} className="border-b border-border/50 hover:bg-card">
-                  <td className="py-2 px-3 font-medium">{r.title}</td>
-                  <td className="py-2 px-3 text-muted">{r.media_type}</td>
-                  <td className="py-2 px-3">
-                    <StatusPill status={r.status} />
-                  </td>
-                  <td className="py-2 px-3">
-                    <LibraryPill status={r.library_status} />
-                  </td>
-                  <td className="py-2 px-3 text-muted text-xs">{r.created_at}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <ul className="space-y-3">
+            {items.map((r: any) => (
+              <li key={r.id} className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-5">
+                <div className="flex min-w-0 flex-col lg:flex-row gap-4 lg:gap-6">
+                  <h3 className="min-w-0 flex-1 text-sm font-semibold [overflow-wrap:anywhere]">{r.title}</h3>
+                  <dl className="grid min-w-0 flex-[2] grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                    <div className="min-w-0"><dt className="text-xs text-muted mb-2">Type</dt><dd>{r.media_type === 'tv' ? 'Series' : 'Movie'}</dd></div>
+                    <div className="min-w-0"><dt className="text-xs text-muted mb-2">Approval</dt><dd><StatusPill status={r.status} /></dd></div>
+                    <div className="min-w-0"><dt className="text-xs text-muted mb-2">Library</dt><dd><LibraryPill status={r.library_status} /></dd></div>
+                    <div className="min-w-0"><dt className="text-xs text-muted mb-2">Requested</dt><dd className="text-xs [overflow-wrap:anywhere]">{r.created_at || 'Not recorded'}</dd></div>
+                  </dl>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
       </section>
 
@@ -53,26 +46,47 @@ export default function Requests() {
   );
 }
 
+function QueryError({ message, busy, onRetry }: { message: string; busy: boolean; onRetry: () => void }) {
+  return <div role="alert" className="rounded-xl border border-border bg-card p-5 space-y-3">
+    <p className="text-sm">{message}</p>
+    <button type="button" onClick={onRetry} disabled={busy} className={controlStyle}>
+      {busy ? 'Refreshing…' : 'Refresh list'}
+    </button>
+  </div>;
+}
+
 function FailedRequestsPanel() {
   const qc = useQueryClient();
-  const { data } = useQuery({ queryKey: ['failed-requests'], queryFn: api.failedRequests, refetchInterval: 10000 });
+  const { data, isError, isFetching, refetch } = useQuery({ queryKey: ['failed-requests'], queryFn: api.failedRequests, refetchInterval: 10000 });
   const retryMut = useMutation({
     mutationFn: (id: number) => api.retryRequest(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['failed-requests'] });
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['failed-requests'] }),
+        qc.invalidateQueries({ queryKey: ['my-requests'] }),
+      ]);
     },
   });
 
   const items = data?.items || [];
-  if (items.length === 0) return null;
+  if (items.length === 0 && !isError && !retryMut.isError) return null;
+
+  const refresh = async () => {
+    const result = await refetch();
+    if (!result.isError) retryMut.reset();
+  };
 
   return (
-    <section>
+    <section className="min-w-0 space-y-4">
       <h2 className="text-lg font-bold mb-3 text-red-400">Failed requests</h2>
       <p className="text-muted text-xs mb-3">
         These requests failed to find a stream. The system retries automatically  -  you can also retry manually.
       </p>
-      <table className="w-full text-sm">
+      {(isError || retryMut.isError) && <QueryError
+        message={retryMut.isError ? 'Could not confirm the retry. Refresh to check its status.' : 'Could not refresh failed requests.'}
+        busy={isFetching} onRetry={() => void refresh()} />}
+      {items.length > 0 && <div role="region" aria-label="Failed request details" tabIndex={0} className="max-w-full overflow-x-auto rounded-xl border border-border">
+      <table className="w-full min-w-[640px] text-sm">
         <thead className="text-xs text-muted uppercase border-b border-border">
           <tr>
             <th className="text-left py-2 px-3">Title</th>
@@ -93,52 +107,69 @@ function FailedRequestsPanel() {
               <td className="py-2 px-3 text-muted text-xs">{r.updated_at}</td>
               <td className="py-2 px-3 text-right">
                 <button
+                  type="button"
                   onClick={() => retryMut.mutate(r.id)}
-                  disabled={retryMut.isPending}
-                  className="px-3 py-1 rounded bg-accent/20 text-accent text-xs hover:bg-accent/30 disabled:opacity-50"
+                  disabled={retryMut.isPending || retryMut.isError || isError}
+                  aria-label={`Retry ${r.title}`}
+                  className={controlStyle}
                 >
-                  ↺ Retry
+                  {retryMut.isPending && retryMut.variables === r.id ? 'Retrying…' : 'Retry'}
                 </button>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+      </div>}
     </section>
   );
 }
 
 function PendingApprovalsPanel() {
   const qc = useQueryClient();
-  const { data } = useQuery({
+  const { data, isError, isFetching, refetch } = useQuery({
     queryKey: ['pending-requests'],
     queryFn: () => api.userRequests('pending'),
     refetchInterval: 15000,
   });
   const approveMut = useMutation({
     mutationFn: (id: number) => api.approveRequest(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['pending-requests'] });
-      qc.invalidateQueries({ queryKey: ['my-requests'] });
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['pending-requests'] }),
+        qc.invalidateQueries({ queryKey: ['my-requests'] }),
+      ]);
     },
   });
   const denyMut = useMutation({
     mutationFn: ({ id, note }: { id: number; note?: string }) => api.denyRequest(id, note),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['pending-requests'] });
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['pending-requests'] }),
+        qc.invalidateQueries({ queryKey: ['my-requests'] }),
+      ]);
     },
   });
 
   const items = data?.items || [];
-  if (items.length === 0) return null;
+  const uncertain = approveMut.isError || denyMut.isError;
+  if (items.length === 0 && !isError && !uncertain) return null;
+  const refresh = async () => {
+    const result = await refetch();
+    if (!result.isError) { approveMut.reset(); denyMut.reset(); }
+  };
 
   return (
-    <section>
+    <section className="min-w-0 space-y-4">
       <h2 className="text-lg font-bold mb-3 text-amber">Pending approvals</h2>
       <p className="text-muted text-xs mb-3">
         These requests need your approval before they are processed.
       </p>
-      <table className="w-full text-sm">
+      {(isError || uncertain) && <QueryError
+        message={uncertain ? 'Could not confirm the update. Refresh before trying again.' : 'Could not refresh pending approvals.'}
+        busy={isFetching} onRetry={() => void refresh()} />}
+      {items.length > 0 && <div role="region" aria-label="Pending approval details" tabIndex={0} className="max-w-full overflow-x-auto rounded-xl border border-border">
+      <table className="w-full min-w-[680px] text-sm">
         <thead className="text-xs text-muted uppercase border-b border-border">
           <tr>
             <th className="text-left py-2 px-3">User</th>
@@ -162,23 +193,28 @@ function PendingApprovalsPanel() {
               <td className="py-2 px-3 text-muted text-xs">{r.created_at}</td>
               <td className="py-2 px-3 text-right space-x-2">
                 <button
+                  type="button"
                   onClick={() => approveMut.mutate(r.id)}
-                  disabled={approveMut.isPending}
-                  className="px-3 py-1 rounded bg-ok/20 text-ok text-xs hover:bg-ok/30 disabled:opacity-50"
-                >Approve</button>
+                  disabled={approveMut.isPending || denyMut.isPending || uncertain || isError}
+                  aria-label={`Approve ${r.title}`}
+                  className={controlStyle}
+                >{approveMut.isPending && approveMut.variables === r.id ? 'Approving…' : 'Approve'}</button>
                 <button
+                  type="button"
                   onClick={() => {
                     const note = prompt('Reason for denial? (optional)');
                     if (note !== null) denyMut.mutate({ id: r.id, note: note || undefined });
                   }}
-                  disabled={denyMut.isPending}
-                  className="px-2 py-1 rounded bg-red-500/20 text-red-400 text-xs hover:bg-red-500/30 disabled:opacity-50"
-                >Deny</button>
+                  disabled={approveMut.isPending || denyMut.isPending || uncertain || isError}
+                  aria-label={`Deny ${r.title}`}
+                  className={controlStyle}
+                >{denyMut.isPending && denyMut.variables?.id === r.id ? 'Denying…' : 'Deny'}</button>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+      </div>}
     </section>
   );
 }
@@ -193,7 +229,7 @@ function StatusPill({ status }: { status: string }) {
 }
 
 function LibraryPill({ status }: { status: string | null }) {
-  if (!status) return <span className="text-xs text-muted">--</span>;
+  if (!status) return <span className="text-xs text-muted">Unknown</span>;
   const map: Record<string, { cls: string; label: string }> = {
     success: { cls: 'bg-ok/20 text-ok', label: 'In library' },
     wanted:  { cls: 'bg-amber/20 text-amber', label: 'Wanted' },

@@ -9,7 +9,8 @@ import DetailModal from '../components/DetailModal';
 export default function Search() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [q, setQ] = useState(searchParams.get('q') || '');
-  const [typeFilter, setTypeFilter] = useState<'all' | MediaType>('all');
+  const selectedType = searchParams.get('type');
+  const typeFilter = selectedType === 'movie' || selectedType === 'tv' ? selectedType : 'all';
 
   // Pick up ?q= changes from the topbar search bar (or a shared link) after mount.
   useEffect(() => {
@@ -20,7 +21,7 @@ export default function Search() {
 
   const updateQuery = (value: string) => {
     setQ(value);
-    setSearchParams(value ? { q: value } : {}, { replace: true });
+    setSearchParams({ ...(value ? { q: value } : {}), ...(typeFilter !== 'all' ? { type: typeFilter } : {}) }, { replace: true });
   };
   const [detail, setDetail] = useState<{ id: number; type: MediaType } | null>(null);
 
@@ -32,7 +33,7 @@ export default function Search() {
     return () => clearTimeout(timer);
   }, [q]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, isFetching, refetch } = useQuery({
     queryKey: ['search', debouncedQ],
     queryFn: () => api.search(debouncedQ).then((r) => r.results),
     enabled: debouncedQ.trim().length > 0,
@@ -43,37 +44,68 @@ export default function Search() {
   );
 
   const open = (it: TmdbItem) => setDetail({ id: it.tmdb_id, type: it.media_type });
+  const waiting = q !== debouncedQ || isLoading;
+  const filter = (type: 'all' | MediaType) => setSearchParams({
+    ...(q ? { q } : {}), ...(type !== 'all' ? { type } : {}),
+  });
 
   return (
-    <div className="space-y-4">
-      <input
-        type="text"
-        autoFocus
-        value={q}
-        onChange={(e) => updateQuery(e.target.value)}
-        placeholder="Search movies and series..."
-        className="w-full max-w-xl bg-bg border border-border rounded-lg px-4 py-3 text-sm
-                   focus:outline-none focus:border-accent text-white placeholder-muted/60"
-      />
-      {q.trim() && (
-        <p className="text-muted text-xs">{filtered.length} results for &quot;{q}&quot;</p>
+    <div className="min-w-0 space-y-5">
+      <div className="space-y-4">
+        <label className="block max-w-2xl">
+          <span className="sr-only">Search the catalog</span>
+          <input
+            type="search"
+            autoFocus
+            value={q}
+            onChange={(e) => updateQuery(e.target.value)}
+            placeholder="Search movies and series"
+            className="min-h-11 w-full bg-control border border-field rounded-xl px-4 py-3 text-sm
+                       text-white placeholder-muted"
+          />
+        </label>
+        <div role="group" aria-label="Filter search results" className="flex flex-wrap gap-2 pb-4 border-b border-border">
+          {([['all', 'All titles'], ['movie', 'Movies'], ['tv', 'Series']] as const).map(([type, label]) => (
+            <button key={type} type="button" aria-pressed={typeFilter === type}
+              onClick={() => filter(type)}
+              className={`min-h-11 rounded-xl border px-4 py-2 text-sm transition-colors ${typeFilter === type
+                ? 'bg-accent text-accent-ink border-accent'
+                : 'bg-control text-muted border-field hover:text-white hover:bg-raised'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {q.trim() && !waiting && !isError && (
+        <p className="text-muted text-sm break-words" role="status">
+          {filtered.length} {filtered.length === 1 ? 'result' : 'results'} for &quot;{debouncedQ}&quot;
+          {isFetching && <span className="ml-2">Updating…</span>}
+        </p>
       )}
       {q.trim() ? (
-        isLoading ? (
-          <div className="text-muted text-sm py-6">Loading...</div>
-        ) : filtered.length > 0 ? (
-          <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 200px))' }}>
-            {filtered.map((it) => (
-              <PosterCard
-                key={`${it.media_type}-${it.tmdb_id}`}
-                item={it}
-                onClick={open}
-                status={it.library_status}
-              />
-            ))}
+        waiting ? (
+          <div className="text-muted text-sm py-8" role="status">Searching the catalog…</div>
+        ) : isError ? (
+          <div role="alert" className="rounded-xl border border-border bg-card p-5 space-y-3">
+            <p className="text-sm">Search is unavailable. Your search has been kept.</p>
+            <button type="button" onClick={() => void refetch()} disabled={isFetching}
+              className="min-h-11 rounded-xl border border-field bg-control px-4 py-2 text-sm disabled:opacity-50">
+              {isFetching ? 'Trying again…' : 'Try search again'}
+            </button>
           </div>
+        ) : filtered.length > 0 ? (
+          <ul aria-label="Search results" className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3 lg:gap-4">
+            {filtered.map((it) => (
+              <li key={`${it.media_type}-${it.tmdb_id}`} className="min-w-0">
+                <PosterCard item={it} onClick={open} status={it.library_status} />
+              </li>
+            ))}
+          </ul>
         ) : (
-          <div className="text-muted text-sm py-6">No results</div>
+          <div className="rounded-xl border border-border bg-card py-12 px-5 text-center space-y-2">
+            <p className="font-semibold">No matching titles</p>
+            <p className="text-muted text-sm">Try another search or choose a different filter.</p>
+          </div>
         )
       ) : (
         <div className="text-muted text-sm py-8 text-center">
