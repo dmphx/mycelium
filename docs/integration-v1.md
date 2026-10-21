@@ -1,7 +1,8 @@
 # Integration API v1: signed receiver contract
 
-Status: receiver primitives only (`integration_auth.py`). No HTTP routes, executor or
-deployment exist yet. The feature is off unless `INTEGRATION_ENABLED=true`.
+Status: signed HTTP boundary, current actor/request reads, and catalog metadata reads
+are implemented. Mutation and authority-bearing operations remain unqualified. The
+feature is off unless `INTEGRATION_ENABLED=true`; this milestone does not qualify deployment.
 
 ## Configuration (environment only)
 
@@ -329,12 +330,12 @@ no leading zero).
 | GET `/capabilities` | catalog:read | none | implemented |
 | GET `/requests` | requests:read | list | implemented |
 | GET `/requests/<id>` | requests:read | none | implemented (foreign and missing are the same 404) |
-| GET `/catalog/search` | catalog:read | q, page, type | 503 |
-| GET `/catalog/rails/<rail>` | catalog:read | type, region, window, provider_id, genre_id, year_from, year_to, page | 503 |
-| GET `/catalog/(movie\|tv)/<id>`, `/catalog/tv/<id>/seasons/<n>` | catalog:read | none | 503 |
-| GET `/genres` | catalog:read | type | 503 |
-| GET `/providers` | catalog:read | type, region | 503 |
-| GET `/genre-tabs`, `/people/<id>` | catalog:read | none | 503 |
+| GET `/catalog/search` | catalog:read | q, page, type | implemented |
+| GET `/catalog/rails/<rail>` | catalog:read | type, region, window, provider_id, genre_id, year_from, year_to, page as applicable | implemented |
+| GET `/catalog/(movie\|tv)/<id>`, `/catalog/tv/<id>/seasons/<n>` | catalog:read | none | implemented |
+| GET `/genres` | catalog:read | type (required) | implemented |
+| GET `/providers` | catalog:read | type (required), region | implemented |
+| GET `/genre-tabs`, `/people/<id>` | catalog:read | none | implemented |
 | GET `/follows` | watchlist:read | none | 503 |
 | POST, DELETE `/follows/<id>` | watchlist:write | none | 503 (not advertised) |
 | GET `/watchlist` | watchlist:read | list | 503 |
@@ -348,9 +349,18 @@ no leading zero).
 
 A `503 capability_unqualified` (`retryable: false`) is returned only after a valid signed
 request; it performs no database write other than the replay store and makes no catalog,
-provider or search call. `GET /capabilities` advertises only `me.read` and `requests.read`;
-every other operation name is listed under `incomplete` in sorted order. Following a person
-is not advertised because existing favorite-actor rows trigger automatic requests.
+provider or search call. `GET /capabilities` and `GET /me` share a dynamic supported-operation
+list: base `me.read` and `requests.read`, plus locally configured implemented catalog reads.
+Affected operations remain in sorted `incomplete` when configuration is invalid or cannot
+be read. Genre tabs operate independently of the TMDB key; details require a valid native
+region. Capabilities perform no provider probes, and provider outages do not remove support.
+Following a person is not advertised because existing favorite-actor rows trigger automatic requests.
+
+Catalog orchestration, exact upstream paths, strict query/region/tab validation, failure
+mapping and retry policy are documented in [integration-catalog.md](integration-catalog.md).
+Catalog queries are decoded once from the verified canonical target, never Flask arguments.
+Catalog output carries metadata only, with no global presence, entitlement or availability
+authority. The service applies the 900000 byte data size check before the HTTP ok envelope.
 
 `GET /me` re-reads the native user row and returns the id, a display name (the username
 when no safe display name exists), the approval policy (`automatic` for administrators and
