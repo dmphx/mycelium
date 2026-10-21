@@ -1,8 +1,7 @@
 # Request intents (foundation)
 
 `request_intents.py` is the persistence and service layer for per-user request
-intents. It has no routes, no metadata resolver and no executor; those are a later
-step. Public request ids are the existing `user_requests.id`.
+intents. It has no routes or executor. The separate metadata resolver is described below. Public request ids are the existing `user_requests.id`.
 
 ## API
 - `normalize_payload(payload) -> {media, scope}`: strict, canonical, raises `IntentError(code, status)`.
@@ -25,3 +24,13 @@ step. Public request ids are the existing `user_requests.id`.
 - The legacy approve route calls processing with default scope; intents must be approved through `review()` once the routes exist.
 - `scope.episodes` and `future` need executor support before they can be dispatched.
 - `request_idempotency.raw_hash` is nullable in the schema; this module is unreleased so no migration of earlier test databases is provided.
+
+## Metadata resolver (`intent_metadata.py`)
+
+`resolve(payload, *, today=None, fetch=None)` is pure: no database, no quota, no writes. It validates the payload with `normalize_payload` (invalid input raises `IntentError`, 400) and reads raw TMDB endpoints through `tmdb._get` (imported lazily; `fetch(path)` can be injected for tests). It never uses the IMDb alias lookup, `get_show_info`, `get_season_episodes` or the season-offset helper, so raw show 34549 season 8 is requested as `/tv/34549/season/8`.
+
+Result: `media`, `scope`, `title`, `imdb_id`, `year`, `cutoff` (the UTC date used) and `episodes[]` of `{tmdb_episode_id, season, episode, name, air_date, runtime_min, air_state}` with `air_state` one of `aired`, `unaired`, `unknown`. Movies return `episodes: []`. `episodes` scope returns only the listed pairs; `selected_seasons` returns the named seasons; `all_seasons` and `future` use the show's regular seasons (1 and up), and specials only when named. `future` keeps episodes whose air date is on or after the cutoff day, and keeps unknown air dates for later deferral. This describes metadata only, not registration or playability.
+
+Errors (`MetadataError`): `metadata_unavailable` (503) for any outage, `None` or empty reply, malformed or inconsistent data (identity mismatches, duplicate pair or episode id, bad dates, runtimes, names, IMDb ids, season counts that disagree with the show's `episode_count`, more than 100 fetched seasons or 5000 observed episodes before filtering, including duplicate raw episode IDs across seasons); `scope_not_found` (404) only when a valid, complete response lacks a named season or episode. An upcoming show with no regular seasons is a valid empty snapshot, so an ongoing scope can wait for future metadata. `tmdb._get` returns `None` for both outages and TMDB 404s, so that is always 503, never 404. A named season's whole response is validated, so one malformed unrelated episode in it fails the request. An empty-string `air_date` is treated as malformed, not unknown.
+
+Executors that use this must recheck the lease immediately before each side effect, not only between episodes, because a search can outlast a lease.
