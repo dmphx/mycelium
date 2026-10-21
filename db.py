@@ -470,6 +470,8 @@ def init() -> None:
         _dedup_requests(conn)
         import request_intents
         request_intents.init_schema(conn)
+        import integration_auth
+        integration_auth.init_schema(conn)
         conn.commit()
     _migrate()
     integrity_check()

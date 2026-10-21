@@ -527,3 +527,12 @@ def configure_logging() -> None:
         level=getattr(logging, LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+
+
+# Signed integration API (environment-only, off by default). No routes read these
+# until the integration blueprint is wired; JWKS files are local paths, never URLs.
+INTEGRATION_ENABLED = _env("INTEGRATION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+INTEGRATION_ISSUER = _env("INTEGRATION_ISSUER")
+INTEGRATION_SERVER_GUID = _env("INTEGRATION_SERVER_GUID").strip().lower()
+INTEGRATION_VIEWER_JWKS_PATH = _env("INTEGRATION_VIEWER_JWKS_PATH")
+INTEGRATION_SERVICE_JWKS_PATH = _env("INTEGRATION_SERVICE_JWKS_PATH")
