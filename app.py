@@ -3655,15 +3655,17 @@ def ui_api_users_update(user_id: int):
 @app.post("/ui/api/me/plugin-fields")
 @auth.require_auth
 def ui_api_me_plugin_fields():
-    """Let users toggle their own plugin user_fields (e.g. webplayer_enabled)."""
+    """Edit explicitly self-service boolean plugin preferences on this account."""
     rec = auth.current_user_record()
     if not rec:
         return jsonify(error="not authenticated"), 401
-    p = request.get_json(silent=True) or {}
-    allowed = set(plugin_loader.user_fields())
-    fields = {k: (1 if v else 0) for k, v in p.items() if k in allowed}
-    if not fields:
-        return jsonify(error="no valid fields"), 400
+    p = request.get_json(silent=True)
+    if not isinstance(p, dict) or not p:
+        return jsonify(error="non-empty plugin fields object required"), 400
+    allowed = set(plugin_loader.self_editable_user_fields())
+    if set(p) - allowed or any(type(value) is not bool for value in p.values()):
+        return jsonify(error="unsupported plugin fields or values"), 400
+    fields = {key: int(value) for key, value in p.items()}
     db.update_user(rec["id"], **fields)
     return jsonify(ok=True)
 

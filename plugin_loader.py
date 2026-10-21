@@ -19,6 +19,7 @@ Deactivating:        remove the folder and restart.
 """
 import importlib
 import logging
+import re
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,36 @@ def user_fields() -> list[str]:
         fields.extend(p["meta"].get("user_fields", []))
         fields.extend(p["meta"].get("admin_fields", []))
     return fields
+
+
+_FIELD_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_PROTECTED_USER_FIELDS = frozenset({
+    "id", "user_id", "username", "password_hash", "role", "quota_monthly",
+    "auto_approve", "enabled", "region", "created_at", "last_login",
+    "library_click_jellyfin", "discover_language_include", "discover_language_exclude",
+})
+
+
+def self_editable_user_fields() -> list[str]:
+    """Boolean plugin preferences ordinary users may edit on their own account.
+
+    user_fields() intentionally includes administrative fields for admin forms;
+    it is not a self-service authorization list. Administrative declarations win
+    across plugins. Malformed metadata fails closed, and core identity/policy
+    fields cannot become self-editable through a plugin declaration.
+    """
+    editable, administrative = set(), set(_PROTECTED_USER_FIELDS)
+    for plugin in _loaded.values():
+        meta = plugin["meta"]
+        own, admin = meta.get("user_fields", []), meta.get("admin_fields", [])
+        if not isinstance(own, list) or not isinstance(admin, list):
+            return []
+        if any(not isinstance(field, str) or not _FIELD_NAME.fullmatch(field)
+               for field in own + admin):
+            return []
+        editable.update(own)
+        administrative.update(admin)
+    return sorted(editable - administrative)
 
 
 def register_jobs(scheduler) -> None:
