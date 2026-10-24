@@ -536,7 +536,11 @@ def _verify_episode(entry: dict, season: int | None, episode: int | None,
             if span and span[0] < span[1]:
                 return _span_reject(span, top_name, int(season), int(episode), imdb_id)
             if tag:
-                if tag != (int(season), int(episode)):
+                alias = None
+                if imdb_id and tag != (int(season), int(episode)):
+                    import episode_scheme
+                    alias = episode_scheme.per_season_number(imdb_id, int(season), int(episode))
+                if tag != (int(season), int(episode)) and tag != (int(season), alias):
                     return (f"single file tags S{tag[0]:02d}E{tag[1]:02d}, "
                             f"not S{int(season):02d}E{int(episode):02d}")
                 return None
@@ -549,7 +553,8 @@ def _verify_episode(entry: dict, season: int | None, episode: int | None,
         return None
     norm = _entry_files(entry)
     absolute = _absolute_episode(imdb_id, season, episode)
-    main = strm_generator._pick_episode_file(norm, int(season), int(episode), absolute=absolute)
+    main = strm_generator._pick_episode_file(norm, int(season), int(episode), absolute=absolute,
+                                             imdb_id=imdb_id)
     if not main:
         return (f"season/series pack with no identifiable "
                 f"S{int(season):02d}E{int(episode):02d} file among {len(norm)} files")
@@ -578,7 +583,7 @@ def _verify_season_pack(entry: dict, season: int | None = None,
     for wanted in episodes:
         absolute = _absolute_episode(imdb_id, int(season), int(wanted))
         if not strm_generator._pick_episode_file(
-            videos, int(season), int(wanted), absolute=absolute
+            videos, int(season), int(wanted), absolute=absolute, imdb_id=imdb_id
         ):
             missing.append(int(wanted))
     if missing:

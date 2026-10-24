@@ -157,6 +157,10 @@ def _tmdb_absolute(imdb_id, season, episode, tmdb_id=None):
             if season_no == season:
                 if episode not in numbers:
                     return None
+                if numbers[0] == previous + 1 and previous:
+                    # TMDB already numbers this season by the running count
+                    # (One Piece S09 = 53..73): the episode is absolute.
+                    return episode
                 return previous + episode
             previous += len(numbers)
     except Exception as exc:

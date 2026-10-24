@@ -95,8 +95,7 @@ def library(tmp_path, monkeypatch):
             rows[row["token"]] = dict(row)
 
         def renumber_virtual_episode(self, token, episode, title, strm_path):
-            rows[token].update(episode=episode, title=title, strm_path=strm_path,
-                               file_id=None)
+            rows[token].update(episode=episode, title=title, strm_path=strm_path)
 
         def mark_episode_status(self, *a):
             pass
@@ -223,3 +222,52 @@ def test_existing_show_folder_is_never_renamed(series_root, monkeypatch):
     _fake_tmdb(monkeypatch, hit, [hit, {"id": 2, "name": "The Office",
                                         "first_air_date": "2001-07-09"}])
     assert strm_generator._canonical_series_folder("tt0386676") == "The Office"
+
+
+# ── file matching on running-count seasons ───────────────────────────────────
+
+def test_per_season_number_inverts_the_mapping():
+    tm = FakeTmdb()
+    assert episode_scheme.per_season_number("tt1", 2, 4, tmdb_client=tm) == 1
+    assert episode_scheme.per_season_number("tt1", 2, 6, tmdb_client=tm) == 3
+    assert episode_scheme.per_season_number("tt1", 2, 7, tmdb_client=tm) is None
+    assert episode_scheme.per_season_number("tt1", 1, 2, tmdb_client=tm) is None
+
+
+def _season_pack(tag_numbers):
+    return [{"id": n, "name": f"Pack/{SHOW}.S02E{n:02d}.1080p.WEB.mkv", "size": 900 * 1024 ** 2}
+            for n in tag_numbers]
+
+
+def test_running_count_episode_matches_a_per_season_tagged_file(monkeypatch):
+    monkeypatch.setattr(episode_scheme, "tmdb", FakeTmdb())
+    files = _season_pack([1, 2, 3])
+    picked = strm_generator._pick_episode_file(files, 2, 5, imdb_id="tt1")
+    assert picked["id"] == 2
+    # Without the show's identity nothing is guessed.
+    assert strm_generator._pick_episode_file(files, 2, 5) is None
+
+
+def test_exact_tag_still_wins_over_the_alias(monkeypatch):
+    monkeypatch.setattr(episode_scheme, "tmdb", FakeTmdb())
+    files = _season_pack([1, 2, 3, 5])
+    assert strm_generator._pick_episode_file(files, 2, 5, imdb_id="tt1")["id"] == 5
+
+
+def test_tmdb_absolute_returns_running_count_numbers_unchanged(monkeypatch):
+    import numbering
+    fake = FakeTmdb()
+    monkeypatch.setitem(sys.modules, "tmdb", types.SimpleNamespace(
+        find_by_imdb=fake.find_by_imdb, get_season_episodes=fake.get_season_episodes))
+    assert numbering._tmdb_absolute("tt1", 2, 5) == 5
+    assert numbering._tmdb_absolute("tt1", 1, 2) == 2
+
+
+def test_single_file_tagged_per_season_is_accepted_for_its_running_number(monkeypatch):
+    import release_sanity
+    monkeypatch.setattr(episode_scheme, "tmdb", FakeTmdb())
+    entry = {"name": f"{SHOW}.S02E02.1080p.WEB", "size": 900 * 1024 ** 2}
+    assert release_sanity.verify_entry(entry, "episode", season=2, episode=5,
+                                       imdb_id="tt1") is None
+    assert release_sanity.verify_entry(entry, "episode", season=2, episode=6,
+                                       imdb_id="tt1")
