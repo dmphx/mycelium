@@ -37,7 +37,10 @@ def _movie_runtime_override(imdb_id: str) -> dict:
     import tmdb
     try:
         sec = tmdb.get_movie_runtime_sec(imdb_id)
-        return {"runtime_minutes": sec / 60.0 if sec else None}
+        identity = tmdb.title_identity(imdb_id, "movie") or {}
+        return {"runtime_minutes": sec / 60.0 if sec else None,
+                "original_language": identity.get("original_language"),
+                "movie_title": identity.get("title") or None}
     except Exception:
         return {}
 

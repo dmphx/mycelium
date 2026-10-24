@@ -205,6 +205,10 @@ SERIES_IDENTITY_CHECK = _env("SERIES_IDENTITY_CHECK", "true").lower() in ("1", "
 # Languages to hard-block (comma-separated codes, e.g. ru). Torrents detected as
 # exclusively in a blocked language are filtered out before sorting.
 EXCLUDE_LANGUAGES = [l.strip().lower() for l in _env("EXCLUDE_LANGUAGES", "").split(",") if l.strip()]
+# Rank releases tagged only with a foreign dub (French VFF, Italian-only,
+# Castellano, Hindi...) after English, MULTi and original-language releases.
+# A dub of the title's own original language (TMDB) is never penalized.
+DEPRIORITIZE_FOREIGN_DUBS = _env("DEPRIORITIZE_FOREIGN_DUBS", "true").lower() in ("1", "true", "yes")
 
 # How long to wait for Torbox to make the torrent available before triggering Jellyfin scan.
 TORBOX_POLL_INTERVAL_SEC = _env_int("TORBOX_POLL_INTERVAL_SEC", 2)

@@ -41,6 +41,14 @@ def _rank(streams, prefer_season_pack: bool = False, override: dict | None = Non
                                   override=override, media_kind=media_kind)
 
 
+def _movie_identity(req) -> dict:
+    import tmdb
+    try:
+        return tmdb.title_identity(req.imdb_id, "movie") or {}
+    except Exception:
+        return {}
+
+
 def _movie_runtime_minutes(imdb_id: str) -> float | None:
     import tmdb
     try:
@@ -254,9 +262,12 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
         log.warning("Lazy cache-check failed for %s: %s", req.title, exc)
         return None
     cached = [s for s in torrent_only if s.info_hash in cached_hashes]
+    identity = _movie_identity(req)
     if cached:
         import release_sanity
-        cached = release_sanity.filter_cached(cached, kind="movie", label=req.title)
+        cached = release_sanity.filter_cached(
+            cached, kind="movie", label=req.title, imdb_id=req.imdb_id,
+            title=req.title, year=identity.get("year"))
     if not cached:
         # No cached torrents  -  try the best NZB before giving up to wanted.
         nzbs = [s for s in candidates if s.is_usenet and s.nzb_url]
@@ -292,16 +303,11 @@ def _lazy_register_movie(req: MediaRequest, candidates: list) -> Optional[Torren
         log.info("Lazy: no cached release for %s  -  will wait in wanted", req.title)
         return None
     winner = cached[0]
-    year = strm_generator._extract_year(winner.name) or strm_generator._extract_year(winner.title)
-    if not year:
-        try:
-            import tmdb
-            info = tmdb._get(f"/find/{req.imdb_id}", params={"external_source": "imdb_id"})
-            results = (info or {}).get("movie_results") or []
-            if results:
-                year = int((results[0].get("release_date") or "0000")[:4]) or None
-        except Exception:
-            year = None
+    # TMDB's year names the folder; a release name's year is only a fallback
+    # (a collection's "1937 a 2022" once baked "Bolt (1937)").
+    year = (identity.get("year")
+            or strm_generator._extract_year(winner.name)
+            or strm_generator._extract_year(winner.title))
     if strm_generator.create_lazy_movie_strm(
         winner.info_hash, winner.magnet, req.title, year,
         imdb_id=req.imdb_id, tmdb_id=getattr(req, 'tmdb_id', None),
@@ -342,7 +348,9 @@ def _process_movie(req: MediaRequest) -> tuple[bool, Optional[TorrentioStream]]:
         return False, None
 
     try:
-        ok, winner = _add_best_from(candidates, req.title, verify={"kind": "movie"})
+        ok, winner = _add_best_from(candidates, req.title, verify={
+            "kind": "movie", "imdb_id": req.imdb_id, "title": req.title,
+            "year": _movie_identity(req).get("year")})
     except RateLimited:
         # TorBox quota gone  -  try RealDebrid (no createtorrent limit) before
         # giving up, so we can still serve the title right now.

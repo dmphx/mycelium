@@ -77,6 +77,23 @@ def _with_show_identity(override: dict | None, imdb_id: str,
     return merged
 
 
+def _with_language_hints(override: dict | None, media_type: str, imdb_id: str,
+                         title: str) -> dict:
+    """Add the TMDB original language (English-first dub ranking) and, for
+    movies, the requested title (collection-name check) to a ranking override."""
+    out = dict(override or {})
+    if media_type == "movie" and title and "movie_title" not in out:
+        out["movie_title"] = title
+    if "original_language" not in out and imdb_id:
+        try:
+            import tmdb
+            out["original_language"] = tmdb.original_language(
+                imdb_id, "movie" if media_type == "movie" else "tv")
+        except Exception:
+            out["original_language"] = None
+    return out
+
+
 def search_candidates(media_type: str, imdb_id: str, title: str,
                       season: int | None = None,
                       episode: int | None = None,
@@ -88,6 +105,7 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
     """Query all enabled catalogs concurrently and persist the search trace."""
     if media_type != "movie":
         override = _with_show_identity(override, imdb_id, title)
+    override = _with_language_hints(override, media_type, imdb_id, title)
     ckey = content_key(imdb_id, season, episode)
     run_id = db.start_search_run(
         ckey, title, media_type, season, episode, trigger)
@@ -231,7 +249,8 @@ def reject(content_key_value: str, info_hash: str, reason: str) -> None:
 
 def next_cached_alternate(content_key_value: str, media_type: str,
                           imdb_id: str, season: int | None = None,
-                          episode: int | None = None) -> tuple[str, str, str] | None:
+                          episode: int | None = None, title: str | None = None,
+                          year: int | None = None) -> tuple[str, str, str] | None:
     """Return a still-cached, sanity-checked alternate from durable history."""
     import release_sanity
     import torbox
@@ -261,7 +280,9 @@ def next_cached_alternate(content_key_value: str, media_type: str,
     before_sanity = {stream.info_hash for stream in streams}
     streams = release_sanity.filter_cached(
         streams, kind=kind, season=season, episode=episode,
-        imdb_id=imdb_id, label=content_key_value)
+        imdb_id=imdb_id, label=content_key_value,
+        title=title if kind == "movie" else None,
+        year=year if kind == "movie" else None)
     after_sanity = {stream.info_hash for stream in streams}
     for info_hash in before_sanity - after_sanity:
         reject(content_key_value, info_hash, "SANITY_REJECTED")
