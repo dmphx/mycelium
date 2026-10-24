@@ -2606,13 +2606,12 @@ def restore_virtual_item(row: dict) -> None:
 def renumber_virtual_episode(token: str, episode: int, title: str, strm_path: str) -> None:
     """Move a series item to another episode number of the same season.
 
-    The pinned file is cleared so the next play matches the file again under
-    the new number.
+    Used when the same episode is renumbered, so a pinned file stays valid.
     """
     with _connect() as conn:
         conn.execute(
-            "UPDATE virtual_items SET episode=?, title=?, strm_path=?, file_id=NULL "
-            "WHERE token=?", (episode, title, strm_path, token))
+            "UPDATE virtual_items SET episode=?, title=?, strm_path=? WHERE token=?",
+            (episode, title, strm_path, token))
         conn.commit()
 
 

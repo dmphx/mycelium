@@ -36,6 +36,7 @@ from io_utils import atomic_write_text
 log = logging.getLogger(__name__)
 
 _CACHE_TTL = 6 * 3600
+_NEG_CACHE_TTL = 600  # unknown seasons: retry TMDB after ten minutes
 _cache: dict[tuple[str, int], tuple[float, tuple[int, ...]]] = {}
 _cache_lock = threading.Lock()
 _EPISODE_SUFFIX_RE = re.compile(r"\s*S\d{1,3}E\d{1,4}$", re.IGNORECASE)
@@ -47,7 +48,7 @@ def _season_numbers(imdb_id: str, season: int, tmdb_client=None) -> tuple[int, .
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
-        if hit and now - hit[0] < _CACHE_TTL:
+        if hit and now - hit[0] < (_CACHE_TTL if hit[1] else _NEG_CACHE_TTL):
             return hit[1]
     client = tmdb_client or tmdb
     numbers: tuple[int, ...] = ()
@@ -60,10 +61,9 @@ def _season_numbers(imdb_id: str, season: int, tmdb_client=None) -> tuple[int, .
         }))
     except Exception as exc:
         log.debug("TMDB season numbers unavailable for %s S%s: %s", imdb_id, season, exc)
-        return ()
-    if numbers:
-        with _cache_lock:
-            _cache[key] = (now, numbers)
+        numbers = ()
+    with _cache_lock:
+        _cache[key] = (now, numbers)
     return numbers
 
 
@@ -87,6 +87,19 @@ def map_per_season(numbers: tuple[int, ...], episode: int) -> int | None:
     if first is None or episode < 1 or episode >= first or episode > len(numbers):
         return None
     return first + episode - 1
+
+
+def per_season_number(imdb_id: str | None, season: int, episode: int,
+                      tmdb_client=None) -> int | None:
+    """The per-season number of TMDB episode `episode` on a running-count
+    season (One Piece S09E53 -> 1), else None."""
+    if not imdb_id or season is None or episode is None or int(season) < 1:
+        return None
+    numbers = _season_numbers(imdb_id, int(season), tmdb_client)
+    first = absolute_offset(numbers)
+    if first is None or not first <= int(episode) < first + len(numbers):
+        return None
+    return int(episode) - first + 1
 
 
 def tmdb_episode_number(imdb_id: str | None, season: int, episode: int,

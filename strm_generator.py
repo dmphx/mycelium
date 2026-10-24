@@ -135,7 +135,8 @@ def _file_has_absolute(name: str, n: int) -> bool:
 
 
 def _pick_episode_file(files: list[dict], season: int, episode: int,
-                       absolute: int | None = None) -> dict | None:
+                       absolute: int | None = None,
+                       imdb_id: str | None = None) -> dict | None:
     """Pick the file in a (season) pack for one episode.
 
     Safest first:
@@ -157,6 +158,18 @@ def _pick_episode_file(files: list[dict], season: int, episode: int,
     matched = [f for f in videos if _file_episode(f.get('name') or '') == want]
     if matched:
         return max(matched, key=lambda f: f.get('size') or 0)
+    # TMDB numbers some seasons by a running count (One Piece S09 = 53..73)
+    # while season packs tag their files per season (S09E01). Match the
+    # per-season tag of the same episode.
+    alias = None
+    if imdb_id:
+        import episode_scheme
+        alias = episode_scheme.per_season_number(imdb_id, int(season), int(episode))
+    if alias is not None:
+        aliased = [f for f in videos
+                   if _file_episode(f.get('name') or '') == (int(season), alias)]
+        if aliased:
+            return max(aliased, key=lambda f: f.get('size') or 0)
     # Absolute numbering: packs that name files by a single running number with
     # no SxxExx (e.g. anime "E0052").  Accept only when the request's episode
     # number equals exactly one untagged file's absolute number, so the worst
@@ -212,7 +225,8 @@ def spore_item_size(entry: dict, item: dict) -> int:
         season = item.get("season")
         episode = item.get("episode")
         if season is not None and episode is not None:
-            selected = _pick_episode_file(files, int(season), int(episode))
+            selected = _pick_episode_file(files, int(season), int(episode),
+                                          imdb_id=item.get("imdb_id"))
 
     if selected is None and files and not is_episode:
         selected = _pick_main_movie_file(files)
@@ -1059,7 +1073,7 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
                 continue
             if season is not None and episode is not None:
                 # Episode in a season pack: find the specific file by SxxExx
-                f = _pick_episode_file(files, season, episode)
+                f = _pick_episode_file(files, season, episode, imdb_id=vi.get("imdb_id"))
                 if not f:
                     log.debug("Preload: no file match S%02dE%02d for %s", season, episode, title)
                     continue
@@ -2113,7 +2127,8 @@ def probe_pending_stubs() -> dict:
                     continue
 
                 if season is not None and episode is not None:
-                    f = _pick_episode_file(files, season, episode)
+                    f = _pick_episode_file(files, season, episode,
+                                           imdb_id=vi.get("imdb_id"))
                     if not f:
                         log.debug("Probe pending: no file for S%02dE%02d token=%s",
                                   season, episode, token)
