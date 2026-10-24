@@ -242,6 +242,12 @@ MAX_RETRY_ATTEMPTS = _env_int("MAX_RETRY_ATTEMPTS", 10)
 # path/NFO/library mappings automatically and records ambiguous TMDB matches
 # for operator review.
 IDENTITY_REPAIR_INTERVAL_HOURS = _env_int("IDENTITY_REPAIR_INTERVAL_HOURS", 24)
+# Weekly episode hygiene: quarantine never-played episodes past TMDB's last
+# episode (phantom_cleanup) and fold per-season duplicates on seasons TMDB
+# numbers by a running count (episode_scheme). 0 disables. The limit bounds
+# how many items one episode-numbering run touches.
+EPISODE_HYGIENE_INTERVAL_HOURS = _env_int("EPISODE_HYGIENE_INTERVAL_HOURS", 168)
+EPISODE_HYGIENE_LIMIT = _env_int("EPISODE_HYGIENE_LIMIT", 500)
 IDENTITY_REPAIR_BATCH = _env_int("IDENTITY_REPAIR_BATCH", 500)
 
 # Candidate ranking can be tuned for the dominant client family. "balanced"

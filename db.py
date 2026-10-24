@@ -2591,6 +2591,31 @@ def delete_virtual_item(token: str) -> None:
         conn.commit()
 
 
+def restore_virtual_item(row: dict) -> None:
+    """Re-insert a virtual_items row captured with get_virtual_item (undo a delete)."""
+    with _connect() as conn:
+        known = {r[1] for r in conn.execute("PRAGMA table_info(virtual_items)")}
+        cols = [c for c in row if c in known]
+        conn.execute(
+            f"INSERT OR REPLACE INTO virtual_items ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)})",
+            [row[c] for c in cols])
+        conn.commit()
+
+
+def renumber_virtual_episode(token: str, episode: int, title: str, strm_path: str) -> None:
+    """Move a series item to another episode number of the same season.
+
+    The pinned file is cleared so the next play matches the file again under
+    the new number.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE virtual_items SET episode=?, title=?, strm_path=?, file_id=NULL "
+            "WHERE token=?", (episode, title, strm_path, token))
+        conn.commit()
+
+
 def delete_virtual_item_by_strm_path(strm_path: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM virtual_items WHERE strm_path=?", (strm_path,))

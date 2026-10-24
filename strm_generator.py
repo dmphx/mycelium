@@ -808,6 +808,26 @@ def _series_folder_imdb(folder: Path) -> str | None:
     return match.group(1) if match else None
 
 
+def _series_namesakes(hit: dict) -> set[str] | None:
+    """First-air years of other TMDB shows with exactly this show's name.
+
+    None when the name is unique (or the search fails, which keeps the plain
+    folder name the library used before)."""
+    name = hit.get("name") or ""
+    try:
+        import tmdb as _tmdb
+        data = _tmdb._get("/search/tv", params={"query": name}) or {}
+    except Exception:
+        return None
+    wanted = _norm_title(name)
+    years = {
+        str(row.get("first_air_date") or "")[:4]
+        for row in data.get("results") or []
+        if row.get("id") != hit.get("id") and _norm_title(row.get("name") or "") == wanted
+    }
+    return years or None
+
+
 def _canonical_series_folder(imdb_id: str | None,
                               fallback_title: str | None = None) -> str:
     """Return the canonical show-folder name from TMDB for this imdb_id (TV).
@@ -826,12 +846,28 @@ def _canonical_series_folder(imdb_id: str | None,
             hits = results.get("tv_results") or []
             if hits and hits[0].get("name"):
                 title = _safe(hits[0]["name"])
+                year = str(hits[0].get("first_air_date") or "")[:4]
                 existing = Path(MEDIA_PATH) / "series" / title
                 existing_imdb = _series_folder_imdb(existing)
                 if existing_imdb and existing_imdb != imdb_id:
-                    year = str(hits[0].get("first_air_date") or "")[:4]
                     suffix = year if re.fullmatch(r"\d{4}", year) else imdb_id
                     return _safe(f"{title} ({suffix})")
+                if existing.is_dir():
+                    # This show's folder already exists under the plain name;
+                    # renaming it is out of scope here (Plex keeps its match).
+                    return title
+                namesakes = _series_namesakes(hits[0])
+                if namesakes is not None:
+                    # Another show has this exact name ("The Office" US/UK,
+                    # "The Tribe" 1999/2021): a bare folder lets Plex guess the
+                    # newest one. Add the year, and the IMDb hint when a
+                    # namesake premiered the same year.
+                    if not re.fullmatch(r"\d{4}", year):
+                        return _safe(f"{title} {{imdb-{imdb_id}}}")
+                    folder = f"{title} ({year})"
+                    if year in namesakes:
+                        folder = f"{folder} {{imdb-{imdb_id}}}"
+                    return _safe(folder)
                 return title
         except Exception as exc:
             log.debug("_canonical_series_folder TMDB lookup failed for %s: %s", imdb_id, exc)
@@ -1360,6 +1396,12 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
     # was sanitized differently since the episode was first registered (folder
     # rename, title fix, etc.) that check misses it and we'd register a second
     # token for the same episode. Checking imdb_id+season+episode catches that.
+    if imdb_id:
+        # A per-season number on a season TMDB numbers by a running count
+        # (Naruto Shippuden S02E01 is TMDB S02E33) would sit beside the
+        # absolute copy as a duplicate.
+        import episode_scheme
+        episode = episode_scheme.tmdb_episode_number(imdb_id, season, episode)
     if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
         return False
     season_dir = f"Season {season:02d}"
@@ -2392,6 +2434,10 @@ def process_torrent(item: dict, canonical_title: str | None = None,
             clean_canonical = _safe(canonical_title)
             if clean_canonical:
                 info = dict(info, title=clean_canonical)
+        if imdb_id and info['type'] == 'episode':
+            import episode_scheme
+            info = dict(info, episode=episode_scheme.tmdb_episode_number(
+                imdb_id, info['season'], info['episode']))
         path = _strm_path(info)
         if path.exists():
             continue

@@ -727,6 +727,26 @@ def _start_scheduler() -> BackgroundScheduler:
         )
         log.info("Scheduled TorBox quota check every %dh", QUOTA_CHECK_INTERVAL_HOURS)
 
+    if cfg.EPISODE_HYGIENE_INTERVAL_HOURS > 0:
+        def _episode_hygiene():
+            import episode_scheme
+            import phantom_cleanup
+            phantoms = phantom_cleanup.cleanup(dry_run=False)
+            numbering = episode_scheme.reconcile(
+                dry_run=False, limit=cfg.EPISODE_HYGIENE_LIMIT)
+            log.info("Episode hygiene: phantoms %s (%d quarantined), numbering %s "
+                     "(%d duplicates, %d renumbered)",
+                     phantoms.get("status"), len(phantoms.get("quarantined") or []),
+                     numbering.get("status"), numbering.get("duplicates_removed", 0),
+                     numbering.get("renumbered", 0))
+
+        scheduler.add_job(
+            _episode_hygiene, trigger="interval",
+            hours=cfg.EPISODE_HYGIENE_INTERVAL_HOURS,
+            id="episode_hygiene", next_run_time=None, max_instances=1,
+        )
+        log.info("Scheduled episode hygiene every %dh", cfg.EPISODE_HYGIENE_INTERVAL_HOURS)
+
     def _zilean_native_sync():
         if _settings_mod.get("ZILEAN_MODE", cfg.ZILEAN_MODE) != "native":
             return
