@@ -298,6 +298,25 @@ def _materialize_inner(token: str, allow_readd: bool | None = None) -> str | Non
         return url
 
 
+def _movie_identity(item: dict) -> tuple[str | None, int | None]:
+    """(title, year) a movie item's file must match; (None, None) for series.
+
+    TMDB's year wins over the stored one, which older grabs took from the
+    release name (a collection's "1937 a 2022" gave every title 1937).
+    """
+    if item.get("media_type") != "movie":
+        return None, None
+    import release_sanity
+    title, title_year = release_sanity.split_title_year(item.get("title") or "")
+    year = None
+    try:
+        import tmdb
+        year = tmdb.title_identity(item.get("imdb_id"), "movie").get("year")
+    except Exception:
+        year = None
+    return title or None, year or item.get("year") or title_year
+
+
 def _pick_usenet_file_id(item: dict, virtual_item: dict) -> int | None:
     """Pick the right file inside a completed TorBox usenet download.
 
@@ -520,6 +539,7 @@ def _materialize_locked(token: str, allow_readd: bool = True,
 
     # ── TorBox path ───────────────────────────────────────────────────────────
     torbox_id = item["torbox_id"]
+    live_listing = None  # TorBox torrent dict with files, when already fetched
 
     # Fast path: cached torbox_id still live in TorBox.
     if torbox_id:
@@ -527,6 +547,8 @@ def _materialize_locked(token: str, allow_readd: bool = True,
         if not live or not torbox._is_ready(live):
             torbox_id = None
             rematerialized = True
+        else:
+            live_listing = live
 
     # Second chance: torrent may still be in TorBox library under its hash.
     if not torbox_id and item.get("info_hash"):
@@ -690,6 +712,37 @@ def _materialize_locked(token: str, allow_readd: bool = True,
             return None
 
     file_id = item["file_id"]
+    movie_title, movie_year = _movie_identity(item)
+    if file_id and item["media_type"] == "movie":
+        # A pinned movie file is re-checked too: pins written before the
+        # collection guard point at another film of a pack (twelve Disney
+        # titles all pinned to the same "Pete's Dragon" file).
+        listing = (live_listing if live_listing and live_listing.get("id") == torbox_id
+                   else torbox.find_by_id(torbox_id))
+        if listing and listing.get("files"):
+            import release_sanity
+            _bad = release_sanity.verify_live_torrent(
+                listing, "movie", imdb_id=item.get("imdb_id"),
+                title=movie_title, year=movie_year)
+            if _bad:
+                log.error("Catbox: release sanity rejected pinned torrent %s for %s (%s)",
+                          torbox_id, item["title"], _bad)
+                db.update_virtual_file_id(token, None)
+                alternate = _try_alternate_release(
+                    token, item, ckey, f"sanity:{_bad}", alternate_attempts)
+                if alternate:
+                    return alternate
+                _fail_put(token, _FAIL_COOLDOWN_SEC)
+                if ckey:
+                    db.update_playability_fail(ckey, REASON_NO_FILE)
+                return None
+            main, _ = release_sanity.pick_movie_file(
+                listing["files"], movie_title, movie_year, listing.get("name"))
+            if main and main.get("id") is not None and main["id"] != file_id:
+                log.warning("Catbox: re-pinning %s from file %s to %s (%s)",
+                            item["title"], file_id, main["id"], main.get("name"))
+                file_id = main["id"]
+                db.update_virtual_file_id(token, file_id)
     if not file_id:
         live = torbox.find_by_id(torbox_id)
         if live:
@@ -705,7 +758,9 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                      else "season_pack")
             _bad = release_sanity.verify_live_torrent(
                 live, _kind, season=item.get("season"), episode=item.get("episode"),
-                imdb_id=item.get("imdb_id"))
+                imdb_id=item.get("imdb_id"),
+                title=movie_title if _kind == "movie" else None,
+                year=movie_year if _kind == "movie" else None)
             if _bad:
                 log.error("Catbox: release sanity rejected torrent %s for %s (%s)  -  "
                           "keeping .strm, not serving a mislabeled pack",
@@ -721,7 +776,8 @@ def _materialize_locked(token: str, allow_readd: bool = True,
                 return None
             import strm_generator
             if item["media_type"] == "movie":
-                main = strm_generator._pick_main_movie_file(live.get("files") or [])
+                main, _ = release_sanity.pick_movie_file(
+                    live.get("files") or [], movie_title, movie_year, live.get("name"))
                 if main:
                     file_id = main["id"]
                     db.update_virtual_file_id(token, file_id)
@@ -814,9 +870,11 @@ def _try_alternate_release(token: str, item: dict, ckey: str | None,
     key = (item.get("imdb_id"), item.get("season"), item.get("episode"))
     with _search_cache_lock:
         _search_cache.pop(key, None)
+    movie_title, movie_year = _movie_identity(item)
     fresh = search_engine.next_cached_alternate(
         ckey, item.get("media_type") or "movie", item.get("imdb_id") or "",
-        season=item.get("season"), episode=item.get("episode"))
+        season=item.get("season"), episode=item.get("episode"),
+        title=movie_title, year=movie_year)
     if not fresh:
         fresh = _search_cached_release(item)
     if not fresh or fresh is _SEARCH_UNAVAILABLE:
@@ -928,9 +986,12 @@ def _search_best_cached_release(item: dict) -> tuple[str, str, str] | None | obj
                     "episode" if season is not None and episode is not None else
                     "season_pack")
             before_sanity = {s.info_hash for s in torbox_candidates}
+            movie_title, movie_year = (_movie_identity(item) if kind == "movie"
+                                       else (None, None))
             torbox_candidates = release_sanity.filter_cached(
                 torbox_candidates, kind=kind, season=season, episode=episode,
-                imdb_id=imdb_id, label=item.get("title") or ckey)
+                imdb_id=imdb_id, label=item.get("title") or ckey,
+                title=movie_title, year=movie_year)
             after_sanity = {s.info_hash for s in torbox_candidates}
             for rejected_hash in before_sanity - after_sanity:
                 search_engine.reject(ckey, rejected_hash, "SANITY_REJECTED")

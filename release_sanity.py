@@ -233,11 +233,14 @@ def _span_reject(span: tuple[int, int], top_name: str, season: int, episode: int
             f"({_short(top_name)})")
 
 
-def movie_name_size_reject(name: str, size_gb: float) -> str | None:
+def movie_name_size_reject(name: str, size_gb: float,
+                           title: str | None = None) -> str | None:
     """Reason this NAME/SIZE cannot be a single movie, or None if it's plausible.
 
     Pure heuristic (no network). Used at ranking time to drop pack/oversized
-    candidates before they can ever be added to TorBox.
+    candidates before they can ever be added to TorBox. `title` (the requested
+    film) lets the multi-movie collection check skip words the title itself
+    uses ("The Collection", "The Twilight Saga").
     """
     max_gb, pack_re = _cfg()
     if size_gb and max_gb and size_gb > max_gb:
@@ -245,7 +248,173 @@ def movie_name_size_reject(name: str, size_gb: float) -> str | None:
                 f"(almost always a pack/collection)")
     if pack_re and name and pack_re.search(name):
         return f"name matches season/series-pack pattern ({_short(name)})"
+    reason = movie_collection_name_reason(name, title)
+    if reason:
+        return reason
     return None
+
+
+# ── single-movie file selection inside multi-file torrents ───────────────────
+#
+# A movie request must play the requested film, not whichever file is largest.
+# Collections ("Collection Disney Pixar 1937 à 2022", "Pirates Five Movies",
+# a bare-hash torrent holding 60 films) used to pass because their names do not
+# look like season packs and the largest file is an ordinary film size. These
+# helpers match the request title and year against each feature-length file.
+
+# A year range in a movie release name means several films: "1937 à 2022",
+# "(1984-2023)", "1971-1988".
+_YEAR_RANGE_RE = re.compile(
+    r"\b(?:19|20)\d{2}\s*(?:[" + _EP_DASHES + r"]|\ba\b|\bà\b|\bto\b)\s*(?:19|20)\d{2}\b",
+    re.IGNORECASE)
+_COUNTED_MOVIES_RE = re.compile(
+    r"\b(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,3})"
+    r"[\s._-]*(?:movies|films)\b", re.IGNORECASE)
+_COLLECTION_WORD_RE = re.compile(
+    r"\b(?:collection|cole[cç][aã]o|colecci[oó]n|collezione|sammlung|"
+    r"int[eé]grale|anthology|saga|filmography)\b", re.IGNORECASE)
+# Single films sold as part of a label line, not multi-movie collections.
+_LABEL_COLLECTION_RE = re.compile(
+    r"\b(?:criterion|masters[\s._-]*of[\s._-]*cinema|arrow|eureka)[\s._-]*collection\b",
+    re.IGNORECASE)
+
+_TITLE_STOP = frozenset({"the", "a", "an", "of", "and", "in", "to", "on", "at", "for",
+                         "le", "la", "les", "de", "du", "des", "et", "il", "el", "der",
+                         "die", "das"})
+_ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7",
+          "viii": "8", "ix": "9", "x": "10"}
+_RELEASE_TAG_RE = re.compile(
+    r"^(?:\d{3,4}p|4k|uhd|bluray|blu|ray|bdrip|brrip|webrip|web|dl|webdl|hdtv|dvdrip|"
+    r"x264|x265|h264|h265|hevc|avc|remux|hdr|hdr10|dv|10bit|8bit|aac|ac3|dts|"
+    r"ddp|eac3|atmos|imax|extended|unrated|remastered|proper|repack)$", re.IGNORECASE)
+
+
+def _tokens(text: str | None) -> list[str]:
+    s = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+    s = s.replace("'", "").replace("&", " and ")
+    return re.findall(r"[a-z0-9]+", s)
+
+
+def split_title_year(title: str | None) -> tuple[str, int | None]:
+    """'Bolt (2008)' -> ('Bolt', 2008); titles without a trailing year pass through."""
+    m = re.match(r"^(.*?)\s*\((\d{4})\)\s*$", title or "")
+    if m:
+        return m.group(1), int(m.group(2))
+    return title or "", None
+
+
+def _name_years(name: str) -> list[int]:
+    return [int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", name or "")]
+
+
+def _title_score(title: str, name: str) -> float:
+    """Share of the title's significant words present in `name` (0..1).
+
+    A sequel number in the title ("Toy Story 2", "Rocky III") is mandatory: a
+    file without it is a different film of the same series and scores 0.
+    """
+    words = [_ROMAN.get(w, w) for w in _tokens(title)]
+    sig = [w for w in words if w not in _TITLE_STOP] or words
+    if not sig:
+        return 0.0
+    have = {_ROMAN.get(w, w) for w in _tokens(name)}
+    if any(w.isdigit() and len(w) <= 2 and w not in have for w in sig):
+        return 0.0
+    return sum(1 for w in sig if w in have) / len(sig)
+
+
+def _extra_words(title: str, name: str) -> int:
+    """Words in the file's title part (before the year/quality tags) that the
+    requested title lacks: 'Doctor Dolittle 3' has one extra over 'Doctor Dolittle'."""
+    want = {_ROMAN.get(w, w) for w in _tokens(title)}
+    extra = 0
+    for w in _tokens(name.rsplit("/", 1)[-1].rsplit(".", 1)[0]):
+        if re.fullmatch(r"(?:19|20)\d{2}", w) or _RELEASE_TAG_RE.match(w):
+            break
+        w = _ROMAN.get(w, w)
+        if w not in want and w not in _TITLE_STOP and not (w.isdigit() and len(w) == 3):
+            extra += 1
+    return extra
+
+
+def _year_ok(year: int | None, name: str, tolerance: int = 1) -> bool:
+    if not year:
+        return True
+    years = _name_years(name)
+    return not years or any(abs(y - year) <= tolerance for y in years)
+
+
+def movie_collection_name_reason(name: str | None, title: str | None = None) -> str | None:
+    """Reason a release NAME is a multi-movie collection, or None.
+
+    Year ranges and counted titles ("Five Movies") always count. Collection
+    words count only when the requested title does not contain them, and label
+    lines such as "Criterion Collection" never do.
+    """
+    if not name:
+        return None
+    title_words = set(_tokens(title))
+    if _YEAR_RANGE_RE.search(name) and not _YEAR_RANGE_RE.search(title or ""):
+        return f"name spans several years, a multi-movie collection ({_short(name)})"
+    m = _COUNTED_MOVIES_RE.search(name)
+    if m and not set(_tokens(m.group(0))) <= title_words:
+        return f"name counts several films ({_short(name)})"
+    stripped = _LABEL_COLLECTION_RE.sub(" ", name)
+    m = _COLLECTION_WORD_RE.search(stripped)
+    if m and title is not None and not set(_tokens(m.group(0))) <= title_words:
+        return f"name marks a multi-movie collection ({_short(name)})"
+    return None
+
+
+def pick_movie_file(files: list[dict], title: str | None = None,
+                    year: int | None = None,
+                    torrent_name: str | None = None) -> tuple[dict | None, str | None]:
+    """Choose the requested film's file inside a torrent: (file, None) or (None, reason).
+
+    With one feature-length video the largest file is the film (the old rule),
+    unless both its title and year contradict the request. With several, the
+    file must match the requested title and year; a collection where nothing
+    matches is rejected rather than serving its largest film. Without a title
+    this falls back to the largest-file rule.
+    """
+    import strm_generator
+    norm = [{**f, "name": (f.get("name") or f.get("short_name") or "")} for f in files]
+    videos = [f for f in norm
+              if strm_generator._is_video(f["name"]) and not strm_generator._is_trailer(f)]
+    if not videos:
+        return None, "no playable video file"
+    largest = strm_generator._pick_main_movie_file(norm)
+    if not title:
+        return largest, None
+    base_title, title_year = split_title_year(title)
+    year = year or title_year
+    top = max((f.get("size") or 0) for f in videos)
+    features = [f for f in videos if (f.get("size") or 0) >= top * 0.25]
+    if len(features) <= 1:
+        name = largest["name"].rsplit("/", 1)[-1] if largest else ""
+        if (largest and year and not _year_ok(year, name, tolerance=2)
+                and _title_score(base_title, name) < 0.5
+                and _title_score(base_title, torrent_name or "") < 0.5):
+            return None, (f"only video '{_short(name)}' matches neither the title nor "
+                          f"the year of {base_title} ({year})")
+        return largest, None
+    scored = []
+    for f in features:
+        name = f["name"].rsplit("/", 1)[-1]
+        score = _title_score(base_title, name)
+        if score >= 0.6 and _year_ok(year, name):
+            scored.append((-score, _extra_words(base_title, name),
+                           -(f.get("size") or 0), f))
+    if scored:
+        scored.sort(key=lambda row: row[:3])
+        return scored[0][3], None
+    if (len(features) == 2 and torrent_name
+            and _title_score(base_title, torrent_name) >= 0.6
+            and _year_ok(year, torrent_name)):
+        return largest, None
+    return None, (f"cached torrent holds {len(features)} feature-length videos and none "
+                  f"matches {base_title}{f' ({year})' if year else ''}; a collection, "
+                  f"not this film")
 
 
 # ── cached-files verification ────────────────────────────────────────────────
@@ -269,11 +438,13 @@ def _entry_files(entry: dict) -> list[dict]:
 
 def verify_entry(entry: dict, kind: str, *, season: int | None = None,
                  episode: int | None = None, imdb_id: str | None = None,
-                 episodes: list[int] | None = None) -> str | None:
+                 episodes: list[int] | None = None, title: str | None = None,
+                 year: int | None = None) -> str | None:
     """Reason a cached torrent listing can't be the requested item, or None if it
     passes. `entry` is one hash's value from torbox.check_cached_files().
 
-    kind: 'movie' | 'episode' | 'season_pack'.
+    kind: 'movie' | 'episode' | 'season_pack'. For movies, `title`/`year` of
+    the request let a multi-file torrent be matched to the requested film.
     """
     if not entry:
         return None  # nothing to check (uncached / no listing)  -  fail open
@@ -281,7 +452,7 @@ def verify_entry(entry: dict, kind: str, *, season: int | None = None,
     if reason:
         return reason
     if kind == "movie":
-        return _verify_movie(entry)
+        return _verify_movie(entry, title=title, year=year)
     if kind == "episode":
         return _verify_episode(entry, season, episode, imdb_id)
     if kind == "season_pack":
@@ -289,11 +460,15 @@ def verify_entry(entry: dict, kind: str, *, season: int | None = None,
     return None
 
 
-def _verify_movie(entry: dict) -> str | None:
+def _verify_movie(entry: dict, title: str | None = None,
+                  year: int | None = None) -> str | None:
     import strm_generator
     max_gb, pack_re = _cfg()
     top_name = entry.get("name") or ""
     raw_files = entry.get("files") or []
+    reason = movie_collection_name_reason(top_name, title)
+    if reason:
+        return f"cached torrent {reason}"
 
     if raw_files:
         norm = _entry_files(entry)
@@ -306,7 +481,9 @@ def _verify_movie(entry: dict) -> str | None:
         ep_tagged = sum(1 for f in videos if strm_generator._file_episode(f["name"]))
         if ep_tagged >= 2:
             return f"cached torrent holds {ep_tagged} episode-tagged video files (series pack)"
-        main = strm_generator._pick_main_movie_file(videos)
+        main, reason = pick_movie_file(norm, title, year, top_name)
+        if reason:
+            return reason
         if not main:
             return "cached torrent has no non-trailer video file"
         main_gb = (main.get("size") or 0) / _BYTES_PER_GB
@@ -811,7 +988,8 @@ def _identity_filter(candidates: list, identity: "ShowIdentity | None",
 def filter_cached(candidates: list, kind: str, *, season: int | None = None,
                   episode: int | None = None, imdb_id: str | None = None,
                   episodes: list[int] | None = None,
-                  label: str = "") -> list:
+                  label: str = "", title: str | None = None,
+                  year: int | None = None) -> list:
     """Drop cached candidates whose actual TorBox files fail the sanity check.
 
     `candidates` are TorrentioStream-likes already known to be cached. Batches a
@@ -844,7 +1022,7 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
         return _identity_filter(candidates, identity, {}, label or kind)
     import torbox
     try:
-        entries = torbox.check_cached_files([c.info_hash for c in candidates])
+        entries = _cached_listing([c.info_hash for c in candidates], kind)
     except Exception as exc:
         log.debug("release sanity: batch check_cached_files failed (%s)  -  not blocking", exc)
         return _identity_filter(candidates, identity, {}, label or kind)
@@ -867,7 +1045,7 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
             continue
         reason = verify_entry(
             entry, kind, season=season, episode=episode, imdb_id=imdb_id,
-            episodes=episodes,
+            episodes=episodes, title=title, year=year,
         )
         if reason:
             log.warning("Release sanity: rejected %s cached candidate %s  -  %s",
@@ -878,9 +1056,19 @@ def filter_cached(candidates: list, kind: str, *, season: int | None = None,
     return _identity_filter(kept, identity, entries, label or kind)
 
 
+def _cached_listing(hashes: list[str], kind: str) -> dict:
+    """checkcached entries; movies ask for the full file list so a collection
+    can be told apart from one film at grab time."""
+    import torbox
+    if kind == "movie":
+        return torbox.check_cached_files(hashes, list_files=True)
+    return torbox.check_cached_files(hashes)
+
+
 def check_hash(info_hash: str, kind: str, *, season: int | None = None,
                episode: int | None = None, imdb_id: str | None = None,
-               label: str = "") -> tuple[bool, str]:
+               label: str = "", title: str | None = None,
+               year: int | None = None) -> tuple[bool, str]:
     """Verify a single already-chosen hash. Returns (ok, reason).
 
     ok=True with reason='' means it passed OR could not be checked (uncached /
@@ -890,12 +1078,13 @@ def check_hash(info_hash: str, kind: str, *, season: int | None = None,
         return True, ""
     import torbox
     try:
-        entry = torbox.check_cached_files([info_hash]).get((info_hash or "").lower())
+        entry = _cached_listing([info_hash], kind).get((info_hash or "").lower())
     except Exception as exc:
         log.debug("release sanity: check_cached_files(%s) failed: %s  -  not blocking",
                   info_hash, exc)
         return True, ""
-    reason = verify_entry(entry, kind, season=season, episode=episode, imdb_id=imdb_id)
+    reason = verify_entry(entry, kind, season=season, episode=episode, imdb_id=imdb_id,
+                          title=title, year=year)
     if reason:
         log.warning("Release sanity: rejected %s hash %s  -  %s", label or kind, info_hash, reason)
         _record_reject(kind, reason)
@@ -904,7 +1093,8 @@ def check_hash(info_hash: str, kind: str, *, season: int | None = None,
 
 
 def verify_live_torrent(live: dict, kind: str, *, season: int | None = None,
-                        episode: int | None = None, imdb_id: str | None = None) -> str | None:
+                        episode: int | None = None, imdb_id: str | None = None,
+                        title: str | None = None, year: int | None = None) -> str | None:
     """Backstop for catbox: `live` is a TorBox mylist/find_by_id torrent dict
     (has top-level name/size + a `files` list). Reshape it into the checkcached
     entry shape and reuse verify_entry."""
@@ -913,7 +1103,8 @@ def verify_live_torrent(live: dict, kind: str, *, season: int | None = None,
         "size": live.get("size") or 0,
         "files": live.get("files") or [],
     }
-    return verify_entry(entry, kind, season=season, episode=episode, imdb_id=imdb_id)
+    return verify_entry(entry, kind, season=season, episode=episode, imdb_id=imdb_id,
+                        title=title, year=year)
 
 
 def _record_reject(kind: str, reason: str, count: int = 1) -> None:

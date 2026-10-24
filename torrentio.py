@@ -13,6 +13,7 @@ from config import (
     EXCLUDE_BLURAY,
     EXCLUDE_CAM,
     EXCLUDE_DV_P5,
+    DEPRIORITIZE_FOREIGN_DUBS,
     EXCLUDE_LANGUAGES,
     EXCLUDE_REMUX,
     EXCLUDE_UNDERSIZED_RELEASES,
@@ -106,7 +107,20 @@ _LANG_PATTERNS = {
     "en":     re.compile(r"\b(english|eng(?:lish)?(?:[. -](?:audio|dubbed|dub))?|eng-?subs?)\b", re.IGNORECASE),
     "multi":  re.compile(r"\b(multi(?:lang|-?audio|-?subs?)?|dual[. -]?audio|tri-?audio)\b", re.IGNORECASE),
     "ru":     re.compile(r"\b(russian|rus(?:sian)?|ru[. -]?dub(?:bed)?|rudub)\b|[а-яА-ЯёЁ]{4,}", re.IGNORECASE),
+    # Dub markers: a release tagged only with one of these carries that audio
+    # instead of the original. "VOSTFR" (original + French subs) is not a dub.
+    "fr":     re.compile(r"\b(truefrench|french|vff|vfq|vf2|vfi|vf)\b", re.IGNORECASE),
+    "it":     re.compile(r"\b(ita|italian|italiano)\b", re.IGNORECASE),
+    "es":     re.compile(r"\b(castellano|spanish|espa[nñ]ol|esp|latino)\b", re.IGNORECASE),
+    "de":     re.compile(r"\b(german|deutsch|ger)\b", re.IGNORECASE),
+    "pt":     re.compile(r"\b(portuguese|portugu[eê]s|dublado|pt[. -]?br)\b", re.IGNORECASE),
+    "pl":     re.compile(r"\b(polish|lektor|dubbing[. -]?pl)\b", re.IGNORECASE),
+    "hi":     re.compile(r"\bhindi\b", re.IGNORECASE),
+    "ta":     re.compile(r"\btamil\b", re.IGNORECASE),
+    "te":     re.compile(r"\btelugu\b", re.IGNORECASE),
 }
+# Languages that never count as a foreign dub for the English-first ranking.
+_NOT_A_DUB = frozenset({"en", "multi"})
 
 
 @dataclass
@@ -430,6 +444,8 @@ def rank_streams(
     min_seeders = _settings.get("MIN_SEEDERS", MIN_SEEDERS)
     max_size_gb = _settings.get("MAX_SIZE_GB", MAX_SIZE_GB)
     audio_pref = _settings.get("AUDIO_LANGUAGE_PREFERENCE", AUDIO_LANGUAGE_PREFERENCE)
+    deprioritize_dubs = _settings.get("DEPRIORITIZE_FOREIGN_DUBS", DEPRIORITIZE_FOREIGN_DUBS)
+    original_language = (override.get("original_language") or "").lower() or None
     playback_profile = str(_settings.get("PLAYBACK_PROFILE", PLAYBACK_PROFILE) or "balanced").lower()
 
     candidates = streams if allow_4k else [s for s in streams if s.quality != "2160p"]
@@ -535,7 +551,8 @@ def rank_streams(
         import release_sanity
         kept = []
         for s in candidates:
-            reason = release_sanity.movie_name_size_reject(f"{s.name} {s.title}", s.size_gb)
+            reason = release_sanity.movie_name_size_reject(
+                f"{s.name} {s.title}", s.size_gb, title=override.get("movie_title"))
             if reason:
                 log.info("Release sanity: dropping movie candidate %s (%s)", s.info_hash, reason)
             else:
@@ -556,6 +573,18 @@ def rank_streams(
             if want in s.languages or "multi" in s.languages:
                 return idx
         return len(audio_pref) + 1
+
+    acceptable_audio = set(_NOT_A_DUB) | set(audio_pref or ())
+    if original_language:
+        acceptable_audio.add(original_language)
+
+    def _dub_score(s: TorrentioStream) -> int:
+        """1 for a release marked only with foreign dub languages (French VFF,
+        Italian-only, Castellano...) unless that is the film's original language;
+        it then ranks after every English, MULTi or original-language release."""
+        if not deprioritize_dubs or not s.languages:
+            return 0
+        return 0 if set(s.languages) & acceptable_audio else 1
 
     def _compat_score(s: TorrentioStream) -> int:
         """Lower is better for the configured dominant playback client."""
@@ -582,6 +611,7 @@ def rank_streams(
     def sort_key(s: TorrentioStream) -> tuple:
         blob = f"{s.name} {s.title}"
         return (
+            _dub_score(s),
             0 if prefer_season_pack and s.is_season_pack else 1,
             _quality_rank(s, quality_pref),
             identity_rank.get(id(s), 1),

@@ -55,6 +55,44 @@ def _get(path: str, params: dict | None = None, timeout: int = 10) -> dict | Non
         return None
 
 
+_IDENTITY_CACHE: dict[tuple[str, str], dict] = {}
+
+
+def title_identity(imdb_id: str | None, media_type: str = "movie") -> dict:
+    """TMDB title, original title, year and original language for an imdb id.
+
+    Returns {} when unknown. Cached per process: release ranking and sanity
+    checks call this for every search of the same title.
+    """
+    if not imdb_id:
+        return {}
+    kind = "movie" if media_type == "movie" else "tv"
+    key = (imdb_id, kind)
+    if key in _IDENTITY_CACHE:
+        return _IDENTITY_CACHE[key]
+    data = _get(f"/find/{imdb_id}", params={"external_source": "imdb_id"})
+    if data is None:
+        return {}  # transient failure: do not cache
+    results = data.get(f"{kind}_results") or []
+    out: dict = {}
+    if results:
+        item = results[0]
+        date = item.get("release_date") or item.get("first_air_date") or ""
+        out = {
+            "title": item.get("title") or item.get("name") or "",
+            "original_title": item.get("original_title") or item.get("original_name") or "",
+            "year": int(date[:4]) if date[:4].isdigit() else None,
+            "original_language": (item.get("original_language") or "").lower() or None,
+        }
+    _IDENTITY_CACHE[key] = out
+    return out
+
+
+def original_language(imdb_id: str | None, media_type: str = "movie") -> str | None:
+    """TMDB original_language (ISO 639-1) for an imdb id, or None."""
+    return title_identity(imdb_id, media_type).get("original_language")
+
+
 def tmdb_to_imdb(tmdb_id: int | str, media_type: str = "movie") -> str | None:
     kind = "movie" if media_type == "movie" else "tv"
     data = _get(f"/{kind}/{tmdb_id}/external_ids")

@@ -598,7 +598,8 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
     return cached
 
 
-def check_cached_files(hashes: list[str], timeout: int = 15) -> dict[str, dict]:
+def check_cached_files(hashes: list[str], timeout: int = 15,
+                       list_files: bool = False) -> dict[str, dict]:
     """Like check_cached(), but keeps the per-hash size/name info that
     TorBox's checkcached response already includes for free. Used to answer
     "how big is this" without add_magnet/materialize -- no torrent is added
@@ -607,17 +608,21 @@ def check_cached_files(hashes: list[str], timeout: int = 15) -> dict[str, dict]:
     Single-file torrents report size/name at the top level; multi-file
     torrents (season packs) additionally carry a "files" list -- callers
     that need one specific episode should look there first and fall back
-    to the top-level entry otherwise."""
+    to the top-level entry otherwise. list_files=True asks TorBox for every
+    file of multi-file torrents, which the movie collection check needs."""
     if not hashes:
         return {}
     _BATCH = 100
     if len(hashes) > _BATCH:
         out: dict[str, dict] = {}
         for i in range(0, len(hashes), _BATCH):
-            out.update(check_cached_files(hashes[i:i + _BATCH], timeout=timeout))
+            out.update(check_cached_files(hashes[i:i + _BATCH], timeout=timeout,
+                                          list_files=list_files))
         return out
     url = f"{_base_url().rstrip('/')}/torrents/checkcached"
     params = {"hash": ",".join(hashes), "format": "object"}
+    if list_files:
+        params["list_files"] = "true"
     try:
         resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
         resp.raise_for_status()
