@@ -44,6 +44,11 @@ def _owned_hls(token, owner_id):
     return s
 
 
+def _touch_owned(token, owner_id, generation=None):
+    if not web_player.touch_playback(token, owner_id=owner_id, generation=generation):
+        abort(404)
+
+
 def _owned_generation(token, owner_id, filename):
     _owned_direct(token, owner_id)
     generation, sep, basename = filename.partition("/")
@@ -104,7 +109,7 @@ def stream_hls_file(token: str, filename: str):
     rec = _check_enabled()
     s, basename = _owned_generation(token, rec["id"], filename)
     p = _session_file(s, basename)
-    s.touch()
+    _touch_owned(token, rec["id"], s.generation)
     mimetype = {".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t",
                 ".m4s": "video/iso.segment", ".mp4": "video/mp4"}[p.suffix]
     return send_file(p, mimetype=mimetype)
@@ -114,7 +119,7 @@ def stream_hls_file(token: str, filename: str):
 def stream_direct(token: str):
     rec = _check_enabled()
     s = _owned_direct(token, rec["id"])
-    s.touch()
+    _touch_owned(token, rec["id"])
     return redirect(s.cdn_url, code=302)
 
 
@@ -133,10 +138,11 @@ def stream_hls_status(token: str):
     current = web_player.get_session(token, owner_id=rec["id"])
     if current is not None:
         state = web_player._playback_state(current)
+        _touch_owned(token, rec["id"], current.generation)
         return jsonify(status="ready", url=state.pop("stream_url"), **state)
     if s.conversion_error:
         return jsonify(status="error", error="Conversion failed. Please reopen the player.")
-    s.touch()
+    _touch_owned(token, rec["id"])
     return jsonify(status="converting")
 
 
@@ -144,7 +150,9 @@ def stream_hls_status(token: str):
 def stream_subtitles_list(token: str):
     rec = _check_enabled()
     _owned_direct(token, rec["id"])
-    return jsonify(subtitles=web_player.list_subtitles(token, owner_id=rec["id"]))
+    subtitles = web_player.list_subtitles(token, owner_id=rec["id"])
+    _touch_owned(token, rec["id"])
+    return jsonify(subtitles=subtitles)
 
 
 @bp.get("/stream/<token>/subtitles/<path:filename>")
@@ -152,7 +160,7 @@ def stream_subtitle_file(token: str, filename: str):
     rec = _check_enabled()
     s, basename = _owned_generation(token, rec["id"], filename)
     p = _session_file(s, basename, subtitle=True)
-    s.touch()
+    _touch_owned(token, rec["id"], s.generation)
     return send_file(p, mimetype="text/vtt")
 
 
@@ -198,6 +206,7 @@ def stream_save_position(token: str):
             abort(400)
         except PermissionError:
             abort(403)
+        _touch_owned(token, rec["id"], hls.generation if hls is not None else None)
         return jsonify(ok=True)
     finally:
         session.operation_lock.release()
