@@ -91,7 +91,7 @@ type treeEntry struct {
 	Token  string `json:"token"`
 	Path   string `json:"path"`   // e.g. "movies/Civil War (2024)/Civil War (2024).mkv"
 	Size   int64  `json:"size"`   // real cached size in bytes; 0 when uncached/unknown
-	Cached bool   `json:"cached"` // true => serve the real file; false => serve the stub
+	Cached bool   `json:"cached"` // true => real file; false => explicit unavailable
 }
 
 // entryInfo is the per-path record the tree keeps in memory.
@@ -455,7 +455,7 @@ func fetchRange(client *http.Client, requestURL string, offset, length int64, la
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
 		return nil, fmt.Errorf("range GET %s: status %d", label, resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, length))
+	return readMediaResponse(resp, offset, length)
 }
 
 func readRange(token string, offset, length int64) ([]byte, error) {
@@ -510,7 +510,7 @@ func readRange(token string, offset, length int64) ([]byte, error) {
 	if resp.StatusCode != 206 && resp.StatusCode != 200 {
 		return nil, fmt.Errorf("range GET %s: status %d", token, resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, length))
+	return readMediaResponse(resp, offset, length)
 }
 
 // coalesceRange collapses concurrent fetches of the same window into a single
@@ -597,45 +597,21 @@ func (fs *sporeFS) Open(filename string) (billy.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &sporeFile{name: p, size: st.Size(), cached: false, stub: sp}, nil
+		return &sporeFile{name: p, size: st.Size(), sidecar: true, stub: sp}, nil
 	}
 	info, ok := fs.tree.infoFor(p)
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	if !info.cached {
-		// Sticky-real: a title that was already converted (has a built .fsh)
-		// keeps serving as the real file even after its torrent idle-releases
-		// from the account. Plex recorded it as a real Direct Play item, so if
-		// spore-nfs suddenly served the 240-byte stub here Plex would read a
-		// truncated file and playback would break. Instead serve the real size
-		// (moov straight from the local .fsh, mdat re-materialized on demand via
-		// bufferedRead -> /spore-stream), so the item stays playable across the
-		// cache/expire cycle with no Plex re-analysis needed. Never-converted
-		// titles (no .fsh) still serve the stub and transcode via the wrapper.
-		if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
-			return &sporeFile{name: p, token: info.token, size: m.cdnSize, cached: true}, nil
-		}
-		sp := stubPath(p)
-		st, err := os.Stat(sp)
-		if err != nil {
-			return nil, err
-		}
-		return &sporeFile{name: p, token: info.token, size: st.Size(), cached: false, stub: sp}, nil
+	var headerSize int64
+	if m := fshMetaFor(info.token); m.ok {
+		headerSize = m.cdnSize
 	}
-	// The .fsh's cdn_size is the ACTUAL servable size (from the CDN HEAD when the
-	// moov-first header was built). The tree's size can be a stale/nominal value
-	// from a different release; if it over-reports, Plex reads past the real end,
-	// gets 416s, and Direct Play stalls. Prefer the .fsh size whenever present.
-	size := info.size
-	if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
-		size = m.cdnSize
-	} else if size <= 0 {
-		s, err := cachedRealSize(info.token)
-		if err != nil {
-			return nil, err
-		}
-		size = s
+	size, err := playableMediaSize(info.cached, info.size, headerSize)
+	if err != nil {
+		// Never fall back to on-disk MKV metadata. iOS MDE clients may
+		// Direct Play it, bypassing the transcoder wrapper entirely.
+		return nil, &os.PathError{Op: "open", Path: p, Err: err}
 	}
 	return &sporeFile{name: p, token: info.token, size: size, cached: true}, nil
 }
@@ -663,39 +639,17 @@ func (fs *sporeFS) Stat(filename string) (os.FileInfo, error) {
 }
 func (fs *sporeFS) Lstat(filename string) (os.FileInfo, error) { return fs.Stat(filename) }
 
-// sizeAndMtime resolves the size and mtime to report for a path. Cached items
-// report their real size (served via spore-stream); uncached items report the
-// on-disk stub's size (served straight from SPORE_STUB_ROOT: no CDN, no add).
+// sizeAndMtime uses the same non-materializing availability decision as Open.
+// Keep unavailable titles discoverable, but advertise neither stub bytes nor a
+// historical .fsh header as a playable movie. A later cached-state refresh can
+// restore real size and mtime; scanning does not add a provider torrent.
 func (fs *sporeFS) sizeAndMtime(p string, info entryInfo) (int64, time.Time) {
-	if info.cached {
-		// Prefer the .fsh's real cdn_size over the tree's (possibly stale) size --
-		// see Open(). Keeps Stat/ReadDir consistent with what is actually servable.
-		if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
-			return m.cdnSize, mtimeCached
-		}
-		size := info.size
-		// go-nfs calls Stat() on every READ RPC; if this token is already open
-		// for real playback, reuse that size instead of another lookup.
-		if s, ok := peekRealSize(info.token); ok {
-			size = s
-		}
-		if size <= 0 {
-			if s, err := cheapSize(info.token); err == nil {
-				size = s
-			}
-		}
+	var headerSize int64
+	if m := fshMetaFor(info.token); m.ok {
+		headerSize = m.cdnSize
+	}
+	if size, err := playableMediaSize(info.cached, info.size, headerSize); err == nil {
 		return size, mtimeCached
-	}
-	// Sticky-real (see Open): a converted title keeps reporting its real size
-	// and cached mtime once idle-released, so Plex keeps Direct-Playing it
-	// rather than seeing a stub-sized file and breaking. Reporting the same
-	// mtime band it had while cached means Plex never registers a flip, so no
-	// re-analysis is triggered either.
-	if m := fshMetaFor(info.token); m.ok && m.cdnSize > 0 {
-		return m.cdnSize, mtimeCached
-	}
-	if st, err := os.Stat(stubPath(p)); err == nil {
-		return st.Size(), mtimeStub
 	}
 	return 0, mtimeStub
 }
@@ -1145,13 +1099,14 @@ func fshHeaderRead(token string, m fshMeta, offset, want int64) ([]byte, error) 
 }
 
 type sporeFile struct {
-	name   string
-	token  string
-	size   int64
-	pos    int64
-	cached bool
-	stub   string // on-disk stub path, used when !cached
-	mu     sync.Mutex
+	name    string
+	token   string
+	size    int64
+	pos     int64
+	cached  bool
+	sidecar bool   // only .minfo metadata may read from the on-disk tree
+	stub    string // .minfo path; never an MKV media fallback
+	mu      sync.Mutex
 }
 
 func (f *sporeFile) Name() string { return f.name }
@@ -1159,6 +1114,9 @@ func (f *sporeFile) Name() string { return f.name }
 func (f *sporeFile) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if !f.cached && !f.sidecar {
+		return 0, errMediaUnavailable
+	}
 	if f.pos >= f.size {
 		return 0, io.EOF
 	}

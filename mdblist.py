@@ -24,16 +24,27 @@ def is_configured(user: dict) -> bool:
     return bool(user.get("mdblist_api_key"))
 
 
+class MDBListUnavailable(RuntimeError):
+    """The provider list read did not produce a qualified list response."""
+
+
 def get_user_lists(api_key: str) -> list[dict]:
     """Return the account's own lists: [{"id", "name", "items": count}, ...]."""
     try:
         r = requests.get(f"{_BASE}/lists/user", params={"apikey": api_key}, timeout=_HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str)
+            or not ((type(row.get("id")) is int and 0 <= row["id"] <= 9007199254740991)
+                    or (isinstance(row.get("id"), str) and bool(row["id"])))
+            for row in data
+        ):
+            raise ValueError("Invalid MDBList list response")
+        return data
     except Exception as exc:
         log.warning("MDBList get_user_lists failed: %s", safe_exc(exc))
-        return []
+        raise MDBListUnavailable("MDBList lists unavailable") from None
 
 
 def get_list_items(list_id: int | str, api_key: str) -> list[dict]:

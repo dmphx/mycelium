@@ -1,7 +1,8 @@
 """Signed integration API facade: the HTTP boundary only.
 
 Implemented: GET me, capabilities, requests (list and one), and catalog metadata
-reads through integration_catalog_service, and isolated non-automatic saved people.
+reads through integration_catalog_service, isolated non-automatic saved people, and
+owned watchlist pages/mutations backed by an explicitly selected current source.
 Other allowlisted operations authenticate and answer 503 capability_unqualified.
 
 Authentication is the receiver in integration_auth.py. This blueprint never reads the
@@ -34,6 +35,8 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 import integration_auth as ia
 import integration_catalog_service as catalog
 import integration_personalization as personalization
+import integration_watchlist_overlay as watchlist_overlay
+import integration_watchlist_service as watchlist
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +96,8 @@ ROUTES: tuple[Route, ...] = (
     _r("people", "GET", "/people/(" + _ID + ")", "catalog:read", handler="people.read"),
     _r("follows.read", "GET", "/follows", "watchlist:read", handler="follows_read"),
     _r("follows.write", "POST/DELETE", "/follows/(" + _ID + ")", "watchlist:write", handler="follows_write"),
-    _r("watchlist.read", "GET", "/watchlist", "watchlist:read", _LIST_KEYS),
-    _r("watchlist.write", "POST/DELETE", "/watchlist", "watchlist:write"),
+    _r("watchlist.read", "GET", "/watchlist", "watchlist:read", _LIST_KEYS, handler="watchlist_read"),
+    _r("watchlist.write", "POST/DELETE", "/watchlist", "watchlist:write", handler="watchlist_write"),
     _r("requests.list", "GET", "/requests", "requests:read", _LIST_KEYS, handler="requests_list"),
     _r("requests.get", "GET", "/requests/(" + _RID + ")", "requests:read", handler="requests_get"),
     _r("requests.write", "POST", "/requests", "requests:write"),
@@ -353,6 +356,7 @@ def _capabilities(vr, found) -> Response:  # noqa: ARG001
 def _operations(user):
     supported = catalog.operations(user)
     supported.update(personalization.operations(user["id"], metadata_ready="people.read" in supported))
+    supported.update(watchlist.operations(user["id"], metadata_ready="catalog.search" in supported))
     return [name for name in OPERATION_NAMES if name in supported]
 
 
@@ -363,6 +367,43 @@ def _follows_read(vr, found):
 def _follows_write(vr, found):
     return ok(personalization.mutate_saved_person(vr.user["id"], vr.method, int(found.group(1)),
                                                 vr.body, vr.idempotency_key, vr.body_sha256))
+
+
+def _watchlist_read(vr, found):
+    params = _query(vr.target)
+    limit, before = 50, None
+    if "limit" in params:
+        if not _LIMIT_RE.fullmatch(params["limit"]) or int(params["limit"]) > LIST_MAX:
+            raise ia.IntegrationError("bad_request", 400, "invalid limit")
+        limit = int(params["limit"])
+    if "before_id" in params:
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", params["before_id"]) \
+                or int(params["before_id"]) > 9223372036854775807:
+            raise ia.IntegrationError("bad_request", 400, "invalid cursor")
+        before = int(params["before_id"])
+    if not watchlist_overlay.check_selection(vr.user["id"])["ready"]:
+        return _unqualified(vr, found)
+    return ok(watchlist_overlay.list_selected(vr.user["id"], limit=limit, before_id=before))
+
+
+def _watchlist_write(vr, found):
+    # Historical replay is independent of current metadata/source readiness and
+    # cannot repeat an old mutation against newer native membership.
+    try:
+        replay = personalization.replay_lookup(vr.user["id"], "watchlist", vr.method,
+                                               vr.body, vr.idempotency_key)
+    except ia.IntegrationError as error:
+        # Preserve the unqualified-source boundary. An owner without a selected
+        # source has no newly active write contract, including for an empty body.
+        if error.status == 400 and not watchlist_overlay.check_selection(vr.user["id"])["ready"]:
+            return _unqualified(vr, found)
+        raise
+    if replay is not None:
+        return ok(replay)
+    if not watchlist_overlay.check_selection(vr.user["id"])["ready"]:
+        return _unqualified(vr, found)
+    return ok(watchlist.mutate(vr.user["id"], vr.method, vr.body,
+                              vr.idempotency_key, vr.body_sha256))
 
 
 def _catalog_handler(operation):
@@ -429,4 +470,5 @@ def _requests_get(vr, found) -> Response:
 _HANDLERS = {"me": _me, "capabilities": _capabilities, "requests_list": _requests_list,
              "requests_get": _requests_get, "unqualified": _unqualified,
              "follows_read": _follows_read, "follows_write": _follows_write}
+_HANDLERS.update({"watchlist_read": _watchlist_read, "watchlist_write": _watchlist_write})
 _HANDLERS.update({operation: _catalog_handler(operation) for operation in catalog.CATALOG_OPERATIONS})

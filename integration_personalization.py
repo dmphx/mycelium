@@ -99,7 +99,7 @@ def _binding(resource, action, identity, key):
         if set(identity) != {"person_id"}:
             _bad()
         _id(identity["person_id"])
-    elif resource == "watchlist":  # Namespace reserved; no watchlist mutation is implemented.
+    elif resource == "watchlist":
         if set(identity) != {"media"} or type(identity["media"]) is not dict \
                 or set(identity["media"]) != {"type", "tmdb_id"} \
                 or identity["media"]["type"] not in ("movie", "tv"):
@@ -184,8 +184,12 @@ def _result(conn, user_id, resource, action, identity, key, semantic):
                     or data["following"] != (row["action"] == "POST") \
                     or data["automatic_requests"] is not False:
                 _unavailable()
+        elif row["resource"] == "watchlist":
+            if set(data) != {"media", "saved"} or type(data["saved"]) is not bool \
+                    or data["saved"] != (row["action"] == "POST") \
+                    or _json(data["media"]) != _json(stored_identity["media"]):
+                _unavailable()
         else:
-            # Future watchlist writers must validate their own result shape before qualification.
             _unavailable()
     except (ValueError, TypeError, AttributeError, KeyError, IndexError, ia.IntegrationError) as exc:
         if isinstance(exc, ia.IntegrationError) and exc.status == 503:

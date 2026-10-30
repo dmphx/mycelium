@@ -4,6 +4,7 @@ import { api, csrfToken } from '../api';
 import type { GenreRule } from '../api';
 import { usePlugins } from '../hooks/usePlugins';
 import MaintenancePanel from '../components/MaintenancePanel';
+import PluginMetadataStatus from '../components/PluginMetadataStatus';
 
 /** Shared fetch helper for this page's raw fetch() maintenance actions:
  * redirects to /login on 401 (matching api.ts's http() wrapper) and throws
@@ -37,7 +38,8 @@ export default function Admin() {
   const { data: users } = useQuery({ queryKey: ['users'], queryFn: api.users });
   const { data: session } = useQuery({ queryKey: ['session'], queryFn: api.session });
 
-  const { plugins } = usePlugins();
+  const metadata = usePlugins();
+  const { plugins } = metadata;
   // Collect all user_fields contributed by loaded plugins: [{field, label}]
   const pluginUserFields = plugins.flatMap(p =>
     (p.user_fields || []).map(f => ({
@@ -78,15 +80,16 @@ export default function Admin() {
         {!pending?.items || pending.items.length === 0 ? (
           <div className="text-muted text-sm">No pending requests</div>
         ) : (
-          <table className="w-full text-sm">
+          <div role="region" aria-label="Pending requests table" tabIndex={0} className="min-w-0 max-w-full overflow-x-auto rounded">
+          <table aria-label="Pending requests" className="w-full min-w-[640px] text-sm">
             <thead className="text-xs text-muted uppercase border-b border-border">
               <tr>
-                <th className="text-left py-2 px-3">User</th>
-                <th className="text-left py-2 px-3">Title</th>
-                <th className="text-left py-2 px-3">Type</th>
-                <th className="text-left py-2 px-3">IMDB</th>
-                <th className="text-left py-2 px-3">Requested</th>
-                <th className="text-right py-2 px-3">Action</th>
+                <th scope="col" className="text-left py-2 px-3">User</th>
+                <th scope="col" className="text-left py-2 px-3">Title</th>
+                <th scope="col" className="text-left py-2 px-3">Type</th>
+                <th scope="col" className="text-left py-2 px-3">IMDB</th>
+                <th scope="col" className="text-left py-2 px-3">Requested</th>
+                <th scope="col" className="text-right py-2 px-3">Action</th>
               </tr>
             </thead>
             <tbody>
@@ -101,12 +104,14 @@ export default function Admin() {
                   <td className="py-2 px-3 text-muted text-xs">{r.created_at}</td>
                   <td className="py-2 px-3 text-right">
                     <button
+                      aria-label={`Approve ${r.title}`}
                       onClick={() => approveMut.mutate(r.id)}
                       className="px-3 py-1 rounded bg-ok/20 text-ok text-xs hover:bg-ok/30"
                     >
                       ✓ Approve
                     </button>
                     <button
+                      aria-label={`Deny ${r.title}`}
                       onClick={() => denyMut.mutate({ id: r.id, note: prompt('Reason?') || '' })}
                       className="ml-2 px-3 py-1 rounded bg-red-500/20 text-red-400 text-xs hover:bg-red-500/30"
                     >
@@ -117,25 +122,28 @@ export default function Admin() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </section>
 
       <section>
         <h2 className="text-lg font-bold mb-3">Users</h2>
+        <PluginMetadataStatus metadata={metadata} empty={pluginUserFields.length === 0} emptyMessage="No plugin user fields available." />
         <CreateUserForm />
         {users?.users && users.users.length > 0 && (
-          <table className="w-full text-sm mt-4">
+          <div role="region" aria-label="Users table" tabIndex={0} className="mt-4 min-w-0 max-w-full overflow-x-auto rounded">
+          <table aria-label="Users" className="w-full min-w-[640px] text-sm">
             <thead className="text-xs text-muted uppercase border-b border-border">
               <tr>
-                <th className="text-left py-2 px-3">Username</th>
-                <th className="text-left py-2 px-3">Role</th>
-                <th className="text-left py-2 px-3">Auto-approve</th>
-                <th className="text-left py-2 px-3">Enabled</th>
+                <th scope="col" className="text-left py-2 px-3">Username</th>
+                <th scope="col" className="text-left py-2 px-3">Role</th>
+                <th scope="col" className="text-left py-2 px-3">Auto-approve</th>
+                <th scope="col" className="text-left py-2 px-3">Enabled</th>
                 {pluginUserFields.map(({ field, label }) => (
                   <th key={field} className="text-left py-2 px-3">{label}</th>
                 ))}
-                <th className="text-left py-2 px-3">Last login</th>
-                <th className="text-right py-2 px-3">Action</th>
+                <th scope="col" className="text-left py-2 px-3">Last login</th>
+                <th scope="col" className="text-right py-2 px-3">Action</th>
               </tr>
             </thead>
             <tbody>
@@ -145,12 +153,14 @@ export default function Admin() {
                   <td className="py-2 px-3 text-muted">{u.role}</td>
                   <td className="py-2 px-3">
                     <Toggle
+                      label={`Auto-approve for ${u.username}`}
                       on={u.auto_approve}
                       onClick={() => updateMut.mutate({ id: u.id, fields: { auto_approve: !u.auto_approve } })}
                     />
                   </td>
                   <td className="py-2 px-3">
                     <Toggle
+                      label={`Enabled for ${u.username}`}
                       on={u.enabled}
                       onClick={() => updateMut.mutate({ id: u.id, fields: { enabled: !u.enabled } })}
                     />
@@ -158,6 +168,7 @@ export default function Admin() {
                   {pluginUserFields.map(({ field }) => (
                     <td key={field} className="py-2 px-3">
                       <Toggle
+                        label={`${field} for ${u.username}`}
                         on={!!(u as any)[field]}
                         onClick={() => updateMut.mutate({ id: u.id, fields: { [field]: !(u as any)[field] } })}
                       />
@@ -167,6 +178,7 @@ export default function Admin() {
                   <td className="py-2 px-3 text-right">
                     {session?.user?.id !== u.id && (
                       <button
+                        aria-label={`Delete ${u.username}`}
                         onClick={() => confirm(`Delete ${u.username}?`) && deleteMut.mutate(u.id)}
                         className="px-3 py-1 rounded bg-red-500/20 text-red-400 text-xs hover:bg-red-500/30"
                       >
@@ -178,6 +190,7 @@ export default function Admin() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </section>
 
@@ -210,29 +223,32 @@ function CreateUserForm() {
   return (
     <div className="bg-card rounded-lg border border-border p-4">
       <div className="flex flex-wrap gap-3 items-end">
-        <div>
-          <label className="block text-[10px] uppercase tracking-wider text-muted mb-1">Username</label>
+        <div className="min-w-0 flex-1 basis-[180px]">
+          <label htmlFor="admin-create-username" className="block text-[10px] uppercase tracking-wider text-muted mb-1">Username</label>
           <input
+            id="admin-create-username" aria-label="New user username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            className="bg-bg border border-border rounded px-3 py-2 text-sm"
+            className="min-w-0 max-w-full w-full min-h-[44px] bg-bg border border-border rounded px-3 py-2 text-sm"
           />
         </div>
-        <div>
-          <label className="block text-[10px] uppercase tracking-wider text-muted mb-1">Password</label>
+        <div className="min-w-0 flex-1 basis-[180px]">
+          <label htmlFor="admin-create-password" className="block text-[10px] uppercase tracking-wider text-muted mb-1">Password</label>
           <input
+            id="admin-create-password" aria-label="New user password"
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="bg-bg border border-border rounded px-3 py-2 text-sm"
+            className="min-w-0 max-w-full w-full min-h-[44px] bg-bg border border-border rounded px-3 py-2 text-sm"
           />
         </div>
-        <div>
-          <label className="block text-[10px] uppercase tracking-wider text-muted mb-1">Role</label>
+        <div className="min-w-0 flex-1 basis-[180px]">
+          <label htmlFor="admin-create-role" className="block text-[10px] uppercase tracking-wider text-muted mb-1">Role</label>
           <select
+            id="admin-create-role" aria-label="New user role"
             value={role}
             onChange={(e) => setRole(e.target.value as any)}
-            className="bg-bg border border-border rounded px-3 py-2 text-sm"
+            className="min-w-0 max-w-full w-full min-h-[44px] bg-bg border border-border rounded px-3 py-2 text-sm"
           >
             <option value="user">user</option>
             <option value="admin">admin</option>
@@ -263,18 +279,13 @@ function CreateUserForm() {
   );
 }
 
-function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+function Toggle({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`w-10 h-5 rounded-full transition-colors flex items-center px-0.5 ${on ? 'bg-accent' : 'bg-border'}`}
-    >
-      <span
-        className={`w-4 h-4 rounded-full bg-white shadow transition-transform ${
-          on ? 'translate-x-5' : 'translate-x-0'
-        }`}
-      />
+    <button type="button" role="switch" aria-checked={on} aria-label={label} onClick={onClick}
+      className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded">
+      <span aria-hidden="true" className={`w-10 h-5 rounded-full flex items-center px-0.5 ${on ? 'bg-accent' : 'bg-border'}`}>
+        <span className={`w-4 h-4 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-5' : 'translate-x-0'}`} />
+      </span>
     </button>
   );
 }
@@ -412,6 +423,7 @@ function AutoApprovePanel() {
         </p>
 
         <GenreRuleRows
+          labelPrefix="Auto-approve rule"
           rules={effectiveRules}
           movieGenres={movieGenres?.genres || []}
           tvGenres={tvGenres?.genres || []}
@@ -446,12 +458,14 @@ function AutoApprovePanel() {
 }
 
 function GenreRuleRows({
+  labelPrefix,
   rules,
   movieGenres,
   tvGenres,
   onUpdate,
   onRemove,
 }: {
+  labelPrefix: string;
   rules: GenreRule[];
   movieGenres: Array<{ id: number; name: string }>;
   tvGenres: Array<{ id: number; name: string }>;
@@ -464,54 +478,52 @@ function GenreRuleRows({
         const genres = rule.media_type === 'movie' ? movieGenres : tvGenres;
         return (
           <div key={i} className="flex flex-wrap items-center gap-2 bg-bg rounded-lg p-2">
-            <button
-              type="button"
-              onClick={() => onUpdate(i, { enabled: !rule.enabled })}
-              className={`w-9 h-5 rounded-full transition-colors flex items-center px-0.5 flex-shrink-0
-                ${rule.enabled ? 'bg-accent' : 'bg-border'}`}
-            >
-              <div className={`w-4 h-4 rounded-full bg-white shadow transition-transform
-                ${rule.enabled ? 'translate-x-4' : 'translate-x-0'}`} />
-            </button>
+            <Toggle label={`${labelPrefix} ${i + 1} enabled`} on={rule.enabled}
+              onClick={() => onUpdate(i, { enabled: !rule.enabled })} />
             <select
+              aria-label={`${labelPrefix} ${i + 1} media type`}
               value={rule.media_type}
               onChange={(e) => {
                 const mt = e.target.value as 'movie' | 'tv';
                 const g = (mt === 'movie' ? movieGenres : tvGenres)?.[0];
                 onUpdate(i, { media_type: mt, genre_id: g?.id || 0, genre_name: g?.name || '' });
               }}
-              className="bg-card border border-border rounded px-2 py-1 text-xs"
+              className="min-w-0 max-w-full min-h-[44px] bg-card border border-border rounded px-2 py-1 text-xs"
             >
               <option value="movie">Movies</option>
               <option value="tv">Shows</option>
             </select>
             <select
+              aria-label={`${labelPrefix} ${i + 1} genre`}
               value={rule.genre_id}
               onChange={(e) => {
                 const g = genres.find((x) => x.id === Number(e.target.value));
                 onUpdate(i, { genre_id: g?.id || 0, genre_name: g?.name || '' });
               }}
-              className="bg-card border border-border rounded px-2 py-1 text-xs"
+              className="min-w-0 max-w-full min-h-[44px] bg-card border border-border rounded px-2 py-1 text-xs"
             >
               {genres.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
             </select>
             <input
               type="number"
+              aria-label={`${labelPrefix} ${i + 1} from year`}
               placeholder="From year"
               value={rule.year_from ?? ''}
               onChange={(e) => onUpdate(i, { year_from: e.target.value ? Number(e.target.value) : null })}
-              className="w-24 bg-card border border-border rounded px-2 py-1 text-xs"
+              className="w-24 max-w-full min-h-[44px] bg-card border border-border rounded px-2 py-1 text-xs"
             />
             <span className="text-muted text-xs">to</span>
             <input
               type="number"
+              aria-label={`${labelPrefix} ${i + 1} to year`}
               placeholder="To year"
               value={rule.year_to ?? ''}
               onChange={(e) => onUpdate(i, { year_to: e.target.value ? Number(e.target.value) : null })}
-              className="w-24 bg-card border border-border rounded px-2 py-1 text-xs"
+              className="w-24 max-w-full min-h-[44px] bg-card border border-border rounded px-2 py-1 text-xs"
             />
             <button
               type="button"
+              aria-label={`Remove ${labelPrefix.toLowerCase()} ${i + 1}`}
               onClick={() => onRemove(i)}
               className="ml-auto px-2 py-1 rounded text-xs text-red-400 hover:bg-red-500/10"
             >
@@ -570,6 +582,7 @@ function DiscoverGenreTabsPanel() {
         </p>
 
         <GenreRuleRows
+          labelPrefix="Discover genre tab"
           rules={effectiveTabs}
           movieGenres={movieGenres?.genres || []}
           tvGenres={tvGenres?.genres || []}

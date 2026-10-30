@@ -335,3 +335,34 @@ def test_specials_zero_is_allowed_but_parent_zero_is_not():
 def test_provider_and_genre_identifiers_are_canonical(value):
     with pytest.raises(tc.TmdbUnavailable, match="param_not_allowed"):
         run(Resp(), params={"with_genres": value})
+
+
+@pytest.mark.parametrize("imdb", ["tt123456", "tt0001234", "tt1234567890"])
+def test_narrow_imdb_find_request(imdb):
+    data, session = run(Resp(), path="/find/" + imdb, params={"external_source": "imdb_id"})
+    url, sent = session.calls[0]
+    assert data == {} and url.endswith("/find/" + imdb)
+    assert sent["params"] == {"external_source": "imdb_id", "api_key": KEY}
+    assert sent["allow_redirects"] is False and session.trust_env is False and session.closed
+
+
+@pytest.mark.parametrize("path", ["/find/tt12345", "/find/tt12345678901", "/find/TT1234567",
+    "/find/tt１２３４５６７", "/find/tt1234567/", "/find/tt1234567\n", "/find/%74t1234567",
+    "/find/tt1234567?external_source=imdb_id", "//find/tt1234567", "/find/1234567"])
+def test_find_path_aliases_rejected(path):
+    with pytest.raises(tc.TmdbUnavailable, match="path_not_allowed"):
+        run(Resp(), path=path, params={"external_source": "imdb_id"})
+
+
+@pytest.mark.parametrize("params", [None, {}, {"external_source": "tvdb_id"}, {"external_source": True},
+    {"external_source": "imdb_id\n"}, {"external_source": "imdb_id", "page": 1},
+    {"external_source": "imdb_id", "language": "en-US"}, {"external_source": "imdb_id", "append_to_response": "external_ids"}])
+def test_find_parameters_are_path_specific_and_exact(params):
+    with pytest.raises(tc.TmdbUnavailable, match="param_not_allowed"):
+        run(Resp(), path="/find/tt1234567", params=params)
+
+
+@pytest.mark.parametrize("path", ["/movie/603", "/tv/1399", "/search/multi", "/person/9"])
+def test_find_does_not_widen_existing_parameter_grammar(path):
+    with pytest.raises(tc.TmdbUnavailable, match="param_not_allowed"):
+        run(Resp(), path=path, params={"external_source": "imdb_id"})

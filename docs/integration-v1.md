@@ -1,7 +1,9 @@
 # Integration API v1: signed receiver contract
 
 Status: signed HTTP boundary, current actor/request reads, catalog metadata reads and
-isolated non-automatic saved people are implemented. Watchlist and authority-bearing operations remain unqualified. The
+isolated non-automatic saved people are implemented. The private followup adds owned
+watchlist operations only for an explicitly selected current source. Authority-bearing
+operations remain unqualified. The
 feature is off unless `INTEGRATION_ENABLED=true`; this milestone does not qualify deployment.
 
 ## Configuration (environment only)
@@ -341,8 +343,8 @@ no leading zero).
 | GET `/genre-tabs`, `/people/<id>` | catalog:read | none | implemented |
 | GET `/follows` | watchlist:read | none | implemented; isolated saved people |
 | POST, DELETE `/follows/<id>` | watchlist:write | none | implemented; exact body `{}` |
-| GET `/watchlist` | watchlist:read | list | 503 |
-| POST, DELETE `/watchlist` | watchlist:write | none | 503 |
+| GET `/watchlist` | watchlist:read | list | explicit current owned source required |
+| POST, DELETE `/watchlist` | watchlist:write | none | exact media-only body; explicit current owned source required for new work |
 | POST `/requests` | requests:write | none | 503 |
 | POST `/availability` | availability:read | none | 503 |
 | POST `/playback-contexts` | playback-contexts:write | none | 503 |
@@ -393,9 +395,10 @@ policy, library grants or repair activation.
 
 The signed follows facade uses only `integration_saved_people`. It never reads, copies,
 writes or changes `favorite_actors`, whose existing automatic-request consumers remain
-unchanged. Every follows response includes `automatic_requests: false`. Watchlist GET,
-POST and DELETE remain unqualified and unadvertised; there is no legacy-row hydration,
-metadata migration, identity-hint change or new processor/request/quota/outbox/grant path.
+unchanged. Every follows response includes `automatic_requests: false`. That milestone
+left watchlist operations unqualified; the private watchlist followup below uses an
+explicit source selection rather than legacy-row hydration or metadata migration.
+There is no identity-hint change or new processor/request/quota/outbox/grant path.
 
 POST and DELETE `/follows/<person_id>` require body exactly `{}`. The canonical path
 provides the strict integer identity 1..2147483647; all caller fields, including owner,
@@ -448,3 +451,161 @@ Deterministic temporary-SQLite and signed HTTP tests cover ownership, enabled re
 historical replay, concurrency, rollback, retention/cascade, bounds, metadata failures,
 source corruption and unchanged legacy consumers. These checks do not qualify deployment,
 public edge behavior or final browser acceptance.
+
+## Internal watchlist overlay preparation (C2c2a)
+
+The frozen C2c2a transfer left signed watchlist routes 503 and unadvertised. The internal
+`integration_watchlist_overlay.py` primitives prepare and explicitly apply immutable
+server metadata without rewriting, removing or deduplicating native watchlist rows.
+Existing consumers, favorites, requests, quotas, outbox and grant authority are unchanged.
+The explicit internal selection described below does not activate HTTP or create a
+watchlist mutation receipt.
+
+`prepare_owner(user_id, fetch=..., clock=...)` takes one complete native-owner snapshot
+in an explicit read transaction and releases it before metadata fetches. It rechecks the
+enabled owner and full source after resolution before issuing a trusted in-process
+`PreparedWatchlist`. Preparation and checks perform no database writes or schema creation.
+`check_prepared(prepared)` checks current source. `apply_prepared(prepared,
+expected_plan_hash=...)` uses one BEGIN IMMEDIATE to recheck current enabled ownership,
+full source equality, complete coverage, integrity and retention limits, then insert the
+whole overlay batch or roll back. `check_overlay(user_id, plan_hash)` checks a named applied
+batch in one read transaction. Missing owned preparation returns ready false; failures and
+drift never become a successful empty watchlist. No provider fetch occurs under a transaction.
+
+The native snapshot includes id, user_id, media_type, imdb_id, nullable tmdb_id, added_at,
+title and poster_path. Domain-separated versioned SHA-256 fingerprints bind the identity
+set separately from the complete eight-column source. Ordered row hashes include legacy
+title/image values only as opaque provenance; neither value is copied to output. Insert,
+delete, owner reassignment or any column edit invalidates the applicable source comparison.
+Equality is a current-state comparison, not an event log or proof against intermediate
+changes that are later reversed. Every future consumer must recheck in its own transaction;
+timestamps and notifications do not substitute for this check.
+
+Present typed TMDB IDs resolve exact raw movie/TV detail with external_ids appended.
+Root identity, explicit media_type and external IMDb must agree exactly with native
+membership; an external parent ID, when supplied, must agree too. Null native IDs resolve
+only through the checked `/find/tt<6..10 ASCII digits>` path with parameters exactly
+`external_source=imdb_id`. Exactly one candidate of the native kind must round-trip through
+the same typed detail proof. Episode results cannot supply series identity. Zero or
+ambiguous candidates, unsupported types, conflicting identities and duplicate resolved
+typed identities fail closed without title matching, aliases, global identity caches or
+native repairs. Known IDs take one metadata call; null IDs take two.
+
+The existing pure Title builder suffices: credits, providers, region, videos and
+recommendations are not required. Raw overview must already be a string, including a
+genuine empty string; absent/null overview is unresolved rather than invented. Only the
+allowlisted Title DTO and minimal identity proof/response hashes are retained. Optional
+images and dates follow existing builder rules without legacy fallbacks. Persisted DTOs,
+proofs, typed IDs, source fingerprints, hashes and exact coverage are validated on reads
+and identical-plan apply. No raw upstream dictionary, caller display metadata or credentials
+are stored in the overlay.
+
+`integration_watchlist_preparations` stores owner, format, complete-set hashes, count and
+plan hash. `integration_watchlist_overlay_entries` stores native row ID, row hash, native
+identity, resolved typed identity, Title DTO/hash and minimal identity proof. Neither table
+has a foreign key to native watchlist: legacy removal must continue to work. Historical
+entries may remain but fail current-source checks. Update/delete/replacement guards make
+batches immutable while allowing whole native-owner cascade. Apply time is diagnostic,
+not freshness or consistency proof.
+
+Prepared objects are immutable in-process values issued by the resolver, not arbitrary
+JSON dictionaries. Reports and unkeyed hashes are not authentication or authorization.
+There is no JSON-plan loader. The caller must name the exact reviewed hash for apply;
+persisted checks do not make exported plans eligible for application after restart.
+
+Fixed bounds: 100 native rows, 32 predicted/actual checked fetches, 60 elapsed seconds and
+1 MiB total serialized preparation. Oversized snapshots and predictable call-budget excess
+fail before provider work. The elapsed budget is checked between calls and after processing;
+the checked transport can overrun it during one blocking read, so it is not a hard wall-clock
+deadline. There is no partial installation. Retention is at most 16 distinct plans per owner,
+10000 plans globally and 1000000 entries globally. No TTL, eviction or recycling exists.
+An identical intact applied plan can replay at capacity; a new over-capacity plan fails
+nonretryable 503 atomically. Missing/malformed metadata and unresolved source are safe 503;
+transport outages follow the existing retry reason allowlist. Source drift is 409 and
+disabled/missing owners are 403. Error messages contain no upstream text or database paths.
+
+Larger-owner preparation remains unimplemented. The private followup below adds explicit
+selection, owned pages and historical mutation results. This
+internal milestone does not authorize provider use, production database
+operations, source publication or replacement of a user-facing application.
+
+### Explicit current metadata selection
+
+`select_prepared(prepared, expected_plan_hash=..., expected_revision=...)` selects an
+already applied, resolver-issued preparation in one BEGIN IMMEDIATE transaction. It
+rechecks the enabled owner, full current native snapshot, persisted plan and storage guards
+before a compare-and-swap of the owner's selected plan. An unselected owner has revision
+zero. A changed selection increments the retained revision; selecting the same intact plan
+with the current revision leaves it unchanged. A stale expected revision returns 409,
+including an attempt to return to a prior plan after another selection. A hash or exported
+document cannot replace the issued object. Selection does not repair or rewrite membership.
+
+`check_selection(user_id)` reads the explicit selection and its complete current source in
+one read transaction. Nothing selects the newest plan implicitly. Missing selection is
+`ready:false`, reason `not_selected`, revision zero. Only an explicitly applied and selected
+empty snapshot is a ready empty watchlist. Stale membership is 409, a disabled owner is 403,
+and absent guards, invalid stored metadata or a cross-owner pointer fail closed with 503.
+There is no provider access or metadata-key prerequisite for checking retained metadata.
+These checks prove current source equality, not a history of intermediate membership.
+
+The additive `integration_watchlist_selection` table holds owner, plan hash and revision.
+It has no foreign key to native membership. Guarded revisions cannot be reset by replacement
+or deletion while the native owner exists; whole-owner cascade remains possible. Legacy
+membership removal proceeds normally and invalidates the selection instead of dropping
+an unresolved row from a successful facade response. Conflicting duplicate typed identities
+remain intact in native storage and prevent preparation rather than being deduplicated.
+The private signed facade below requires this explicit current source; it never selects
+or prepares an owner implicitly.
+
+`list_selected(user_id, limit=50, before_id=None)` provides the internal owned metadata
+page over that same checked selection. Limits are 1 through 100, cursors are positive
+native row IDs, and ordering is descending row ID. Items contain the validated Title
+fields plus `watchlist_id` and native `added_at` normalized to UTC ISO8601. The response
+has `next_before_id` or null. Owner IDs, IMDb values, legacy display text and proof objects
+are not returned. Each page validates the entire selected source, including rows outside
+the page. A cursor is a boundary rather than snapshot authority: source drift between
+pages fails closed. An unselected owner is 503, rather than an invented empty page.
+This read primitive neither creates selection nor performs provider I/O, membership
+mutations, quota changes or request execution.
+
+### Internal watchlist membership and historical results
+
+`integration_watchlist_service.mutate(user_id, action, payload, key, body_sha256)` is an
+owned primitive invoked by the signed facade after the existing native actor verifier.
+Its exact body is
+`{"media":{"type":"movie|tv","tmdb_id":123}}`, with POST or DELETE. The shared
+personalization result namespace binds owner, resource, action and typed identity.
+It validates historical watchlist results as exact `{media,saved}` objects before
+replay or conflict handling. The raw body digest remains separate from that semantic
+identity. A replay requires an enabled native owner, returns the historical result,
+and does not fetch metadata, recreate removed membership or delete newer membership.
+
+New work requires an explicitly selected complete current watchlist. Adding an absent
+typed title resolves exact checked typed detail plus external IMDb outside any SQLite
+transaction; missing or conflicting identity fails without aliases or caller metadata.
+The final BEGIN IMMEDIATE rechecks owner, result ledger, entire native source and exact
+selected revision. It commits the requested owned membership change, complete immutable
+metadata batch, selected revision and immutable success result together, or rolls all of
+them back. A no-op gets a historical result without changing the selected revision.
+Conflicting native IMDb membership is not merged. Null native IDs already resolved by
+the selected proof are preserved on no-op save. Other native rows are never repaired,
+deduplicated or silently excluded. A changed source during resolution returns 409.
+
+Explicit membership removal retains metadata history and historical success results;
+the overlay has no restrictive native-row foreign key. Returning to a previously retained
+empty plan advances selection revision, including at plan capacity. New distinct plans
+and results remain subject to the existing bounded retention limits; there is no eviction,
+TTL or unbounded growth promise. These primitives do not enqueue requests, change quotas,
+touch automatic favorite actors, assert availability or grant playability. Signed watchlist
+HTTP operations remain 503 and unadvertised for owners without an explicit current
+selection. Source drift is 409, and readiness failures do not disable unrelated reads.
+`watchlist.read` is advertised only for a checked current selection; `watchlist.write`
+additionally requires local metadata configuration and healthy retained-result storage.
+Historical replay is allowed without fresh metadata or current-source readiness, after
+the enabled actor and exact historical result have been verified. Invalid bodies are
+400 for a qualified owner; an owner with no selected source retains the unqualified 503
+boundary. Query grammar, signed raw target/body/scope/idempotency binding, no-cookie
+authentication and no-store envelopes remain the existing integration boundary.
+No live service, real provider, source publication, migration or release is activated by
+this private source followup. The external frozen-proposal comparison remains a separate
+gate and must not be replaced by the included documentation.

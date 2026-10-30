@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -64,7 +65,17 @@ def _init_vaapi() -> None:
         log.warning("web_player: VA-API probe failed: %s - software transcode only", exc)
 
 
-threading.Thread(target=_init_vaapi, daemon=True).start()
+_vaapi_probe_lock = threading.Lock()
+_vaapi_probed = False
+
+
+def _ensure_vaapi() -> None:
+    """Probe only when a real HLS transcode needs it, never at import."""
+    global _vaapi_probed
+    with _vaapi_probe_lock:
+        if not _vaapi_probed:
+            _init_vaapi()
+            _vaapi_probed = True
 
 _BROWSER_AUDIO_OK    = {"aac"}   # vorbis/opus not reliable in mpegts HLS
 _NO_BROWSER_VIDEO_RE = re.compile(r"\b(av1|vp9|vp8)\b", re.IGNORECASE)
@@ -155,7 +166,7 @@ def find_web_candidates(imdb_id: str, media_type: str,
                     seen.add(s.info_hash)
                     streams.append(s)
         except Exception as exc:
-            log.warning("web_player: zilean fetch failed: %s", exc)
+            log.warning("web_player: zilean fetch failed")
 
     if health_cache.is_up("torrentio"):
         kind = "movie" if media_type == "movie" else "series"
@@ -166,7 +177,7 @@ def find_web_candidates(imdb_id: str, media_type: str,
                     seen.add(s.info_hash)
                     streams.append(s)
         except Exception as exc:
-            log.warning("web_player: torrentio fetch failed: %s", exc)
+            log.warning("web_player: torrentio fetch failed")
 
     scored = sorted(
         ((s, _web_score(s, browser_caps)) for s in streams
@@ -190,6 +201,7 @@ class JobStatus(str, Enum):
 @dataclass
 class PrepareJob:
     job_id:       str
+    owner_id:     int
     imdb_id:      str
     media_type:   str
     season:       int | None
@@ -203,6 +215,7 @@ class PrepareJob:
     cdn_url:      str | None = None
     file_info:    dict | None = None
     error:        str | None = None
+    created_at:   float = field(default_factory=time.monotonic)
     _thread:      threading.Thread = field(default=None, repr=False)
 
 
@@ -210,31 +223,118 @@ _jobs: dict[str, PrepareJob] = {}
 _jobs_lock = threading.Lock()
 
 
+MAX_PREPARE_JOBS = 128
+MAX_ACTIVE_JOBS = 8
+MAX_ACTIVE_PER_OWNER = 2
+
+
+def _target(imdb_id, media_type, season, episode) -> None:
+    if not isinstance(imdb_id, str) or not re.fullmatch(r"tt[0-9]{7,10}", imdb_id):
+        raise ValueError("A valid IMDb identity is required")
+    if media_type not in ("movie", "tv"):
+        raise ValueError("Unknown media type")
+    if media_type == "movie":
+        if season is not None or episode is not None:
+            raise ValueError("Movies cannot carry episode coordinates")
+    elif (type(season) is not int or not 0 <= season <= 999
+          or type(episode) is not int or not 1 <= episode <= 9999):
+        raise ValueError("Choose one explicit season and episode")
+
+
+def _owner_enabled(owner_id) -> bool:
+    if type(owner_id) is not int or owner_id <= 0:
+        return False
+    rec = db.get_user(owner_id)
+    return bool(rec and rec.get("enabled") and rec.get("webplayer_enabled"))
+
+
 def start_prepare_job(imdb_id: str, media_type: str,
                       season: int | None = None,
                       episode: int | None = None,
-                      user_agent: str = "") -> str:
-    job_id = uuid.uuid4().hex[:12]
-    job = PrepareJob(job_id=job_id, imdb_id=imdb_id, media_type=media_type,
-                     season=season, episode=episode,
+                      user_agent: str = "", *, owner_id: int) -> str:
+    _target(imdb_id, media_type, season, episode)
+    if not _owner_enabled(owner_id):
+        raise PermissionError("Player is unavailable")
+    job_id = uuid.uuid4().hex
+    job = PrepareJob(job_id=job_id, owner_id=owner_id, imdb_id=imdb_id,
+                     media_type=media_type, season=season, episode=episode,
                      browser_caps=_parse_browser_caps(user_agent))
     with _jobs_lock:
+        cutoff = time.monotonic() - SESSION_IDLE_CLEANUP
+        for key, old in list(_jobs.items()):
+            if old.status in (JobStatus.READY, JobStatus.ERROR) and old.created_at < cutoff:
+                del _jobs[key]
+        active = [j for j in _jobs.values()
+                  if j.status not in (JobStatus.READY, JobStatus.ERROR)]
+        if (len(_jobs) >= MAX_PREPARE_JOBS or len(active) >= MAX_ACTIVE_JOBS
+                or sum(j.owner_id == owner_id for j in active) >= MAX_ACTIVE_PER_OWNER):
+            raise RuntimeError("Player preparation is busy")
         _jobs[job_id] = job
     t = threading.Thread(target=_run_job, args=(job,), daemon=True)
     job._thread = t
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+        raise
     return job_id
 
 
-def get_job(job_id: str) -> PrepareJob | None:
+def get_job(job_id: str, *, owner_id: int) -> PrepareJob | None:
     with _jobs_lock:
-        return _jobs.get(job_id)
+        job = _jobs.get(job_id)
+        return job if job and job.owner_id == owner_id else None
 
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 
-def _get_cdn_url(stream: torrentio.TorrentioStream,
-                 ) -> tuple[str | None, int | None, int | None]:
+_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts"}
+_EPISODE_TAG = re.compile(r"(?i)(?<![a-z0-9])(?:s([0-9]{1,3})e([0-9]{1,4})|([0-9]{1,3})x([0-9]{1,4}))(?![a-z0-9])")
+_EXTRA_FILE = re.compile(r"(?i)(?:^|[ ._/-])(?:samples?|trailers?|extras?|featurettes?)(?:$|[ ._/-])")
+
+
+def _select_file(files, media_type, season=None, episode=None):
+    """Unique explicit file identity only. Never infer pack order or largest file.
+
+    Filename coordinates are selection evidence, not a catalog/grant proof.
+    Multi-episode files and untagged episode fallbacks remain unqualified.
+    """
+    if not isinstance(files, list) or len(files) > 10000:
+        return None
+    candidates = []
+    ids = set()
+    for item in files:
+        if not isinstance(item, dict):
+            return None
+        fid, name = item.get("id"), item.get("name")
+        if type(fid) is not int or fid < 0 or fid in ids:
+            return None
+        ids.add(fid)
+        if not isinstance(name, str) or len(name) > 4096 or "\x00" in name:
+            return None
+        name = name.replace("\\", "/")
+        if Path(name).suffix.lower() not in _VIDEO_EXTENSIONS or _EXTRA_FILE.search(name):
+            continue
+        # Directories may carry a season label, but the file must identify its episode.
+        basename = name.replace("\\", "/").rsplit("/", 1)[-1]
+        tags = list(_EPISODE_TAG.finditer(basename))
+        if media_type == "movie":
+            if not tags:
+                candidates.append(item)
+        elif media_type == "tv" and len(tags) == 1:
+            tag = tags[0]
+            # S01E01E02, S01E01-02 and 1x01-1x02 are not single episodes.
+            if re.match(r"(?i)(?:[ ._]*[ex][0-9]|[ ._]*[-+&][ ._]*(?:s?[0-9]|e[0-9]))", basename[tag.end():]):
+                continue
+            coordinates = (int(tag[1] or tag[3]), int(tag[2] or tag[4]))
+            if coordinates == (season, episode):
+                candidates.append(item)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _get_cdn_url(stream: torrentio.TorrentioStream, media_type: str,
+                 season: int | None = None, episode: int | None = None) -> tuple[str | None, int | None, int | None]:
     """Resolve a TorrentioStream to (cdn_url, torrent_id, file_id).
 
     The caller guarantees that either:
@@ -255,7 +355,7 @@ def _get_cdn_url(stream: torrentio.TorrentioStream,
             log.warning("web_player: TorBox rate-limited on add_magnet hash=%s", stream.info_hash)
             return None, None, None
         except (RuntimeError, _req_exc.RequestException) as exc:
-            log.warning("web_player: add_magnet failed for hash=%s: %s", stream.info_hash, exc)
+            log.warning("web_player: add_magnet failed for hash=%s", stream.info_hash)
             return None, None, None
         item = torbox.wait_until_ready(stream.info_hash, timeout=60,
                                        torrent_id=torrent_id)
@@ -274,11 +374,12 @@ def _get_cdn_url(stream: torrentio.TorrentioStream,
     if not files:
         return None, None, None
 
-    _VIDEO_EXT = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts"}
-    videos  = [f for f in files
-               if Path(f.get("name") or "").suffix.lower() in _VIDEO_EXT] or files
-    main    = max(videos, key=lambda f: f.get("size") or 0)
-    file_id = main.get("id")
+    if type(torrent_id) is not int or torrent_id < 0:
+        return None, None, None
+    main = _select_file(files, media_type, season, episode)
+    if main is None:
+        return None, None, None
+    file_id = main["id"]
 
     url = _request_dl(torrent_id, file_id)
     return url, torrent_id, file_id
@@ -313,10 +414,10 @@ def _request_dl(torrent_id: int, file_id: int) -> str | None:
                 return (resp.json() or {}).get("data") or None
             last = f"HTTP {resp.status_code}"
         except req_lib.HTTPError as exc:
-            log.warning("web_player: requestdl failed: %s", exc)
+            log.warning("web_player: requestdl rejected (HTTP error)")
             return None
         except req_lib.RequestException as exc:
-            last = str(exc)
+            last = "network unavailable"
         if attempt < attempts:
             delay = (_config.REQUESTDL_BACKOFF_MS / 1000.0) * attempt
             log.info("web_player: requestdl transient (%s); retry %d/%d in %.1fs",
@@ -328,6 +429,8 @@ def _request_dl(torrent_id: int, file_id: int) -> str | None:
 
 def _run_job(job: PrepareJob) -> None:
     try:
+        if not _owner_enabled(job.owner_id):
+            raise PermissionError("Player is unavailable")
         job.status  = JobStatus.SEARCHING
         job.message = "Looking for a web-compatible version…"
 
@@ -363,7 +466,7 @@ def _run_job(job: PrepareJob) -> None:
                     log.info("web_player: found in TorBox library hash=%s", c.info_hash)
                     break
         except (torbox.RateLimited, RuntimeError, _req_exc.RequestException) as exc:
-            log.warning("web_player: library lookup failed: %s", exc)
+            log.warning("web_player: library lookup failed")
 
         # Priority 2: TorBox has it cached (instant add, no download wait).
         if best is None:
@@ -376,7 +479,7 @@ def _run_job(job: PrepareJob) -> None:
                 job.error  = "TorBox rate limit hit. Wait a moment and try again."
                 return
             except (RuntimeError, _req_exc.RequestException) as exc:
-                log.warning("web_player: check_cached failed: %s", exc)
+                log.warning("web_player: check_cached failed")
                 job.status = JobStatus.ERROR
                 job.error  = "TorBox temporarily unavailable. Try again in a moment."
                 return
@@ -416,84 +519,11 @@ def _run_job(job: PrepareJob) -> None:
 
             log.info("web_player: selected %r hash=%s", candidate.title, _hash)
 
-            # Reuse an active direct session (prefer direct play for non-HEVC).
-            with _direct_lock:
-                existing_direct = _direct_sessions.get(_hash)
-            if existing_direct:
-                age = time.monotonic() - existing_direct.started_at
-                if age > CDN_URL_MAX_AGE_S:
-                    log.info("web_player: CDN URL stale (%.0fs), refreshing hash=%s",
-                             age, _hash)
-                    _refresh_direct_cdn_url(existing_direct)
-
-                if existing_direct.file_info.get('video_codec') != 'hevc':
-                    log.info("web_player: reusing active direct session hash=%s", _hash)
-                    job.token       = _hash
-                    job.file_info   = existing_direct.file_info
-                    job.cdn_url     = None
-                    job.stream_type = "direct"
-                    job.stream_url  = f"/stream/{_hash}/direct"
-                    job.status      = JobStatus.READY
-                    job.message     = "Ready"
-                    return
-
-                # HEVC: check for an existing HLS session first.
-                with _sessions_lock:
-                    existing_hls = _sessions.get(_hash)
-                if existing_hls and existing_hls.proc.poll() is None:
-                    log.info("web_player: reusing active HLS session for HEVC hash=%s", _hash)
-                    multi_audio = len(existing_hls.file_info.get("audio_tracks", [])) > 1
-                    job.token       = _hash
-                    job.file_info   = existing_hls.file_info
-                    job.cdn_url     = existing_hls.cdn_url
-                    job.stream_type = "hls"
-                    job.stream_url  = (f"/stream/{_hash}/hls/master.m3u8" if multi_audio
-                                       else f"/stream/{_hash}/hls/playlist.m3u8")
-                    job.status      = JobStatus.READY
-                    job.message     = "Ready"
-                    return
-
-                # HEVC without an HLS session - run conversion on the existing direct session.
-                log.info("web_player: transcoding HEVC direct session to HLS hash=%s", _hash)
-                job.token    = _hash
-                job.file_info = existing_direct.file_info
-                job.status   = JobStatus.PREPARING
-                job.message  = "Transcoding HEVC to H264..."
-                _do_hls_conversion(_hash, existing_direct.file_info)
-                tmp_dir  = PLAYER_TMP_DIR / _hash
-                err_file = tmp_dir / "hls_error.txt"
-                rdy_file = tmp_dir / "hls_ready.txt"
-                if err_file.exists():
-                    job.status = JobStatus.ERROR
-                    job.error  = err_file.read_text()
-                    return
-                playlist = rdy_file.read_text().strip() if rdy_file.exists() else "playlist.m3u8"
-                job.stream_type = "hls"
-                job.stream_url  = f"/stream/{_hash}/hls/{playlist}"
-                job.status      = JobStatus.READY
-                job.message     = "Ready"
-                return
-
-            # Reuse an active HLS session without re-probing (skip if HDR).
-            with _sessions_lock:
-                existing = _sessions.get(_hash)
-            if existing and existing.proc.poll() is None:
-                if existing.file_info.get("is_hdr"):
-                    log.warning("web_player: skipping HDR cached session hash=%s", _hash)
-                    continue
-                log.info("web_player: reusing active HLS session hash=%s", _hash)
-                multi_audio   = len(existing.file_info.get("audio_tracks", [])) > 1
-                job.file_info = existing.file_info
-                job.cdn_url   = existing.cdn_url
-                job.status    = JobStatus.READY
-                job.message   = "Ready"
-                job.stream_url = (f"/stream/{_hash}/hls/master.m3u8" if multi_audio
-                                  else f"/stream/{_hash}/hls/playlist.m3u8")
-                return
-
+            # A release hash is content identity, never a playback session identity.
+            # Every job has independent ownership, episode binding and seek state.
             job.status  = JobStatus.MATERIALIZING
             job.message = "Fetching via TorBox…"
-            _cdn, _torrent_id, _file_id = _get_cdn_url(candidate)
+            _cdn, _torrent_id, _file_id = _get_cdn_url(candidate, job.media_type, job.season, job.episode)
             if not _cdn:
                 log.warning("web_player: requestdl failed for hash=%s, skipping", _hash)
                 continue
@@ -504,7 +534,7 @@ def _run_job(job: PrepareJob) -> None:
             torrent_id  = _torrent_id
             file_id     = _file_id
             file_info   = _file_info_from_candidate(candidate)
-            session_key = _hash
+            session_key = job.job_id
             break
 
         if not cdn_url or not file_info or not session_key:
@@ -512,7 +542,7 @@ def _run_job(job: PrepareJob) -> None:
             job.error  = "No instantly available version found. Use Jellyfin."
             return
 
-        job.cdn_url   = cdn_url
+        job.cdn_url   = None
         job.file_info = file_info
 
         # Always transcode HEVC to HLS - browsers cannot reliably decode raw HEVC
@@ -522,22 +552,24 @@ def _run_job(job: PrepareJob) -> None:
         job.status  = JobStatus.PREPARING
         job.message = "Transcoding HEVC to H264..." if needs_hls else "Preparing for playback..."
 
+        if not _owner_enabled(job.owner_id):
+            raise PermissionError("Player is unavailable")
         _start_direct(session_key, file_info, cdn_url,
-                      torrent_id=torrent_id, file_id=file_id)
+                      torrent_id=torrent_id, file_id=file_id,
+                      owner_id=job.owner_id, content_hash=candidate.info_hash,
+                      target=(job.imdb_id, job.media_type, job.season, job.episode))
         job.token = session_key
 
         if needs_hls:
             _do_hls_conversion(session_key, file_info)
-            tmp_dir  = PLAYER_TMP_DIR / session_key
-            err_file = tmp_dir / "hls_error.txt"
-            rdy_file = tmp_dir / "hls_ready.txt"
-            if err_file.exists():
+            converted = get_session(session_key, owner_id=job.owner_id)
+            if converted is None:
                 job.status = JobStatus.ERROR
-                job.error  = err_file.read_text()
+                job.error = "Conversion failed. Please reopen the player."
                 return
-            playlist = rdy_file.read_text().strip() if rdy_file.exists() else "playlist.m3u8"
+            job.file_info = converted.file_info
             job.stream_type = "hls"
-            job.stream_url  = f"/stream/{session_key}/hls/{playlist}"
+            job.stream_url = _playback_state(converted)["stream_url"]
         else:
             job.stream_type = "direct"
             job.stream_url  = f"/stream/{session_key}/direct"
@@ -549,10 +581,10 @@ def _run_job(job: PrepareJob) -> None:
         log.warning("web_player: job %s hit TorBox rate limit", job.job_id)
         job.status = JobStatus.ERROR
         job.error  = "TorBox rate limit hit. Wait a moment and try again."
-    except Exception as exc:
-        log.exception("web_player: prepare job %s crashed", job.job_id)
+    except Exception:
+        log.warning("web_player: prepare job %s failed", job.job_id)
         job.status = JobStatus.ERROR
-        job.error  = f"Internal error ({type(exc).__name__}: {exc})"
+        job.error  = "Playback preparation failed. Please try again."
 
 
 # ── FFprobe ────────────────────────────────────────────────────────────────────
@@ -568,7 +600,7 @@ def _probe(cdn_url: str) -> dict | None:
         )
         data    = json.loads(result.stdout)
     except Exception as exc:
-        log.warning("web_player: ffprobe failed: %s", exc)
+        log.warning("web_player: ffprobe failed")
         return None
 
     streams = data.get("streams", [])
@@ -621,12 +653,18 @@ def _content_type_for(file_info: dict) -> str:
 @dataclass
 class DirectSession:
     token:        str
+    owner_id:     int
+    content_hash: str
+    target:       tuple
     content_type: str
     cdn_url:      str
     file_info:    dict
     torrent_id:   int | None = None
     file_id:      int | None = None
-    converting:   bool  = False   # True once HLS fallback has been triggered
+    converting:   bool = False
+    conversion_error: str | None = None
+    generation_attempts: int = 0
+    operation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     started_at:   float = field(default_factory=time.monotonic)
     last_request: float = field(default_factory=time.monotonic)
     _hb:          threading.Thread = field(default=None, repr=False)
@@ -640,7 +678,7 @@ class DirectSession:
                 time.sleep(60)
                 if time.monotonic() - self.last_request > SESSION_IDLE_CLEANUP:
                     break
-                db.touch_virtual_item(self.token)
+                db.touch_virtual_item(self.content_hash)
         self._hb = threading.Thread(target=_beat, daemon=True)
         self._hb.start()
 
@@ -649,9 +687,10 @@ _direct_sessions: dict[str, DirectSession] = {}
 _direct_lock = threading.Lock()
 
 
-def get_direct_session(token: str) -> DirectSession | None:
+def get_direct_session(token: str, *, owner_id: int | None = None) -> DirectSession | None:
     with _direct_lock:
-        return _direct_sessions.get(token)
+        session = _direct_sessions.get(token)
+        return session if session and (owner_id is None or session.owner_id == owner_id) else None
 
 
 def _refresh_direct_cdn_url(session: DirectSession) -> None:
@@ -669,8 +708,10 @@ def _refresh_direct_cdn_url(session: DirectSession) -> None:
 
 def _start_direct(token: str, file_info: dict, cdn_url: str,
                   torrent_id: int | None = None,
-                  file_id:    int | None = None) -> DirectSession:
-    session = DirectSession(token=token, content_type=_content_type_for(file_info),
+                  file_id:    int | None = None, *, owner_id: int,
+                  content_hash: str, target: tuple) -> DirectSession:
+    session = DirectSession(token=token, owner_id=owner_id, content_hash=content_hash,
+                            target=target, content_type=_content_type_for(file_info),
                             cdn_url=cdn_url, file_info=file_info,
                             torrent_id=torrent_id, file_id=file_id)
     session.start_heartbeat()
@@ -680,16 +721,24 @@ def _start_direct(token: str, file_info: dict, cdn_url: str,
     return session
 
 
-def start_hls_conversion(token: str) -> bool:
-    """Trigger HLS pipeline for an active direct session (browser couldn't play it)."""
-    s = get_direct_session(token)
-    if not s:
-        return False
-    if s.converting:
-        return True  # already in progress — idempotent
-    s.converting = True
-    threading.Thread(target=_do_hls_conversion, args=(token, s.file_info),
-                     daemon=True).start()
+def start_hls_conversion(token: str, *, owner_id: int) -> bool:
+    """One conversion per owned playback; competing calls cannot spawn workers."""
+    with _direct_lock:
+        s = _direct_sessions.get(token)
+        if not s or s.owner_id != owner_id:
+            return False
+        if s.converting or get_session(token) is not None:
+            return True
+        if s.conversion_error or not s.operation_lock.acquire(blocking=False):
+            return False
+        s.converting = True
+    try:
+        threading.Thread(target=_do_hls_conversion, args=(token, s.file_info),
+                         kwargs={"reserved": True}, daemon=True).start()
+    except Exception:
+        s.converting = False
+        s.operation_lock.release()
+        raise
     return True
 
 
@@ -717,78 +766,98 @@ def _file_info_from_candidate(candidate) -> dict:
     }
 
 
-def _do_hls_conversion(token: str, file_info: dict) -> None:
-    tmp_dir = PLAYER_TMP_DIR / token
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    # Remove stale files from previous (crashed/incomplete) transcode runs so
-    # _wait_segments doesn't return True on old segments while the new ffmpeg
-    # is still starting up.
-    for _pat in ("seg*.ts", "seg*.m4s", "seg_*_*.ts", "seg_*_*.m4s"):
-        for _f in tmp_dir.glob(_pat):
-            _f.unlink(missing_ok=True)
-    for _name in ("playlist.m3u8", "video.m3u8", "master.m3u8",
-                  "hls_ready.txt", "hls_error.txt"):
-        (tmp_dir / _name).unlink(missing_ok=True)
-    try:
-        s = get_direct_session(token)
-        cdn_url = s.cdn_url if s else None
-        if not cdn_url:
-            log.warning("web_player: HLS fallback — no CDN URL for token=%s", token)
-            (tmp_dir / "hls_error.txt").write_text("Session expired — please reopen the player")
-            return
-        # Probe now if we skipped it during direct play (lazy path).
-        if not file_info.get('audio_tracks'):
-            log.info("web_player: lazy ffprobe for HLS fallback token=%s", token)
-            probed = _probe(cdn_url)
-            if probed is None:
-                log.warning("web_player: ffprobe failed for token=%s", token)
-                (tmp_dir / "hls_error.txt").write_text("Could not read file info — use Jellyfin")
-                return
-            file_info = probed
-            s = get_direct_session(token)
-            if s:
-                s.file_info = file_info
-        session = _start_hls(token, cdn_url, file_info, tmp_dir)
-        if not _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT,
-                              proc=session.proc):
-            rc = session.proc.poll()
-            session.proc.terminate()
-            log.warning("web_player: HLS fallback failed token=%s rc=%s", token, rc)
-            # Surface the last lines of ffmpeg stderr so we can diagnose.
-            err_log = tmp_dir / "ffmpeg.log"
-            detail  = ""
-            if err_log.exists():
-                try:
-                    lines  = err_log.read_text(errors="replace").strip().splitlines()
-                    detail = " | ".join(lines[-6:]) if lines else ""
-                    log.warning("web_player: ffmpeg stderr tail: %s", detail)
-                except Exception:
-                    pass
-            msg = (f"FFmpeg failed (rc={rc}) — use Jellyfin for this file" if rc is not None and rc != 0
-                   else "FFmpeg timed out — use Jellyfin for this file")
-            (tmp_dir / "hls_error.txt").write_text(f"{msg}\n{detail}" if detail else msg)
-            return
-        multi_audio = len(file_info.get("audio_tracks", [])) > 1
-        playlist = "master.m3u8" if multi_audio else "playlist.m3u8"
-        (tmp_dir / "hls_ready.txt").write_text(playlist)
-        threading.Thread(
-            target=_extract_subtitles,
-            args=(cdn_url, file_info.get("subtitle_tracks", []), token, tmp_dir),
-            daemon=True,
-        ).start()
-        log.info("web_player: HLS fallback ready token=%s playlist=%s", token, playlist)
-    except Exception:
-        log.exception("web_player: HLS fallback crashed token=%s", token)
+MAX_HLS_GENERATIONS = 8  # Includes failed attempts; no recycling of old output.
+
+
+def _generation_dir(session: DirectSession) -> Path:
+    if session.generation_attempts >= MAX_HLS_GENERATIONS:
+        raise RuntimeError("Playback generation limit reached")
+    session.generation_attempts += 1
+    path = PLAYER_TMP_DIR / session.token / uuid.uuid4().hex
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def _stop_process(proc) -> None:
+    """Reap our transcode before returning, including its timeout path."""
+    if proc.poll() is None:
+        proc.terminate()
         try:
-            (tmp_dir / "hls_error.txt").write_text("Internal error during conversion")
-        except Exception:
-            pass
-        # Clean up tmp_dir if no session was registered (avoids permanent leak).
-        import shutil as _shutil
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    else:
+        proc.wait(timeout=2)
+
+
+def _playback_state(session) -> dict:
+    playlist = "master.m3u8" if len(session.file_info.get("audio_tracks", [])) > 1 else "playlist.m3u8"
+    return {"stream_url": f"/stream/{session.token}/hls/{session.generation}/{playlist}",
+            "generation": session.generation, "seek_offset_s": session.seek_offset,
+            "duration_s": session.file_info.get("duration_s", 0), "file_info": session.file_info}
+
+
+def _publish_hls(session, previous=None) -> None:
+    if not _owner_enabled(session.owner_id):
+        raise PermissionError("Player is unavailable")
+    with _sessions_lock:
+        if _sessions.get(session.token) is not previous:
+            raise RuntimeError("Playback generation changed")
+        _sessions[session.token] = session
+        _generations[(session.token, session.generation)] = session
+    try:
+        session.start_heartbeat()
+    except Exception:
         with _sessions_lock:
-            registered = token in _sessions
-        if not registered:
-            _shutil.rmtree(tmp_dir, ignore_errors=True)
+            if _sessions.get(session.token) is session:
+                if previous is None:
+                    _sessions.pop(session.token, None)
+                else:
+                    _sessions[session.token] = previous
+            _generations.pop((session.token, session.generation), None)
+        raise
+
+
+def _do_hls_conversion(token: str, file_info: dict, *, reserved=False) -> None:
+    direct = get_direct_session(token)
+    if direct is None:
+        return
+    # The prepare worker may arrive while the browser's fallback already owns
+    # conversion. It waits for that same finite operation rather than duplicating it.
+    if not reserved and not direct.operation_lock.acquire(timeout=SEGMENT_WAIT_TIMEOUT + 45):
+        return
+    session = None
+    try:
+        if get_session(token) is not None:
+            return
+        direct.converting = True
+        if not _owner_enabled(direct.owner_id):
+            raise PermissionError("Player is unavailable")
+        tmp_dir = _generation_dir(direct)
+        if not file_info.get("audio_tracks"):
+            file_info = _probe(direct.cdn_url)
+            if file_info is None or file_info.get("is_hdr"):
+                raise RuntimeError("Unsupported file")
+            direct.file_info = file_info
+        session = _start_hls(token, direct.cdn_url, file_info, tmp_dir)
+        _publish_hls(session)
+        direct.conversion_error = None
+        try:
+            threading.Thread(target=_extract_subtitles,
+                             args=(direct.cdn_url, file_info.get("subtitle_tracks", []), token, tmp_dir),
+                             daemon=True).start()
+        except Exception:
+            log.warning("web_player: subtitle worker unavailable token=%s", token)
+    except Exception:
+        if session is not None and get_session(token) is not session:
+            _stop_process(session.proc)
+        # Do not expose ffmpeg stderr, provider URLs or exception payloads.
+        direct.conversion_error = "Conversion failed. Please reopen the player."
+        log.warning("web_player: conversion failed token=%s", token)
+    finally:
+        direct.converting = False
+        direct.operation_lock.release()
 
 
 # ── HLS session ────────────────────────────────────────────────────────────────
@@ -796,6 +865,8 @@ def _do_hls_conversion(token: str, file_info: dict) -> None:
 @dataclass
 class HLSSession:
     token:        str
+    owner_id:     int
+    content_hash: str
     proc:         subprocess.Popen
     tmp_dir:      Path
     cdn_url:      str  = ""
@@ -803,6 +874,11 @@ class HLSSession:
     started_at:   float = field(default_factory=time.monotonic)
     last_request: float = field(default_factory=time.monotonic)
     seeking:      bool = False
+    seek_offset:  float = 0.0
+
+    @property
+    def generation(self):
+        return self.tmp_dir.name
     _hb:          threading.Thread = field(default=None, repr=False)
 
     def touch(self):
@@ -811,75 +887,70 @@ class HLSSession:
     def start_heartbeat(self):
         def _beat():
             while self.proc.poll() is None:
-                db.touch_virtual_item(self.token)
+                db.touch_virtual_item(self.content_hash)
                 time.sleep(60)
         self._hb = threading.Thread(target=_beat, daemon=True)
         self._hb.start()
 
 
 _sessions: dict[str, HLSSession] = {}
+_generations: dict[tuple[str, str], HLSSession] = {}
 _sessions_lock = threading.Lock()
 
 
-def get_session(token: str) -> HLSSession | None:
-    with _sessions_lock:
-        return _sessions.get(token)
-
-
-def seek_session(token: str, position_s: float) -> str | None:
-    """Kill the running FFmpeg, wipe segments, restart at position_s.
-    Returns the (unchanged) stream URL so the frontend can reload Hls.js."""
+def get_session(token: str, *, owner_id: int | None = None) -> HLSSession | None:
     with _sessions_lock:
         session = _sessions.get(token)
-        if not session:
-            return None
-        if session.seeking:
-            # A seek for this token is already in flight - letting a second
-            # one run concurrently would terminate/restart ffmpeg twice and
-            # leave two processes writing into the same tmp_dir. _start_hls
-            # below replaces the dict entry with a fresh session (seeking
-            # defaults to False again), so nothing needs resetting here.
-            return None
-        session.seeking = True
+        return session if session and (owner_id is None or session.owner_id == owner_id) else None
 
+
+def get_generation(token: str, generation: str, *, owner_id: int) -> HLSSession | None:
+    if not re.fullmatch(r"[a-f0-9]{32}", generation):
+        return None
+    with _sessions_lock:
+        session = _generations.get((token, generation))
+        return session if session and session.owner_id == owner_id else None
+
+
+def seek_session(token: str, position_s: float, *, owner_id: int) -> dict | None:
+    """Publish a ready fresh generation. Earlier generations are never overwritten.
+
+    Stopping our old transcode does not assert that its readers have disappeared.
+    Existing segments stay available under their original generation URL.
+    """
+    if (type(position_s) not in (int, float) or not math.isfinite(position_s)
+            or not 0 <= position_s <= 604800):
+        raise ValueError("Invalid seek position")
+    direct = get_direct_session(token, owner_id=owner_id)
+    if not direct or not _owner_enabled(owner_id) or not direct.operation_lock.acquire(blocking=False):
+        return None
+    previous = None
+    session = None
     try:
-        multi_audio = len(session.file_info.get("audio_tracks", [])) > 1
-
-        # Stop current process
-        session.proc.terminate()
-        try:
-            session.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            session.proc.kill()
-            session.proc.wait(timeout=1)
-
-        tmp_dir = session.tmp_dir
-
-        # Remove old segments and playlists.
-        for pattern in ("seg*.ts", "seg*.m4s", "seg_*_*.ts", "seg_*_*.m4s", "init*.mp4"):
-            for f in tmp_dir.glob(pattern):
-                f.unlink(missing_ok=True)
-        for name in (["playlist.m3u8", "video.m3u8", "master.m3u8"]
-                     + [f"audio_{i}.m3u8" for i in range(10)]):
-            (tmp_dir / name).unlink(missing_ok=True)
-
-        # Restart at new position (registers updated session under same token)
-        _start_hls(token, session.cdn_url, session.file_info, tmp_dir,
-                   seek_offset=position_s)
-
-        # Wait for first segments (multi-audio already waits inside _start_hls)
-        if not multi_audio:
-            _wait_segments(tmp_dir, SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT)
-    except Exception:
-        # _start_hls normally replaces the dict entry with a fresh session
-        # (seeking=False). If we never got that far, clear the flag on the
-        # old object so this token isn't permanently locked out of seeking.
-        session.seeking = False
+        previous = get_session(token, owner_id=owner_id)
+        if previous is None:
+            return None
+        duration = previous.file_info.get("duration_s") or 0
+        if duration > 0 and position_s > duration:
+            raise ValueError("Seek exceeds duration")
+        tmp_dir = _generation_dir(direct)
+        previous.seeking = True
+        _stop_process(previous.proc)
+        session = _start_hls(token, previous.cdn_url, previous.file_info, tmp_dir,
+                             seek_offset=float(position_s))
+        _publish_hls(session, previous)
+        return _playback_state(session)
+    except ValueError:
         raise
-
-    return (f"/stream/{token}/hls/master.m3u8" if multi_audio
-            else f"/stream/{token}/hls/playlist.m3u8")
-
+    except Exception:
+        if session is not None and get_session(token) is not session:
+            _stop_process(session.proc)
+        log.warning("web_player: seek unavailable token=%s", token)
+        return None
+    finally:
+        if previous is not None:
+            previous.seeking = False
+        direct.operation_lock.release()
 
 
 def _audio_copy_or_transcode(track: dict, out_index: int) -> list[str]:
@@ -900,7 +971,7 @@ def _audio_copy_or_transcode(track: dict, out_index: int) -> list[str]:
     ]
 
 
-def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
+def _spawn_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
                seek_offset: float = 0.0) -> HLSSession:
     """Start (or restart) HLS segmentation.
 
@@ -912,6 +983,11 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
 
     seek_offset > 0 = fast keyframe seek in input before generating segments.
     """
+    direct = get_direct_session(token)
+    if not direct or not _owner_enabled(direct.owner_id):
+        raise PermissionError("Player is unavailable")
+    if file_info.get("video_codec") not in ("h264", "avc"):
+        _ensure_vaapi()
     audio_tracks = file_info["audio_tracks"]
     multi_audio  = len(audio_tracks) > 1
 
@@ -981,32 +1057,15 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
             ]
             cmd.append(str(tmp_dir / f"audio_{i}.m3u8"))
 
-        log.info("web_player: FFmpeg multi-audio/%s token=%s seek=%.1f",
-                 mode_label, token, seek_offset)
-        stderr_log = open(tmp_dir / "ffmpeg.log", "w")
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_log)
-        except Exception:
-            stderr_log.close()
-            raise
-
-        session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir,
-                             cdn_url=cdn_url, file_info=file_info)
-        session.start_heartbeat()
-        with _sessions_lock:
-            _sessions[token] = session
-
-        # Wait for first video segments before writing master playlist
-        _wait_segments_pattern(tmp_dir, f"seg_v*.{seg_ext}",
-                               SEGMENT_WAIT_COUNT, SEGMENT_WAIT_TIMEOUT,
-                               proc=proc)
-
         # Write master.m3u8
         lines  = ["#EXTM3U"]
         default = "YES"
         for i, track in enumerate(audio_tracks):
-            lang  = (track.get("language") or "und").lower()
-            name  = track.get("title") or lang.upper()
+            raw_lang = track.get("language")
+            lang = raw_lang.lower() if isinstance(raw_lang, str) and re.fullmatch(r"[A-Za-z]{2,8}", raw_lang) else "und"
+            raw_name = track.get("title")
+            name = re.sub(r'["\\\x00-\x1f\x7f]', "", raw_name)[:128] if isinstance(raw_name, str) else ""
+            name = name or lang.upper()
             lines.append(
                 f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",'
                 f'NAME="{name}",DEFAULT={default},LANGUAGE="{lang}",'
@@ -1015,7 +1074,20 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
             default = "NO"
         lines.append('#EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO="audio"')
         lines.append("video.m3u8")
-        (tmp_dir / "master.m3u8").write_text("\n".join(lines) + "\n")
+        log.info("web_player: FFmpeg multi-audio/%s token=%s seek=%.1f",
+                 mode_label, token, seek_offset)
+        with open(tmp_dir / "ffmpeg.log", "w") as stderr_log:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_log)
+
+        session = HLSSession(token=token, owner_id=direct.owner_id,
+                             content_hash=direct.content_hash, proc=proc, tmp_dir=tmp_dir,
+                             cdn_url=cdn_url, file_info=file_info, seek_offset=seek_offset)
+
+        try:
+            (tmp_dir / "master.m3u8").write_text("\n".join(lines) + "\n")
+        except Exception:
+            _stop_process(proc)
+            raise
 
     else:
         # Single audio: combined video+audio output
@@ -1036,20 +1108,40 @@ def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
 
         log.info("web_player: FFmpeg single-audio/%s token=%s seek=%.1f",
                  mode_label, token, seek_offset)
-        stderr_log = open(tmp_dir / "ffmpeg.log", "w")
-        try:
+        with open(tmp_dir / "ffmpeg.log", "w") as stderr_log:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_log)
-        except Exception:
-            stderr_log.close()
-            raise
 
-        session = HLSSession(token=token, proc=proc, tmp_dir=tmp_dir,
-                             cdn_url=cdn_url, file_info=file_info)
-        session.start_heartbeat()
-        with _sessions_lock:
-            _sessions[token] = session
+        session = HLSSession(token=token, owner_id=direct.owner_id,
+                             content_hash=direct.content_hash, proc=proc, tmp_dir=tmp_dir,
+                             cdn_url=cdn_url, file_info=file_info, seek_offset=seek_offset)
 
     return session
+
+
+def _start_hls(token: str, cdn_url: str, file_info: dict, tmp_dir: Path,
+               seek_offset: float = 0.0) -> HLSSession:
+    session = _spawn_hls(token, cdn_url, file_info, tmp_dir, seek_offset)
+    try:
+        tracks = file_info.get("audio_tracks", [])
+        patterns = (["seg_v*.ts"] + [f"seg_a{i}_*.ts" for i in range(len(tracks))]
+                    if len(tracks) > 1 else ["seg*.ts"])
+        deadline = time.monotonic() + SEGMENT_WAIT_TIMEOUT
+        for pattern in patterns:
+            remaining = max(0, deadline - time.monotonic())
+            if not _wait_segments_pattern(tmp_dir, pattern, SEGMENT_WAIT_COUNT,
+                                          remaining, proc=session.proc):
+                raise RuntimeError("HLS output not ready")
+        # A failed process must not be declared ready even if it left segments.
+        if session.proc.poll() not in (None, 0):
+            raise RuntimeError("Transcode failed")
+        playlists = (["master.m3u8", "video.m3u8"] + [f"audio_{i}.m3u8" for i in range(len(tracks))]
+                     if len(tracks) > 1 else ["playlist.m3u8"])
+        if not all((tmp_dir / name).is_file() for name in playlists):
+            raise RuntimeError("HLS playlists missing")
+        return session
+    except BaseException:
+        _stop_process(session.proc)
+        raise
 
 
 def _wait_segments(tmp_dir: Path, count: int, timeout: float,
@@ -1198,8 +1290,8 @@ def _fetch_external_subtitles(imdb_id: str, media_type: str,
             raw_path.unlink(missing_ok=True)
 
 
-def list_subtitles(token: str) -> list[dict]:
-    s = get_session(token)
+def list_subtitles(token: str, *, owner_id: int) -> list[dict]:
+    s = get_session(token, owner_id=owner_id)
     if not s:
         return []
     out = []
@@ -1210,7 +1302,7 @@ def list_subtitles(token: str) -> list[dict]:
         out.append({
             "language": lang,
             "label":    source,
-            "url":      f"/stream/{token}/subtitles/{p.name}",
+            "url":      f"/stream/{token}/subtitles/{s.generation}/{p.name}",
         })
     return out
 

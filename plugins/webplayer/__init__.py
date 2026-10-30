@@ -16,7 +16,9 @@ PLUGIN_META = {
 
 def run_migrations() -> None:
     import db
+    from . import positions
     with db._connect() as c:
+        positions.init_schema(c)
         cols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
         if "webplayer_enabled" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN webplayer_enabled INTEGER NOT NULL DEFAULT 0")

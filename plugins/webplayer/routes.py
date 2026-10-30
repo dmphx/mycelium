@@ -1,172 +1,206 @@
+import math
+import re
+
 import db
 import auth
 from flask import Blueprint, abort, jsonify, redirect, request, send_file, Response
-from . import web_player
+from . import web_player, positions
 
 bp = Blueprint("webplayer_routes", __name__)
 
 
 def _check_enabled():
     rec = auth.current_user_record()
-    if not rec or not rec.get("webplayer_enabled"):
+    if (not rec or type(rec.get("id")) is not int or rec["id"] <= 0
+            or not rec.get("enabled") or not rec.get("webplayer_enabled")):
         abort(403)
     return rec
 
 
-def _require_session():
-    """Guard for the /stream/<token>/* playback endpoints.
+def _body():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        abort(400)
+    return d
 
-    Only /prepare used to check anything; every other route here was
-    reachable by anyone who obtained a token, with no login check at all.
-    Delegates to _check_enabled() - the same "real, webplayer_enabled user"
-    requirement /prepare already enforces - rather than just "someone is
-    logged in", which would let any authenticated user (including ones
-    without the Web Player feature) hit another user's token."""
-    _check_enabled()
+
+def _number(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 604800:
+        abort(400)
+    return float(value)
+
+
+def _owned_direct(token, owner_id):
+    s = web_player.get_direct_session(token, owner_id=owner_id)
+    if not s:
+        abort(404)
+    return s
+
+
+def _owned_hls(token, owner_id):
+    s = web_player.get_session(token, owner_id=owner_id)
+    if not s:
+        abort(404)
+    return s
+
+
+def _owned_generation(token, owner_id, filename):
+    _owned_direct(token, owner_id)
+    generation, sep, basename = filename.partition("/")
+    if not sep:
+        abort(404)
+    s = web_player.get_generation(token, generation, owner_id=owner_id)
+    if not s:
+        abort(404)
+    return s, basename
+
+
+def _session_file(session, filename, *, subtitle=False):
+    pattern = (r"sub_[a-zA-Z0-9_]+[.]vtt" if subtitle else
+               r"(?:playlist|master|video|audio_[0-9]+)[.]m3u8|seg[a-zA-Z0-9_]*[.](?:ts|m4s)|init[a-zA-Z0-9_]*[.]mp4")
+    if not re.fullmatch(pattern, filename):
+        abort(400)
+    base = session.tmp_dir.resolve()
+    path = session.tmp_dir / filename
+    if path.is_symlink() or path.resolve().parent != base or not path.is_file():
+        abort(404)
+    return path
 
 
 @bp.post("/ui/api/web-player/prepare")
 def web_player_prepare():
-    _check_enabled()
-    d = request.json or {}
-    job_id = web_player.start_prepare_job(
-        imdb_id    = d["imdb_id"],
-        media_type = d["media_type"],
-        season     = d.get("season"),
-        episode    = d.get("episode"),
-        user_agent = request.headers.get("User-Agent", ""),
-    )
+    rec = _check_enabled()
+    d = _body()
+    if not {"imdb_id", "media_type"} <= d.keys() or d.keys() - {"imdb_id", "media_type", "season", "episode"}:
+        abort(400)
+    try:
+        job_id = web_player.start_prepare_job(
+            imdb_id=d["imdb_id"], media_type=d["media_type"],
+            season=d.get("season"), episode=d.get("episode"),
+            user_agent=request.headers.get("User-Agent", ""), owner_id=rec["id"],
+        )
+    except ValueError:
+        abort(400)
+    except PermissionError:
+        abort(403)
+    except RuntimeError:
+        return jsonify(error="Player preparation is busy. Please try again."), 503
     return jsonify(job_id=job_id)
 
 
 @bp.get("/ui/api/web-player/status/<job_id>")
 def web_player_status(job_id: str):
-    _check_enabled()
-    job = web_player.get_job(job_id)
+    rec = _check_enabled()
+    job = web_player.get_job(job_id, owner_id=rec["id"])
     if not job:
         abort(404)
-    return jsonify(
-        status      = job.status.value,
-        message     = job.message,
-        token       = job.token,
-        stream_url  = job.stream_url,
-        stream_type = job.stream_type,
-        cdn_url     = job.cdn_url,
-        file_info   = job.file_info,
-        error       = job.error,
-    )
+    return jsonify(status=job.status.value, message=job.message, token=job.token,
+                   stream_url=job.stream_url, stream_type=job.stream_type,
+                   file_info=job.file_info, error=job.error)
 
 
 @bp.get("/stream/<token>/hls/<path:filename>")
 def stream_hls_file(token: str, filename: str):
-    """Serve any HLS file for a session.
-
-    Supports mpegts (.ts) and fragmented MP4 (.m4s + init.mp4) segments,
-    plus all playlist variants (.m3u8).
-    """
-    _require_session()
-    if "/" in filename:
-        abort(400)
-    s = web_player.get_session(token)
-    if not s:
-        abort(404)
-    p = s.tmp_dir / filename
-    if not p.exists():
-        abort(404)
+    rec = _check_enabled()
+    s, basename = _owned_generation(token, rec["id"], filename)
+    p = _session_file(s, basename)
     s.touch()
-    if filename.endswith(".m3u8"):
-        return send_file(p, mimetype="application/vnd.apple.mpegurl")
-    if filename.endswith(".ts"):
-        return send_file(p, mimetype="video/mp2t")
-    if filename.endswith(".m4s"):
-        return send_file(p, mimetype="video/iso.segment")
-    if filename.endswith(".mp4"):
-        return send_file(p, mimetype="video/mp4")
-    abort(400)
+    mimetype = {".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t",
+                ".m4s": "video/iso.segment", ".mp4": "video/mp4"}[p.suffix]
+    return send_file(p, mimetype=mimetype)
 
 
 @bp.get("/stream/<token>/direct")
 def stream_direct(token: str):
-    """Redirect to the TorBox CDN URL for direct H264 playback."""
-    _require_session()
-    s = web_player.get_direct_session(token)
-    if not s:
-        abort(404)
+    rec = _check_enabled()
+    s = _owned_direct(token, rec["id"])
     s.touch()
     return redirect(s.cdn_url, code=302)
 
 
 @bp.post("/stream/<token>/convert-hls")
 def stream_convert_hls(token: str):
-    """Trigger HLS transcoding for a direct session (called when browser can't play)."""
-    _require_session()
-    ok = web_player.start_hls_conversion(token)
-    if not ok:
+    rec = _check_enabled()
+    if not web_player.start_hls_conversion(token, owner_id=rec["id"]):
         abort(404)
     return jsonify(ok=True)
 
 
 @bp.get("/stream/<token>/hls-status")
 def stream_hls_status(token: str):
-    """Poll whether HLS conversion is done."""
-    _require_session()
-    s = web_player.get_direct_session(token)
-    if not s:
-        abort(404)
-    tmp_dir  = web_player.PLAYER_TMP_DIR / token
-    err_file = tmp_dir / "hls_error.txt"
-    rdy_file = tmp_dir / "hls_ready.txt"
-    if err_file.exists():
-        return jsonify(status="error", error=err_file.read_text().strip())
-    if rdy_file.exists():
-        playlist = rdy_file.read_text().strip()
-        return jsonify(status="ready", url=f"/stream/{token}/hls/{playlist}")
+    rec = _check_enabled()
+    s = _owned_direct(token, rec["id"])
+    current = web_player.get_session(token, owner_id=rec["id"])
+    if current is not None:
+        state = web_player._playback_state(current)
+        return jsonify(status="ready", url=state.pop("stream_url"), **state)
+    if s.conversion_error:
+        return jsonify(status="error", error="Conversion failed. Please reopen the player.")
+    s.touch()
     return jsonify(status="converting")
 
 
 @bp.get("/stream/<token>/subtitles")
 def stream_subtitles_list(token: str):
-    _require_session()
-    return jsonify(subtitles=web_player.list_subtitles(token))
+    rec = _check_enabled()
+    _owned_direct(token, rec["id"])
+    return jsonify(subtitles=web_player.list_subtitles(token, owner_id=rec["id"]))
 
 
-@bp.get("/stream/<token>/subtitles/<filename>")
+@bp.get("/stream/<token>/subtitles/<path:filename>")
 def stream_subtitle_file(token: str, filename: str):
-    _require_session()
-    if "/" in filename or not filename.endswith(".vtt"):
-        abort(400)
-    s = web_player.get_session(token)
-    if not s:
-        abort(404)
-    p = s.tmp_dir / filename
-    if not p.exists():
-        abort(404)
+    rec = _check_enabled()
+    s, basename = _owned_generation(token, rec["id"], filename)
+    p = _session_file(s, basename, subtitle=True)
+    s.touch()
     return send_file(p, mimetype="text/vtt")
 
 
 @bp.post("/stream/<token>/seek")
 def stream_seek(token: str):
-    """Restart FFmpeg at a new position so the user can jump anywhere."""
-    _require_session()
-    d = request.json or {}
-    position_s = float(d.get("position_s", 0))
-    stream_url = web_player.seek_session(token, position_s)
-    if stream_url is None:
-        abort(404)
-    return jsonify(stream_url=stream_url)
+    rec = _check_enabled()
+    _owned_hls(token, rec["id"])
+    d = _body()
+    if set(d) != {"position_s"}:
+        abort(400)
+    try:
+        state = web_player.seek_session(token, _number(d["position_s"]), owner_id=rec["id"])
+    except ValueError:
+        abort(400)
+    if state is None:
+        return jsonify(error="Seek is unavailable. Please reopen the player."), 409
+    return jsonify(**state)
 
 
 @bp.post("/stream/<token>/position")
 def stream_save_position(token: str):
     rec = _check_enabled()
-    d = request.json or {}
-    db.save_playback_position(
-        user_id    = rec["id"],
-        token      = token,
-        position_s = float(d.get("position_s", 0)),
-        duration_s = d.get("duration_s"),
-    )
-    return jsonify(ok=True)
+    session = _owned_direct(token, rec["id"])
+    d = _body()
+    if not {"position_s"} <= d.keys() or d.keys() - {"position_s", "duration_s", "generation"}:
+        abort(400)
+    if not session.operation_lock.acquire(blocking=False):
+        return jsonify(error="Playback is changing."), 409
+    try:
+        hls = web_player.get_session(token, owner_id=rec["id"])
+        if (hls is not None and d.get("generation") != hls.generation) or (hls is None and d.get("generation") is not None):
+            return jsonify(error="Playback generation changed."), 409
+        position = _number(d["position_s"])
+        duration = _number(d["duration_s"]) if d.get("duration_s") is not None else None
+        if duration is not None and position > duration:
+            abort(400)
+        known_duration = (hls.file_info if hls is not None else session.file_info).get("duration_s") or 0
+        if known_duration > 0 and position > known_duration:
+            abort(400)
+        try:
+            positions.save(session, position, duration)
+        except ValueError:
+            abort(400)
+        except PermissionError:
+            abort(403)
+        return jsonify(ok=True)
+    finally:
+        session.operation_lock.release()
 
 
 _INSTALLER_SCRIPT = r"""#!/usr/bin/env bash

@@ -22,6 +22,18 @@ _n = [0]
 BODY = b"{}"
 
 
+def qualify_watchlist(env, user=None):
+    import integration_watchlist_overlay as overlay
+    owner = env.uid if user is None else user
+    prepared = overlay.prepare_owner(owner)
+    overlay.apply_prepared(prepared, expected_plan_hash=prepared.plan_hash)
+    overlay.select_prepared(prepared, expected_plan_hash=prepared.plan_hash, expected_revision=0)
+
+
+def watchlist_body(tid=603, kind="movie", **extra):
+    return json.dumps({"media": {"type": kind, "tmdb_id": tid}, **extra}, separators=(",", ":")).encode()
+
+
 def b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -810,3 +822,121 @@ def test_follows_provider_failure_is_not_success_or_capability_change(catalog_en
         assert response.status_code == status and response.get_json()["error"]["retryable"] is retryable
         assert call(env, path="/integration/v1/follows", scope="watchlist:read").get_json()["data"]["items"] == []
         assert call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"] == expected
+
+
+def test_watchlist_facade_requires_explicit_source_then_returns_real_empty(env):
+    before = call(env, path="/integration/v1/watchlist", scope="watchlist:read")
+    assert before.status_code == 503 and err(before) == "capability_unqualified"
+    qualify_watchlist(env)
+    response = call(env, path="/integration/v1/watchlist", scope="watchlist:read")
+    assert response.status_code == 200 and response.get_json()["data"] == {"items": [], "next_before_id": None}
+    assert response.headers["Cache-Control"] == "no-store" and "Set-Cookie" not in response.headers
+    operations = call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"]
+    assert "watchlist.read" in operations and "watchlist.write" not in operations
+    assert "requests.write" not in operations and "availability.read" not in operations
+    assert call(env, path="/integration/v1/watchlist", scope="catalog:read").status_code == 403
+    assert call(env, path="/integration/v1/watchlist", scope="watchlist:read", sign=False).status_code == 401
+
+
+def test_watchlist_signed_mutation_receipts_and_replays_do_not_repeat_membership(env, monkeypatch):
+    import config
+    import tmdb_checked as tc
+    qualify_watchlist(env)
+    config.TMDB_API_KEY = "synthetic-qualified-watchlist-key"
+    calls = []
+    def fetch(path, params):
+        with env.db._connect() as conn:
+            assert not conn.in_transaction
+        calls.append((path, params))
+        return {"id": 603, "title": "Trusted server title", "overview": "", "external_ids": {"id": 603, "imdb_id": "tt0000001"}}
+    monkeypatch.setattr(tc, "fetch", fetch)
+    operations = call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"]
+    assert {"watchlist.read", "watchlist.write"} <= set(operations)
+    response = call(env, "POST", "/integration/v1/watchlist", body=watchlist_body(),
+                    scope="watchlist:write", idem="synthetic_watchlist_save_0001")
+    assert response.status_code == 200
+    saved = response.get_json()["data"]
+    assert saved == {"media": {"type": "movie", "tmdb_id": 603}, "saved": True}
+    assert calls == [("/movie/603", {"append_to_response": "external_ids"})]
+    page = call(env, path="/integration/v1/watchlist", scope="watchlist:read").get_json()["data"]
+    assert page["items"][0]["title"] == "Trusted server title" and page["next_before_id"] is None
+    assert not {"user_id", "imdb_id", "availability", "entitlement", "identity_proof"} & page["items"][0].keys()
+    def no_fetch(*args):
+        pytest.fail("historical replay/delete must not fetch metadata")
+    monkeypatch.setattr(tc, "fetch", no_fetch)
+    removed = call(env, "DELETE", "/integration/v1/watchlist", body=watchlist_body(),
+                   scope="watchlist:write", idem="synthetic_watchlist_remove_0002")
+    assert removed.status_code == 200 and removed.get_json()["data"]["saved"] is False
+    config.TMDB_API_KEY = ""
+    replay = call(env, "POST", "/integration/v1/watchlist", body=b' { "media": {"tmdb_id":603, "type":"movie"} } ',
+                  scope="watchlist:write", idem="synthetic_watchlist_save_0001")
+    assert replay.status_code == 200 and replay.get_json()["data"] == saved
+    assert call(env, path="/integration/v1/watchlist", scope="watchlist:read").get_json()["data"]["items"] == []
+    assert env.ri.list_for_user(env.uid, 50) == [] and env.db.get_favorite_actors(env.uid) == []
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=101", "limit=01", "before_id=0", "before_id=-1",
+                                  "before_id=9223372036854775808", "before_id=10000000000000000000"])
+def test_qualified_watchlist_page_rejects_invalid_cursor_and_limit(env, query):
+    qualify_watchlist(env)
+    response = call(env, path="/integration/v1/watchlist?" + query, scope="watchlist:read")
+    assert response.status_code == 400 and err(response) == "bad_request"
+
+
+def test_watchlist_source_drift_is_not_empty_and_does_not_break_unrelated_capabilities(env):
+    qualify_watchlist(env)
+    env.db.add_to_watchlist(env.uid, "tt0000001", 603, "movie", "Concurrent legacy item")
+    response = call(env, path="/integration/v1/watchlist", scope="watchlist:read")
+    assert response.status_code == 409 and err(response) == "watchlist_source_changed"
+    operations = call(env, path="/integration/v1/capabilities").get_json()["data"]["operations"]
+    assert "watchlist.read" not in operations and "me.read" in operations and "follows.read" in operations
+
+
+def test_watchlist_signed_actor_owns_pages_and_cursor_never_transfers_ownership(env):
+    import config
+    import integration_watchlist_overlay as overlay
+    config.TMDB_API_KEY = "synthetic-owned-page-tests"
+    other_subject = "55555555555545558555555555555555"
+    other = env.db.create_user("other-linked-watchlist-owner", "synthetic")
+    assert env.db.link_external_identity(other, "jellyfin", SERVER, other_subject)
+    for owner in (env.uid, other):
+        env.db.add_to_watchlist(owner, "tt0000001", 603, "movie", "Untrusted native title")
+        plan = overlay.prepare_owner(owner, fetch=lambda *a: {"id": 603, "title": "Owned server title", "overview": "", "external_ids": {"id": 603, "imdb_id": "tt0000001"}})
+        overlay.apply_prepared(plan, expected_plan_hash=plan.plan_hash)
+        overlay.select_prepared(plan, expected_plan_hash=plan.plan_hash, expected_revision=0)
+    mine = call(env, path="/integration/v1/watchlist", scope="watchlist:read").get_json()["data"]["items"]
+    theirs = call(env, path="/integration/v1/watchlist", scope="watchlist:read", sub=other_subject).get_json()["data"]["items"]
+    assert len(mine) == len(theirs) == 1 and mine[0]["watchlist_id"] != theirs[0]["watchlist_id"]
+    empty = call(env, path=f"/integration/v1/watchlist?before_id={mine[0]['watchlist_id']}",
+                 scope="watchlist:read", sub=other_subject).get_json()["data"]
+    assert empty["items"] == []  # A row boundary never grants access to the other owner's row.
+
+
+def test_qualified_watchlist_rejects_untrusted_body_without_mutation(env):
+    qualify_watchlist(env)
+    response = call(env, "POST", "/integration/v1/watchlist", body=watchlist_body(title="Caller title"),
+                    scope="watchlist:write", idem="synthetic_watchlist_bad_body")
+    assert response.status_code == 400 and err(response) == "bad_request"
+    assert env.db.get_watchlist(env.uid) == []
+
+
+def test_watchlist_cursor_roundtrips_full_native_sqlite_id_range(env):
+    import config
+    import integration_watchlist_overlay as overlay
+    config.TMDB_API_KEY = "synthetic-high-native-id"
+    for n in (1, 2):
+        env.db.add_to_watchlist(env.uid, f"tt{n:07d}", 600+n, "movie", "Opaque legacy title")
+    with env.db._connect() as conn:
+        conn.execute("UPDATE watchlist SET id=id+9223372036854775804 WHERE user_id=?", (env.uid,))
+    def fetch(path, params):
+        tid = int(path.rsplit('/', 1)[1])
+        return {"id": tid, "title": "Owned high-ID title", "overview": "", "external_ids": {"id": tid, "imdb_id": f"tt{tid-600:07d}"}}
+    plan = overlay.prepare_owner(env.uid, fetch=fetch)
+    overlay.apply_prepared(plan, expected_plan_hash=plan.plan_hash)
+    overlay.select_prepared(plan, expected_plan_hash=plan.plan_hash, expected_revision=0)
+    first = call(env, path="/integration/v1/watchlist?limit=1", scope="watchlist:read").get_json()["data"]
+    assert first["next_before_id"] == 9223372036854775806
+    second = call(env, path=f"/integration/v1/watchlist?before_id={first['next_before_id']}&limit=1", scope="watchlist:read")
+    assert second.status_code == 200
+    assert second.get_json()["data"]["items"][0]["watchlist_id"] == 9223372036854775805
+    assert second.get_json()["data"]["next_before_id"] is None

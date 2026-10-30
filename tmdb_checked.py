@@ -36,6 +36,7 @@ MAX_QUERY = 100
 _CHUNK = 64 * 1024
 
 _ID = r"[1-9][0-9]{0,9}"
+_FIND_PATH = re.compile(r"/find/tt[0-9]{6,10}")
 _ALLOWED_PATHS = tuple(re.compile(p) for p in (
     r"/(?:movie|tv)/" + _ID,
     r"/tv/" + _ID + r"/season/(?:0|[1-9][0-9]{0,3})",
@@ -199,6 +200,11 @@ def _check_param(key, value):
 
 
 def _check_request(path, params):
+    if type(path) is str and _FIND_PATH.fullmatch(path):
+        if type(params) is not dict or set(params) != {"external_source"} \
+                or type(params["external_source"]) is not str or params["external_source"] != "imdb_id":
+            _bad_param()
+        return {"external_source": "imdb_id"}
     if type(path) is not str or not any(p.fullmatch(path) for p in _ALLOWED_PATHS):
         _fail("path_not_allowed")
     # Season zero is a valid specials identity; show/person/movie ids remain positive.
