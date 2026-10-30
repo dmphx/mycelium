@@ -1,0 +1,54 @@
+when:
+  - event: [push, pull_request, manual]
+
+steps:
+  - name: python-tests
+    image: python:3.12-bookworm
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
+      TORBOX_API_KEY: synthetic-ci-only
+      AUTH_SESSION_SECRET: synthetic-ci-only
+      INSECURE_ALLOW_ANON: "true"
+      DB_PATH: /tmp/mycelium-ci/requests.db
+      MEDIA_PATH: /tmp/mycelium-ci/media
+      SPORE_MEDIA_PATH: /tmp/mycelium-ci/spore
+      ENRICHMENT_CACHE_DIR: /tmp/mycelium-ci/enrichment
+      ZILEAN_DB_PATH: /tmp/mycelium-ci/zilean.db
+      SPORE_READ_CACHE_ENABLED: "false"
+      SEERR_URL: ""
+      JELLYFIN_URL: ""
+      PLEX_URL: ""
+    commands:
+      - mkdir -p /tmp/mycelium-ci/media /tmp/mycelium-ci/spore /tmp/mycelium-ci/enrichment
+      - apt-get update
+      - apt-get install -y --no-install-recommends ffmpeg
+      - pip install --disable-pip-version-check -r requirements.txt pytest==8.4.2
+      - python -B -m pytest tests/ -q --tb=short -p no:cacheprovider --junitxml=python-tests.xml
+
+  - name: go-tests
+    image: golang:1.25.12-bookworm
+    environment:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "4"
+      GOMEMLIMIT: 4GiB
+    commands:
+      - apt-get update
+      - apt-get install -y --no-install-recommends ffmpeg
+      - mkdir -p /tmp/mycelium-ci
+      - ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 4 -c:v ffv1 -threads 2 -c:a pcm_s16le /tmp/mycelium-ci/synthetic.mkv
+      - test "$(stat -c %s /tmp/mycelium-ci/synthetic.mkv)" -ge 1048576
+      - cd spore-nfs
+      - SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 -mod=readonly ./...
+
+  - name: frontend-checks
+    image: node:22-bookworm
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
+    commands:
+      - cd frontend
+      - npm ci --no-audit --no-fund
+      - npm run build
+      - npx --no-install tsc --noEmit
