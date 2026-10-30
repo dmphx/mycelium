@@ -320,6 +320,7 @@ def ui_api_me_password():
 # _start_scheduler() since the scheduler primes it at boot.
 _spore_status: "dict[str, tuple[bool, int]]" = {}
 _spore_status_lock = threading.Lock()
+_spore_status_ready = threading.Event()
 
 
 # A title is "cached" (serve the real file) when its torrent is already in the
@@ -369,6 +370,7 @@ def _refresh_spore_status() -> None:
     with _spore_status_lock:
         _spore_status.clear()
         _spore_status.update(newmap)
+        _spore_status_ready.set()
     cached_n = sum(1 for c, _ in newmap.values() if c)
     log.info("spore-nfs status refreshed: %d items, %d cached (%.1fs)",
              len(newmap), cached_n, _t.monotonic() - t0)
@@ -2016,6 +2018,14 @@ def spore_nfs_tree():
     rebuilt at most once per _SPORE_TREE_TTL under a lock: without the cache,
     concurrent polls each rebuilt it and piled up on the single gunicorn worker,
     starving playback (/spore-stream) under any added load."""
+    # A non-empty library is not evidence that its cached-size map is ready.
+    # Refuse the cold snapshot so NFS keeps its existing short startup retry
+    # cadence instead of caching placeholder sizes for a full tree TTL.
+    if not _spore_status_ready.is_set():
+        return app.response_class(
+            '{"error":"Cache status is initializing"}', status=503,
+            mimetype="application/json",
+            headers={"Retry-After": "10", "Cache-Control": "no-store"})
     import time as _t
     body = _spore_tree_cache["body"]
     if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:

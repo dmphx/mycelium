@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v4.json'
-FIXTURE_SHA='2b8e5b1e0a15017f15043e19311e8de9d7900ac95a65514f2b4889e48a920c81'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v4.json')
-INVENTORY_SHA='edec12a611d7cea66b01550a05093047e4f2f764aee3d547f68ceac57318fb3d'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v5.json'
+FIXTURE_SHA='dfbe2f56e8d2b60946b1699363cddfdb8cb5ebc0e9bcb05ff0296d828a921ae9'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v5.json')
+INVENTORY_SHA='013de3c56d9f2f77ab67c375f3365e2f6b55b758809adf052ab27b5c4d5c3437'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -384,12 +384,23 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
     assert integrated['added_audited_paths']==['episode_scheme.py']
     assert not any(x['path']=='episode_scheme.py' for x in prior['audited_python_files'])
     assert any(x['path']=='episode_scheme.py' for g in current['writer_groups'] for x in g['source_files'])
-    drift={p for p in integrated_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=integrated_pins[p]}
-    assert drift=={'plugins/webplayer/routes.py','plugins/webplayer/web_player.py'}
-    assert {x['path'] for x in current['reviewed_source_changes']}==drift
-    assert current['parent_inventory_sha256']==hashlib.sha256(integrated_path.read_bytes()).hexdigest()
-    for item in current['reviewed_source_changes']:
+    fixed_path=INVENTORY.with_name('destination-path-inventory-v4.json')
+    fixed_model=FIXTURE.with_name('destination-fence-model-v4.json')
+    assert hashlib.sha256(fixed_path.read_bytes()).hexdigest()=='edec12a611d7cea66b01550a05093047e4f2f764aee3d547f68ceac57318fb3d'
+    assert hashlib.sha256(fixed_model.read_bytes()).hexdigest()=='2b8e5b1e0a15017f15043e19311e8de9d7900ac95a65514f2b4889e48a920c81'
+    fixed=json.loads(fixed_path.read_text())
+    fixed_pins={x['path']:x['sha256'] for x in fixed['audited_python_files']}
+    assert {x['path'] for x in fixed['reviewed_source_changes']}=={'plugins/webplayer/routes.py','plugins/webplayer/web_player.py'}
+    assert fixed['parent_inventory_sha256']==hashlib.sha256(integrated_path.read_bytes()).hexdigest()
+    for item in fixed['reviewed_source_changes']:
         assert item['old_sha256']==integrated_pins[item['path']]
+        assert item['new_sha256']==fixed_pins[item['path']]
+    drift={p for p in fixed_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=fixed_pins[p]}
+    assert drift=={'app.py'}
+    assert {x['path'] for x in current['reviewed_source_changes']}==drift
+    assert current['parent_inventory_sha256']==hashlib.sha256(fixed_path.read_bytes()).hexdigest()
+    for item in current['reviewed_source_changes']:
+        assert item['old_sha256']==fixed_pins[item['path']]
         assert item['new_sha256']==hashlib.sha256((source/item['path']).read_bytes()).hexdigest()
     assert current['added_audited_paths']==[]
     assert current['runtime_completeness']=='UNPROVED' and not current['source_search_is_completeness_proof']
