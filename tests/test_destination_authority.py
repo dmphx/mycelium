@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v6-nfo.json'
-FIXTURE_SHA='8824555d6d432e731a2725805258d03594635bd625eebdf8944c892e845ae807'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v6-nfo.json')
-INVENTORY_SHA='4a153eb9d4cd6cd52c69c53ed4330827d9982fe711a41546bdfc7299bdebdda0'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v7-nfo-size.json'
+FIXTURE_SHA='419d70a0a330c9f54bf71ac8e7631ee29260de0f46158be41261cd26d3cd51a7'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v7-nfo-size.json')
+INVENTORY_SHA='9f6edc0c075a6ff646d66ea198f08e8965113841de4bbeededb289e28474fc54'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -406,12 +406,34 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
     for item in startup['reviewed_source_changes']:
         assert item['old_sha256']==fixed_pins[item['path']]
         assert item['new_sha256']==startup_pins[item['path']]
-    drift={p for p in startup_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=startup_pins[p]}
-    assert drift=={'nfo_generator.py'}
-    assert {x['path'] for x in current['reviewed_source_changes']}==drift
-    assert current['parent_inventory_sha256']==hashlib.sha256(startup_path.read_bytes()).hexdigest()
-    for item in current['reviewed_source_changes']:
+    nfo_path=INVENTORY.with_name('destination-path-inventory-v6-nfo.json')
+    nfo_model=FIXTURE.with_name('destination-fence-model-v6-nfo.json')
+    assert hashlib.sha256(nfo_path.read_bytes()).hexdigest()=='4a153eb9d4cd6cd52c69c53ed4330827d9982fe711a41546bdfc7299bdebdda0'
+    assert hashlib.sha256(nfo_model.read_bytes()).hexdigest()=='8824555d6d432e731a2725805258d03594635bd625eebdf8944c892e845ae807'
+    nfo=json.loads(nfo_path.read_text())
+    nfo_pins={x['path']:x['sha256'] for x in nfo['audited_python_files']}
+    assert {p for p in startup_pins if startup_pins[p]!=nfo_pins[p]}=={'nfo_generator.py'}
+    assert nfo['parent_inventory_sha256']==hashlib.sha256(startup_path.read_bytes()).hexdigest()
+    for item in nfo['reviewed_source_changes']:
         assert item['old_sha256']==startup_pins[item['path']]
+        assert item['new_sha256']==nfo_pins[item['path']]
+    independent_size_path=INVENTORY.with_name('destination-path-inventory-v6-size.json')
+    independent_size_model=FIXTURE.with_name('destination-fence-model-v6-size.json')
+    assert hashlib.sha256(independent_size_path.read_bytes()).hexdigest()=='524adc6b27863e9633d4d75d593648bbc65b73e94d4f73769c592ff616b8de26'
+    assert hashlib.sha256(independent_size_model.read_bytes()).hexdigest()=='4c89b55e291b9da3871a6060618e37dc0ab01d40891c5ba25635ff5267bb3a84'
+    independent_size=json.loads(independent_size_path.read_text())
+    independent_size_pins={x['path']:x['sha256'] for x in independent_size['audited_python_files']}
+    assert independent_size['parent_inventory_sha256']==hashlib.sha256(startup_path.read_bytes()).hexdigest()
+    assert {p for p in startup_pins if startup_pins[p]!=independent_size_pins[p]}=={'torrentio.py'}
+    for item in independent_size['reviewed_source_changes']:
+        assert item['old_sha256']==startup_pins[item['path']]
+        assert item['new_sha256']==independent_size_pins[item['path']]
+    drift={p for p in nfo_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=nfo_pins[p]}
+    assert drift=={'torrentio.py'}
+    assert {x['path'] for x in current['reviewed_source_changes']}==drift
+    assert current['parent_inventory_sha256']==hashlib.sha256(nfo_path.read_bytes()).hexdigest()
+    for item in current['reviewed_source_changes']:
+        assert item['old_sha256']==nfo_pins[item['path']]
         assert item['new_sha256']==hashlib.sha256((source/item['path']).read_bytes()).hexdigest()
     assert current['added_audited_paths']==[]
     assert current['runtime_completeness']=='UNPROVED' and not current['source_search_is_completeness_proof']

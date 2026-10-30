@@ -497,12 +497,11 @@ def rank_streams(
         filtered = [s for s in candidates if not _is_undersized(s)]
         if filtered:
             candidates = filtered
-        elif strict_cam:
-            log.warning("Only implausibly small (likely fake/cam/trailer) candidates available "
-                        "and STRICT_NO_CAM is on  -  rejecting all")
-            return []
         else:
-            log.warning("Only implausibly small (likely fake/cam/trailer) candidates available; allowing them")
+            log.warning("Candidate exclusion: reason=all_undersized count=%d "
+                        "runtime_minutes=%s EXCLUDE_UNDERSIZED_RELEASES=true",
+                        len(candidates), runtime_minutes)
+            return []
 
     if min_seeders > 0:
         filtered = [s for s in candidates if s.seeders == 0 or s.seeders >= min_seeders]

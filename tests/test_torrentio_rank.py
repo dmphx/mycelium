@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+import threading
 
 os.environ.setdefault("TORBOX_API_KEY", "test")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -49,9 +50,13 @@ def _real_settings(tmp_path, monkeypatch):
     # its config default, then expose it under sys.modules["settings"] for
     # torrentio's lazy import. Restored to conftest's mock on teardown.
     monkeypatch.setattr(_db, "DB_PATH", str(tmp_path / "torrentio-test.db"))
+    # db caches connections per thread; changing DB_PATH alone reuses the prior
+    # test's settings and makes enabled/disabled policy controls order-dependent.
+    monkeypatch.setattr(_db, "_tls", threading.local())
     _db.init()
     monkeypatch.setitem(sys.modules, "settings", _settings)
     yield
+    _db._tls.conn.close()
 
 
 def _stream(name, quality, size_gb, seeders=10):
@@ -93,11 +98,35 @@ def test_no_runtime_known_skips_the_filter():
     assert len(ranked) == 1
 
 
-def test_all_candidates_undersized_falls_back_to_allowing_them():
+@pytest.mark.parametrize("strict_cam", [False, True])
+def test_all_candidates_undersized_are_excluded_independently_of_cam(strict_cam, caplog):
+    _settings.set("STRICT_NO_CAM", strict_cam)
+    _settings.set("EXCLUDE_UNDERSIZED_RELEASES", True)
     fake1 = _stream("Movie.2024.2160p.WEB-DL", "2160p", size_gb=0.1)
     fake2 = _stream("Movie.2024.1080p.WEB-DL", "1080p", size_gb=0.05)
     ranked = torrentio.rank_streams([fake1, fake2], override={"runtime_minutes": 90})
-    assert len(ranked) == 2
+    assert ranked == []
+    assert "reason=all_undersized count=2" in caplog.text
+
+
+def test_explicitly_disabled_size_exclusion_preserves_candidates():
+    _settings.set("EXCLUDE_UNDERSIZED_RELEASES", False)
+    _settings.set("STRICT_NO_CAM", True)
+    candidates = [_stream("Movie.1080p.WEB-DL", "1080p", size_gb=0.05)]
+    assert torrentio.rank_streams(candidates, override={"runtime_minutes": 90}) == candidates
+
+
+def test_unknown_size_survives_when_known_undersized_candidates_are_removed():
+    small = _stream("Small.1080p.WEB-DL", "1080p", size_gb=0.05)
+    unknown = _stream("Unknown.1080p.WEB-DL", "1080p", size_gb=0)
+    assert torrentio.rank_streams([small, unknown], override={"runtime_minutes": 90}) == [unknown]
+
+
+def test_size_threshold_is_inclusive_and_runtime_scaling_is_preserved():
+    floor = torrentio._min_plausible_size_gb("1080p", 180)
+    below = _stream("Below.1080p.WEB-DL", "1080p", size_gb=floor - 0.01)
+    at_floor = _stream("Exact.1080p.WEB-DL", "1080p", size_gb=floor)
+    assert torrentio.rank_streams([below, at_floor], override={"runtime_minutes": 180}) == [at_floor]
 
 
 def test_configured_url_only_results_fall_back_to_plain_endpoint(monkeypatch, caplog):
