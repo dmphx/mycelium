@@ -4,6 +4,8 @@ import logging
 import os.path as _path
 import re
 import threading
+import hashlib
+import native_request_scopes as native_scopes
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, send_file, stream_with_context, url_for
@@ -3145,7 +3147,12 @@ def ui_api_discover_add():
     """One-click add: resolve TMDB→IMDB, queue for processing.
     For TV the payload may include monitor_mode ('all'|'future'|'selected')
     and seasons (list of season numbers, used when mode is 'selected')."""
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    try:
+        request_scope = native_scopes.prepare(payload)
+    except native_scopes.ScopeError as exc:
+        return jsonify(error=str(exc)), 400
+    raw_body_sha256 = hashlib.sha256(request.get_data()).hexdigest()
     tmdb_id = payload.get("tmdb_id")
     media_type = payload.get("media_type") or "movie"
     title = payload.get("title") or ""
@@ -3166,10 +3173,15 @@ def ui_api_discover_add():
         auto = bool(user_rec.get("auto_approve")) or user_rec.get("role") == "admin"
         status = "approved" if auto else "pending"
         rid = db.create_user_request(user_rec["id"], imdb_id, tmdb_id, media_type,
-                                       title, status=status)
+                                       title, status=status,
+                                       seasons=request_scope.get('seasons'), request_scope=request_scope,
+                                       raw_body_sha256=raw_body_sha256)
         if status == "approved":
-            _kick_off_processing(title, imdb_id, media_type, tmdb_id, monitor_mode, seasons)
-        return jsonify(status=status, request_id=rid, imdb_id=imdb_id)
+            import native_request_dispatch as dispatch
+            outcome = dispatch.run(rid, _kick_off_processing)
+        else:
+            outcome = None
+        return jsonify(status=status, request_id=rid, imdb_id=imdb_id, request_scope=request_scope, request_dispatch=outcome)
 
     # Single-user / legacy mode: process immediately
     _kick_off_processing(title, imdb_id, media_type, tmdb_id, monitor_mode, seasons)
@@ -3179,23 +3191,29 @@ def ui_api_discover_add():
 def _kick_off_processing(title: str, imdb_id: str, media_type: str,
                           tmdb_id: int | None = None,
                           monitor_mode: str = "all",
-                          seasons: list[int] | None = None) -> None:
+                          seasons: list[int] | None = None,
+                          future_starts_on: str | None = None) -> None:
     from webhook_parser import MediaRequest
     if not seerr_compat.IMDB_RE.match(imdb_id or ""):
         log.warning("not processing %r: no usable IMDb id", title)
         return
     if media_type == "tv":
         try:
-            show = tmdb.get_show_info(tmdb_id) if tmdb_id else None
-            n_seasons = (show or {}).get("number_of_seasons") or 1
-            all_seasons = list(range(1, n_seasons + 1))
             if monitor_mode == "selected" and seasons:
-                monitored = [int(s) for s in seasons if int(s) in all_seasons]
+                monitored = list(seasons)
             else:
-                monitored = all_seasons
-            db.upsert_monitored_series(imdb_id, tmdb_id, title, monitored, monitor_mode=monitor_mode)
+                show = tmdb.get_show_info(tmdb_id) if tmdb_id else None
+                n_seasons = (show or {}).get("number_of_seasons") or 1
+                monitored = list(range(1, n_seasons + 1))
+            if future_starts_on is not None:
+                native_scopes.validate({'kind':'future','starts_on':future_starts_on}, 'tv')
+            db.upsert_monitored_series(imdb_id, tmdb_id, title, monitored, monitor_mode=monitor_mode,
+                                       added_at_date=future_starts_on)
         except Exception as exc:
             log.warning("upsert_monitored_series failed: %s", exc)
+            # A scoped owned dispatch must never fabricate a season after metadata/storage failure.
+            if future_starts_on is not None or monitor_mode == 'selected':
+                raise
             monitored = seasons or [1]
         # 'future' mode: don't eagerly fetch the back-catalog  -  let the monitor
         # pick up episodes as they air. Eagerly process only for all/selected.
@@ -3295,10 +3313,33 @@ def ui_api_user_request_approve(req_id: int):
         return jsonify(error="request already reviewed"), 409
     if not seerr_compat.IMDB_RE.match(r.get("imdb_id") or ""):
         return jsonify(error="metadata identity unresolved"), 400
-    db.update_user_request_status(req_id, "approved",
-                                   reviewed_by=(rec or {}).get("id"))
-    _kick_off_processing(r["title"], r["imdb_id"], r["media_type"], r.get("tmdb_id"))
-    return jsonify(ok=True)
+    try:
+        r, scope = db.review_native_request(req_id, 'approved', rec['id'])
+    except KeyError:
+        return jsonify(error='not found'), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 409
+    import native_request_dispatch as dispatch
+    outcome = dispatch.run(req_id, _kick_off_processing)
+    return jsonify(ok=True, status='approved', request_id=req_id, request_scope=scope, request_dispatch=outcome)
+
+
+
+@app.post("/ui/api/user-requests/<int:req_id>/retry-dispatch")
+@auth.require_role("admin")
+def ui_api_user_request_retry_dispatch(req_id: int):
+    """Explicit bounded retry only after a proven pre-handoff failure."""
+    if not auth.is_admin():
+        return jsonify(error="admin required"), 403
+    import native_request_dispatch as dispatch
+    payload = request.get_json(silent=True)
+    if type(payload) is not dict or set(payload) != {'attempt'} or type(payload['attempt']) is not int:
+        return jsonify(error='exact dispatch attempt required'), 400
+    try:
+        outcome = dispatch.run(req_id, _kick_off_processing, expected_attempt=payload['attempt'])
+    except dispatch.DispatchConflict as exc:
+        return jsonify(error=str(exc)), 409
+    return jsonify(ok=True, status='approved', request_id=req_id, request_dispatch=outcome)
 
 
 @app.post("/ui/api/user-requests/<int:req_id>/deny")
@@ -3308,10 +3349,14 @@ def ui_api_user_request_deny(req_id: int):
         return jsonify(error="admin required"), 403
     rec = auth.current_user_record()
     p = request.get_json(silent=True) or {}
-    db.update_user_request_status(req_id, "denied",
-                                   reviewed_by=(rec or {}).get("id"),
-                                   note=p.get("note"))
+    try:
+        db.review_native_request(req_id, 'denied', rec['id'], p.get('note'))
+    except KeyError:
+        return jsonify(error='not found'), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 409
     return jsonify(ok=True)
+
 
 
 # ── User management (admin) ──────────────────────────────────────────────────
@@ -3755,7 +3800,10 @@ def ui_api_mdblist_lists():
     if not rec or not rec.get("mdblist_api_key"):
         return jsonify(error="MDBList not connected"), 400
     import mdblist
-    return jsonify(lists=mdblist.get_user_lists(rec["mdblist_api_key"]))
+    try:
+        return jsonify(lists=mdblist.get_user_lists(rec["mdblist_api_key"]))
+    except mdblist.MDBListUnavailable:
+        return jsonify(error="MDBList lists unavailable"), 503
 
 
 @app.post("/ui/api/mdblist/lists")

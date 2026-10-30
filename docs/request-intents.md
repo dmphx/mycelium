@@ -46,3 +46,59 @@ Tables (all internal): `request_metadata_snapshot` (canonical JSON, predicate JS
 Accepted predicate (internal, pending the final wire contract): movie `{"kind":"movie"}`; TV `{input_scope, numbering:"tmdb", monitoring:"none"|"selected_seasons"|"all_regular_seasons", specials:"explicit_only"}` plus `starts_on` (the cutoff) for `future`.
 
 Not in this slice: publication or the executor, metadata refresh, content registration across users, HTTP routes, or any freshness check on `resolved`. `resolved` must come from the server-side resolver only; a browser-supplied dict must never reach `admit`. Prewrite lease guards do not close the filesystem race, which is a separate gate.
+
+## Receiver-owned preparation (private followup)
+
+`request_preparation.prepare(native_user_id, exact_body_bytes, idempotency_key)` issues an
+immutable in-process `PreparedRequest`. The existing receiver must authenticate the actor
+and exact body first; this primitive does not authenticate callers. It parses strict JSON,
+normalizes the exact media/scope input, captures the enabled native user's policy, fixes the
+receiver UTC date, and resolves metadata outside SQLite transactions. Checked root detail
+uses `append_to_response=external_ids`; the resolver's logical external-ID read comes from
+that same owned response. It never uses legacy `tmdb._get`, find aliases, title matching or
+global library caches. Exact typed root/IMDb and raw show/season/episode checks precede the
+existing immutable snapshot/predicate builder. Source JSON hashes are provenance diagnostics,
+not qualified publisher policy or library grants.
+
+The issued value binds owner, a distinct preparation ID, idempotency key, exact raw body
+SHA256, normalized input hash, native policy preimage/hash, receiver cutoff, resolved metadata,
+snapshot/predicate/accepted hashes and checked metadata source hashes. Reports expose hashes,
+not a reusable JSON-plan credential. There is no exported-plan loader or public constructor.
+`check_prepared(..., user_id=..., raw_body=..., idempotency_key=...)` requires the original issued
+object and exact bindings, rechecks current enabled native policy, and reports
+`admission_qualified:false`. Equivalent JSON spacing preserves semantic/snapshot hashes but
+does not preserve raw-body binding. Current policy equality is not proof against unobserved
+intermediate changes; source policy revisions and all-writer coverage remain final-admission
+requirements. An observed policy change retires that value.
+
+Preparation/checks use a read-only SQLite URI and query-only connection. Missing databases
+are not initialized, and the normal thread-local caller transaction must be absent before
+metadata work. They never write schema, membership, request history, quota, token ledger or
+outbox. The fixed limits are 128 live/resolving values, 60 monotonic seconds including
+resolution, 101 checked fetches, 8 MiB aggregate response JSON and 4 MiB serialized preparation.
+A blocking checked read can overrun the elapsed budget by its bounded transport timeout;
+expiry is checked before issuing and using the value. UTC day rollover or monotonic rollback
+expires it rather than silently changing an accepted cutoff. Unknown air dates remain waiting;
+specials require explicit scope. Capacity failure releases a reserved slot; issued slots are
+released on object collection, without recycling a live value.
+
+`retire(prepared)` cancels the in-process value irreversibly. The value also records its
+issuing process; a forked copy is refused before any inherited lock or SQLite access.
+Checks revalidate the value after native policy and retirement-ledger reads so concurrent
+cancellation or expiry cannot yield a fresh readiness report. The elapsed budget is checked
+again after serialization and before issuance.
+
+`request_preparation_tokens.cancel(prepared, user_id=..., raw_body=..., idempotency_key=...)`
+adds an immutable durable cancellation bound to the genuine local value and exact context.
+It can retire an expired value, but never make it usable. Cancellation replays are read-only
+and work at capacity. The additive table has no native-user foreign key: native owner cleanup
+cannot erase a tombstone or be blocked by it. Update/delete/replacement guards retain records.
+Limits are 1000 per owner and 100000 globally; no TTL or eviction resets a retired token.
+Storage failure retires the local value and returns failure rather than reporting durable
+success. Preparation/checks require the ledger schema/guards, but never create them. The
+existing fresh-schema initializer adds only CREATE statements; no live migration is performed.
+
+Durable consumption tied to a real admitted request, qualified source-policy/destination
+proof, atomic final admission and exact scoped execution remain separate required work.
+Request write/availability/repair authority and live activation stay unqualified; no existing
+request route is wired to this preparation or to the legacy dictionary admission path here.

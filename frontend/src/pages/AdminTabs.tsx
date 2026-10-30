@@ -13,7 +13,7 @@ export default function AdminTabs() {
 
   return (
     <div>
-      <div className="flex gap-2 border-b border-border mb-5">
+      <div className="flex flex-wrap gap-2 border-b border-border mb-5">
         {([
           ['dashboard', 'Dashboard'],
           ['classic', 'Classic (Blacklist, Repair, Settings, Logs)'],
@@ -22,7 +22,8 @@ export default function AdminTabs() {
             key={v}
             type="button"
             onClick={() => setTab(v)}
-            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition ${
+            aria-pressed={tab === v}
+            className={`min-h-[44px] max-w-full px-4 py-2 text-sm font-medium border-b-2 -mb-px transition ${
               tab === v ? 'border-accent text-white' : 'border-transparent text-muted hover:text-white'
             }`}
           >
@@ -33,7 +34,7 @@ export default function AdminTabs() {
       {tab === 'dashboard' ? (
         <Admin />
       ) : (
-        <iframe src="/admin?embed=1" className="w-full border-0" style={{ height: 'calc(100vh - 110px)' }} />
+        <iframe title="Classic administration" src="/admin?embed=1" className="w-full border-0" style={{ height: 'calc(100vh - 110px)' }} />
       )}
     </div>
   );

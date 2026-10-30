@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useModalDialog } from '../hooks/useModalDialog';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, tmdbImg } from '../api';
 import type { TmdbItem } from '../types';
@@ -13,6 +13,7 @@ export default function PersonModal({
   onSelectItem: (item: TmdbItem) => void;
 }) {
   const open = personId !== null;
+  const dialogRef = useModalDialog({ open, layer: 210, onClose });
   const qc = useQueryClient();
   const { data: person, isLoading } = useQuery({
     queryKey: ['person', personId],
@@ -34,13 +35,6 @@ export default function PersonModal({
     onSuccess: () => qc.invalidateQueries({ queryKey: ['favorite-actors'] }),
   });
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   return (
@@ -48,7 +42,9 @@ export default function PersonModal({
       className="fixed inset-0 z-[210] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto bg-card rounded-2xl border border-border shadow-2xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" tabIndex={-1}
+        aria-label={person?.name || 'Person details'}
+        className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto bg-card rounded-2xl border border-border shadow-2xl">
         <button
           type="button"
           onClick={onClose}

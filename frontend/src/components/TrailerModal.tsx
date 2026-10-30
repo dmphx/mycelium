@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useModalDialog } from '../hooks/useModalDialog';
 
 interface TrailerModalProps {
   youtubeKey: string | null;
@@ -7,12 +7,7 @@ interface TrailerModalProps {
 }
 
 function TrailerModal({ youtubeKey, title, onClose }: TrailerModalProps) {
-  useEffect(() => {
-    if (!youtubeKey) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [youtubeKey, onClose]);
+  const dialogRef = useModalDialog({ open: !!youtubeKey, layer: 220, onClose });
 
   if (!youtubeKey) return null;
 
@@ -21,10 +16,12 @@ function TrailerModal({ youtubeKey, title, onClose }: TrailerModalProps) {
 
   return (
     <div
-      className="fixed inset-0 z-[60] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8"
+      className="fixed inset-0 z-[220] bg-black/95 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="relative w-full max-w-4xl bg-black rounded-2xl overflow-hidden shadow-2xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" tabIndex={-1}
+        aria-label={title ? `${title} trailer` : 'Trailer'}
+        className="relative w-full max-w-4xl bg-black rounded-2xl overflow-hidden shadow-2xl">
         <button
           type="button"
           onClick={onClose}

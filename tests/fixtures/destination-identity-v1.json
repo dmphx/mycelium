@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "provenance": "Pinned owned synthetic identity/preimage/rollback inputs only. Not media validation, live namespace/reader authority, a signed receipt or an effect adapter.",
+  "files": {
+    "source/candidate.bin": "synthetic candidate generation bytes, not media",
+    "destination/current.bin": "synthetic original destination bytes, no real media",
+    "rollback/original.bin": "synthetic original destination bytes, no real media"
+  },
+  "manifest": {
+    "version": 1,
+    "mode": "owned_synthetic_identity_binding",
+    "domain_id": "synthetic_destination",
+    "identity": {
+      "media_type": "tv",
+      "tmdb_id": 101,
+      "imdb_id": "tt2000101",
+      "season": 0,
+      "episode": 1,
+      "tmdb_episode_id": 11
+    },
+    "source_candidates": [
+      {
+        "path": "source/candidate.bin",
+        "identity": {
+          "media_type": "tv",
+          "tmdb_id": 101,
+          "imdb_id": "tt2000101",
+          "season": 0,
+          "episode": 1,
+          "tmdb_episode_id": 11
+        }
+      }
+    ],
+    "destination_path": "destination/current.bin",
+    "rollback_path": "rollback/original.bin",
+    "source_sha256": "1b0690f864c7c58ce226396eef77d707b0e35dd16216b1bfd42fcc2a6d0a718f",
+    "preimage_sha256": "ca0d0a1c6f510c39be3496f4ffe1e4eb6fb44e2f594270179bd45d995910448f",
+    "expected_forward_revision": 1
+  }
+}

@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "policy_version": 1,
+  "provenance": "Synthetic pinned offline refresh metadata only. No provider snapshot, frozen integration contract, signer or execution authority.",
+  "parent_fixture_sha256": "42d10a1ab2afcbf42e2f7a33b1ab8a5c9b12d53883948bb9d84d2221ab9d8705",
+  "metadata": {
+    "selected": {
+      "media": {
+        "type": "tv",
+        "tmdb_id": 101
+      },
+      "scope": {
+        "kind": "selected_seasons",
+        "seasons": [
+          0,
+          2
+        ]
+      },
+      "title": "Synthetic Show",
+      "imdb_id": "tt2000101",
+      "year": 2020,
+      "cutoff": "2026-10-21",
+      "episodes": [
+        {
+          "tmdb_episode_id": 11,
+          "season": 0,
+          "episode": 1,
+          "name": "Synthetic 0/1",
+          "air_date": "2020-01-01",
+          "runtime_min": 40,
+          "air_state": "aired"
+        },
+        {
+          "tmdb_episode_id": 21,
+          "season": 2,
+          "episode": 1,
+          "name": "Synthetic 2/1",
+          "air_date": "2026-10-20",
+          "runtime_min": 40,
+          "air_state": "aired"
+        },
+        {
+          "tmdb_episode_id": 22,
+          "season": 2,
+          "episode": 2,
+          "name": "Synthetic 2/2",
+          "air_date": "2026-11-05",
+          "runtime_min": 40,
+          "air_state": "unaired"
+        },
+        {
+          "tmdb_episode_id": 203,
+          "season": 2,
+          "episode": 3,
+          "name": "Synthetic newly observed episode",
+          "air_date": null,
+          "runtime_min": 42,
+          "air_state": "unknown"
+        }
+      ]
+    },
+    "other": {
+      "media": {
+        "type": "tv",
+        "tmdb_id": 101
+      },
+      "scope": {
+        "kind": "selected_seasons",
+        "seasons": [
+          3
+        ]
+      },
+      "title": "Synthetic Show",
+      "imdb_id": "tt2000101",
+      "year": 2020,
+      "cutoff": "2026-10-21",
+      "episodes": [
+        {
+          "tmdb_episode_id": 31,
+          "season": 3,
+          "episode": 1,
+          "name": "Synthetic 3/1",
+          "air_date": "2026-10-20",
+          "runtime_min": 40,
+          "air_state": "aired"
+        }
+      ]
+    },
+    "future": {
+      "media": {
+        "type": "tv",
+        "tmdb_id": 101
+      },
+      "scope": {
+        "kind": "future"
+      },
+      "title": "Synthetic Show",
+      "imdb_id": "tt2000101",
+      "year": 2020,
+      "cutoff": "2026-10-21",
+      "episodes": [
+        {
+          "tmdb_episode_id": 11,
+          "season": 1,
+          "episode": 1,
+          "name": "Synthetic 1/1",
+          "air_date": "2026-10-21",
+          "runtime_min": 40,
+          "air_state": "aired"
+        },
+        {
+          "tmdb_episode_id": 12,
+          "season": 1,
+          "episode": 2,
+          "name": "Synthetic 1/2",
+          "air_date": "2026-11-01",
+          "runtime_min": 40,
+          "air_state": "unaired"
+        },
+        {
+          "tmdb_episode_id": 21,
+          "season": 2,
+          "episode": 1,
+          "name": "Synthetic 2/1",
+          "air_date": "2026-11-05",
+          "runtime_min": 40,
+          "air_state": "unaired"
+        },
+        {
+          "tmdb_episode_id": 403,
+          "season": 4,
+          "episode": 3,
+          "name": "Synthetic newly observed episode",
+          "air_date": null,
+          "runtime_min": 42,
+          "air_state": "unknown"
+        }
+      ]
+    },
+    "all": {
+      "media": {
+        "type": "tv",
+        "tmdb_id": 101
+      },
+      "scope": {
+        "kind": "all_seasons"
+      },
+      "title": "Synthetic Show",
+      "imdb_id": "tt2000101",
+      "year": 2020,
+      "cutoff": "2026-10-21",
+      "episodes": [
+        {
+          "tmdb_episode_id": 11,
+          "season": 1,
+          "episode": 1,
+          "name": "Synthetic 1/1",
+          "air_date": "2020-01-01",
+          "runtime_min": 40,
+          "air_state": "aired"
+        },
+        {
+          "tmdb_episode_id": 21,
+          "season": 2,
+          "episode": 1,
+          "name": "Synthetic 2/1",
+          "air_date": "2026-11-05",
+          "runtime_min": 40,
+          "air_state": "unaired"
+        },
+        {
+          "tmdb_episode_id": 403,
+          "season": 4,
+          "episode": 3,
+          "name": "Synthetic newly observed episode",
+          "air_date": null,
+          "runtime_min": 42,
+          "air_state": "unknown"
+        }
+      ]
+    },
+    "movie": {
+      "media": {
+        "type": "movie",
+        "tmdb_id": 101
+      },
+      "scope": {
+        "kind": "movie"
+      },
+      "title": "Synthetic Show",
+      "imdb_id": "tt2000101",
+      "year": 2021,
+      "cutoff": "2026-10-21",
+      "episodes": []
+    }
+  }
+}

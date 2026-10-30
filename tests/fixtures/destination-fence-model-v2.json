@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "mode": "isolated_model_no_external_entrypoints",
+  "domain_id": "synthetic_destination",
+  "source_inventory_sha256": "6fdcbc7e7573a7dacc4fd519e71f6b0448ed60df835157bf9d8539fd68c3f465",
+  "writers": [
+    "arr_import",
+    "automation",
+    "cleanup_repair",
+    "enrichment",
+    "identity_reidentify",
+    "library_import",
+    "monitor_metadata",
+    "native_and_compat_dispatch",
+    "nfo_metadata",
+    "processor",
+    "retry",
+    "strm_stub_cache",
+    "upgrade_pack",
+    "webplayer_generation"
+  ],
+  "readers": [
+    "bearer_stream",
+    "external_bearer_or_tools",
+    "external_servers_indexers",
+    "nfs_external_handles",
+    "proxy_cache_range",
+    "webplayer_sessions"
+  ],
+  "gateway_sha256": "8d22b6b4fa831946bdba8479f25e4198b45811581077ee5e286a22a915a2cd71",
+  "unknown_domains": [],
+  "preimage": "synthetic original destination bytes, no real media",
+  "reader_generation": 7,
+  "writer_generation": 4
+}

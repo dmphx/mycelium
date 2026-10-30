@@ -474,6 +474,14 @@ def init() -> None:
         integration_auth.init_schema(conn)
         import integration_personalization
         integration_personalization.init_schema(conn)
+        import integration_watchlist_overlay
+        integration_watchlist_overlay.init_schema(conn)
+        import request_preparation_tokens
+        request_preparation_tokens.init_schema(conn)
+        import native_request_scopes
+        native_request_scopes.init_schema(conn)
+        import native_request_dispatch
+        native_request_dispatch.init_schema(conn)
         conn.commit()
     _migrate()
     integrity_check()
@@ -807,19 +815,22 @@ def reconcile_wanted_episodes() -> int:
 # ── monitored_series ──────────────────────────────────────────────────────────
 
 def upsert_monitored_series(imdb_id: str, tmdb_id: int | None, title: str,
-                            seasons: list[int], monitor_mode: str = "all") -> None:
+                            seasons: list[int], monitor_mode: str = "all",
+                            added_at_date: str | None = None) -> None:
     seasons_str = ",".join(str(s) for s in seasons)
     with _connect() as conn:
         conn.execute(
             """INSERT INTO monitored_series (imdb_id, tmdb_id, title, seasons, monitor_mode, added_at_date)
-               VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%d','now'))
+               VALUES (?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%d','now')))
                ON CONFLICT(imdb_id) DO UPDATE SET
                  tmdb_id=COALESCE(excluded.tmdb_id, tmdb_id),
                  title=excluded.title,
                  seasons=excluded.seasons,
                  monitor_mode=excluded.monitor_mode,
+                 added_at_date=CASE WHEN excluded.monitor_mode='future' AND ? IS NOT NULL
+                   THEN excluded.added_at_date ELSE monitored_series.added_at_date END,
                  status='active'""",
-            (imdb_id, tmdb_id, title, seasons_str, monitor_mode),
+            (imdb_id, tmdb_id, title, seasons_str, monitor_mode, added_at_date, added_at_date),
         )
         conn.commit()
 
@@ -3219,15 +3230,30 @@ def get_watchlist(user_id: int) -> list[dict]:
 
 def create_user_request(user_id: int, imdb_id: str, tmdb_id: int | None,
                         media_type: str, title: str, seasons: list[int] | None = None,
-                        status: str = "pending") -> int:
+                        status: str = "pending", request_scope: dict | None = None,
+                        raw_body_sha256: str | None = None) -> int:
     seasons_str = ",".join(str(s) for s in (seasons or [])) or None
     with _connect() as conn:
-        cur = conn.execute(
-            """INSERT INTO user_requests (user_id, imdb_id, tmdb_id, media_type, title, seasons, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, imdb_id, tmdb_id, media_type, title, seasons_str, status),
-        )
-        return cur.lastrowid
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                """INSERT INTO user_requests (user_id, imdb_id, tmdb_id, media_type, title, seasons, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, imdb_id, tmdb_id, media_type, title, seasons_str, status),
+            )
+            rid = cur.lastrowid
+            if request_scope is not None:
+                import native_request_scopes as scopes
+                scopes.store(conn, rid, user_id, imdb_id, tmdb_id, media_type, request_scope, raw_body_sha256)
+                if status == 'approved':
+                    import native_request_dispatch as dispatch
+                    row = dict(conn.execute('SELECT * FROM user_requests WHERE id=?', (rid,)).fetchone())
+                    dispatch.enqueue(conn, row)
+            conn.execute("COMMIT")
+            return rid
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def get_user_requests(user_id: int | None = None, status: str | None = None,
@@ -3249,7 +3275,19 @@ def get_user_requests(user_id: int | None = None, status: str | None = None,
     args.append(limit)
     with _connect() as conn:
         rows = conn.execute(sql, args).fetchall()
-        return [dict(r) for r in rows]
+        import native_request_scopes as scopes
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item['request_scope'] = scopes.read(conn, item)
+            except scopes.ScopeError:
+                item['request_scope'] = None
+            item['request_scope_state'] = 'recorded' if item['request_scope'] else 'unavailable'
+            import native_request_dispatch as dispatch
+            item['request_dispatch'] = dispatch.read(conn, item)
+            result.append(item)
+        return result
 
 
 def list_user_requests_page(take: int, skip: int) -> tuple[list[dict], int]:
@@ -3304,6 +3342,36 @@ def get_user_request(req_id: int) -> dict | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM user_requests WHERE id=?", (req_id,)).fetchone()
         return dict(row) if row else None
+
+
+def review_native_request(req_id: int, status: str, reviewer: int, note: str | None = None):
+    """One pending decision wins; snapshot identity is checked before approval."""
+    import native_request_scopes as scopes
+    if status not in ('approved', 'denied'):
+        raise ValueError('invalid review')
+    with _connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            raw = conn.execute('SELECT * FROM user_requests WHERE id=?', (req_id,)).fetchone()
+            if raw is None:
+                raise KeyError('request not found')
+            row = dict(raw)
+            if row['status'] != 'pending':
+                raise ValueError('request already reviewed')
+            scope = scopes.read(conn, row) if status == 'approved' else None
+            if status == 'approved' and scope is None:
+                if row['media_type'] != 'movie':
+                    raise scopes.ScopeError('original TV scope unavailable')
+                scope = {'kind':'movie'}
+            conn.execute("UPDATE user_requests SET status=?, reviewed_by=?, reviewed_at=strftime('%Y-%m-%d %H:%M:%S','now'), note=COALESCE(?,note) WHERE id=? AND status='pending'", (status,reviewer,note,req_id))
+            if status == 'approved':
+                import native_request_dispatch as dispatch
+                dispatch.enqueue(conn, row)
+            conn.execute('COMMIT')
+            return row, scope
+        except BaseException:
+            conn.execute('ROLLBACK')
+            raise
 
 
 def count_user_requests_this_month(user_id: int) -> int:

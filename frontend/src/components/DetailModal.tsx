@@ -1,5 +1,8 @@
+import RequestDispatchStatus from './RequestDispatchStatus';
+import { readWatchlist } from '../hooks/readWatchlist';
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, tmdbImg } from '../api';
 import type { MediaType, TmdbItem, WatchlistItem } from '../types';
@@ -7,6 +10,8 @@ import TrailerModal from './TrailerModal';
 import PersonModal from './PersonModal';
 import { usePluginSlot } from '../hooks/usePluginSlots';
 import { useWatched } from '../hooks/useWatched';
+import { useLibraryRequest } from '../hooks/useLibraryRequest';
+import { useModalDialog } from '../hooks/useModalDialog';
 
 type DetailModalProps = {
   tmdbId: number | null;
@@ -33,7 +38,7 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
 
   const { data: watchlist } = useQuery({
     queryKey: ['watchlist'],
-    queryFn: api.watchlist,
+    queryFn: ({ signal }) => readWatchlist(signal), retry: false, enabled: open,
   });
 
   const inWatchlist =
@@ -50,80 +55,20 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
   const watched = useWatched();
   const isWatched = !!(detail?.imdb_id && watched.has(detail.imdb_id));
 
-  const [addStatus, setAddStatus] = useState<'idle' | 'adding' | 'added' | 'pending' | 'error' | 'wanted' | 'upcoming'>(
-    'idle',
-  );
-  const [pollingImdbId, setPollingImdbId] = useState<string | null>(null);
+  const requestFlow = useLibraryRequest(session?.authenticated ? String(session.user?.id ?? 'legacy') : null, mediaType, tmdbId);
+  const addStatus = requestFlow.attempt.phase;
   const [personId, setPersonId] = useState<number | null>(null);
-
-  // Poll request status until a terminal state is reached or 3 min timeout
-  useEffect(() => {
-    if (!pollingImdbId) return;
-    const deadline = Date.now() + 3 * 60 * 1000;
-    const interval = setInterval(async () => {
-      try {
-        if (Date.now() > deadline) {
-          setAddStatus('error');
-          setPollingImdbId(null);
-          return;
-        }
-        const res = await fetch(`/ui/api/requests/status?imdb_id=${pollingImdbId}`);
-        if (res.status === 401) {
-          // Session expired mid-poll - match api.ts's http() wrapper behavior
-          // instead of silently polling a dead session for up to 3 minutes.
-          setPollingImdbId(null);
-          if (!window.location.pathname.endsWith('/login')) window.location.href = '/login';
-          return;
-        }
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data.status === 'success') {
-          setAddStatus('added');
-          setPollingImdbId(null);
-          queryClient.invalidateQueries({ queryKey: ['detail', mediaType, tmdbId] });
-        } else if (data.status === 'wanted') {
-          setAddStatus('wanted');
-          setPollingImdbId(null);
-        } else if (data.status === 'upcoming') {
-          setAddStatus('upcoming');
-          setPollingImdbId(null);
-        } else if (data.status === 'failed' || data.status === 'rate_limited') {
-          setAddStatus('error');
-          setPollingImdbId(null);
-        }
-      } catch { /* ignore */ }
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [pollingImdbId, queryClient, mediaType, tmdbId]);
 
   // TV monitoring scope
   const [showTrailer, setShowTrailer] = useState(false);
   const [showPlayer, setShowPlayer] = useState(false);
-  const [monitorMode, setMonitorMode] = useState<'all' | 'future' | 'selected'>('all');
-  const [selectedSeasons, setSelectedSeasons] = useState<number[]>([]);
+  const dialogRef = useModalDialog({ open, layer: 200, onClose, suspended: showPlayer });
+  const [draftMonitorMode, setMonitorMode] = useState<'all' | 'future' | 'selected'>('all');
+  const [draftSelectedSeasons, setSelectedSeasons] = useState<number[]>([]);
 
-  const addMutation = useMutation({
-    mutationFn: () =>
-      api.addToLibrary(
-        detail!.tmdb_id,
-        detail!.media_type,
-        detail!.title,
-        detail!.media_type === 'tv'
-          ? { monitor_mode: monitorMode, seasons: selectedSeasons }
-          : undefined,
-      ),
-    onMutate: () => setAddStatus('adding'),
-    onSuccess: (r) => {
-      if (r.status === 'pending') {
-        setAddStatus('pending');
-      } else if (r.imdb_id) {
-        setPollingImdbId(r.imdb_id);
-      } else {
-        setAddStatus('added');
-      }
-    },
-    onError: () => setAddStatus('error'),
-  });
+  const submittedSelection = requestFlow.attempt.selection;
+  const monitorMode = submittedSelection?.mode ?? draftMonitorMode;
+  const selectedSeasons = submittedSelection?.seasons ?? draftSelectedSeasons;
 
   const toggleSeason = (n: number) =>
     setSelectedSeasons((prev) =>
@@ -151,18 +96,8 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
 
   // Reset state when modal opens fresh
   useEffect(() => {
-    if (open) { setAddStatus('idle'); setShowTrailer(false); setShowPlayer(false); }
+    if (open) { setShowTrailer(false); setShowPlayer(false); }
   }, [open, tmdbId]);
-
-  // Esc to close
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
 
   if (!open) return null;
 
@@ -176,7 +111,10 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
       className="fixed inset-0 z-[200] bg-black/85 backdrop-blur-sm overflow-y-auto p-4 sm:p-8"
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="relative max-w-5xl mx-auto bg-card rounded-2xl overflow-hidden shadow-2xl">
+      <div ref={dialogRef} role="dialog" tabIndex={-1}
+        aria-modal={personId === null && !showTrailer && !showPlayer ? true : undefined}
+        aria-label={detail ? `${detail.title}${detail.year ? ` (${detail.year})` : ''}` : isError ? 'Title details unavailable' : 'Title details'}
+        className="relative max-w-5xl mx-auto bg-card rounded-2xl overflow-hidden shadow-2xl">
         {/* Backdrop hero */}
         {backdrop && (
           <div
@@ -255,7 +193,7 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                     <div className="text-[10px] uppercase tracking-wider text-muted font-semibold mb-2">
                       What to monitor
                     </div>
-                    <div className="flex gap-2 mb-2">
+                    <div className="flex flex-wrap gap-2 mb-2">
                       {([
                         ['all', 'All seasons'],
                         ['future', 'Future episodes only'],
@@ -265,6 +203,8 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                           key={mode}
                           type="button"
                           onClick={() => setMonitorMode(mode)}
+                          aria-pressed={monitorMode === mode}
+                          disabled={addStatus !== 'idle'}
                           className={`text-xs px-3 py-1.5 rounded border ${
                             monitorMode === mode
                               ? 'border-accent bg-accent/10 text-white'
@@ -284,6 +224,8 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                               key={s.season_number}
                               type="button"
                               onClick={() => toggleSeason(s.season_number)}
+                              aria-pressed={selectedSeasons.includes(s.season_number)}
+                              disabled={addStatus !== 'idle'}
                               className={`text-xs px-2 py-1 rounded border ${
                                 selectedSeasons.includes(s.season_number)
                                   ? 'border-accent bg-accent text-white'
@@ -295,6 +237,14 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                             </button>
                           ))}
                       </div>
+                    )}
+                    {submittedSelection && (
+                      <p className="text-xs text-muted mt-2">
+                        Submitted selection: {submittedSelection.mode === 'selected'
+                          ? `seasons ${submittedSelection.seasons.join(', ')}`
+                          : submittedSelection.mode === 'future' ? 'future episodes only' : 'all seasons'}.
+                        {' '}This records your submission, not confirmed library coverage.
+                      </p>
                     )}
                     {monitorMode === 'future' && (
                       <p className="text-[11px] text-muted mt-1">
@@ -310,11 +260,14 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                     addStatus={addStatus}
                     mediaType={detail.media_type}
                     disabled={
-                      detail.media_type === 'tv' &&
+                      !requestFlow.canSubmit || (detail.media_type === 'tv' &&
                       monitorMode === 'selected' &&
-                      selectedSeasons.length === 0
+                      selectedSeasons.length === 0)
                     }
-                    onAdd={() => addMutation.mutate()}
+                    onAdd={() => void requestFlow.submit({
+                      tmdb_id: detail.tmdb_id, media_type: detail.media_type, title: detail.title,
+                      ...(detail.media_type === 'tv' ? { monitor_mode: monitorMode, seasons: [...selectedSeasons] } : {}),
+                    }, detail.imdb_id)}
                   />
                   {canPlay && (libStatus === 'available' || libStatus === 'success') && (
                     <button
@@ -355,6 +308,42 @@ function DetailContent({ tmdbId, mediaType, onClose, onSelectItem }: DetailModal
                     </a>
                   )}
                 </div>
+
+                {(addStatus !== 'idle' || requestFlow.unavailable) && (
+                  <div className="mt-4 space-y-3 text-sm" role={['unknown', 'status_error', 'failed', 'approval_error', 'denied'].includes(addStatus) ? 'alert' : 'status'}>
+                    <p>{requestFlow.unavailable ? 'Request controls are unavailable. Open request history for the current state.'
+                      : addStatus === 'unknown' ? 'Could not confirm the request outcome. Check request history before submitting again.'
+                      : addStatus === 'status_error' ? "Your request was accepted, but the title's library status could not be confirmed."
+                      : addStatus === 'failed' ? 'A processing failure was reported for this title. Check request history for details.'
+                      : addStatus === 'checking_approval' ? 'Checking your request review and dispatch status…'
+                      : addStatus === 'approval_error' ? 'Could not refresh your request status. Any previous handoff state may be out of date. Check request history.'
+                      : addStatus === 'denied' ? 'Your request was denied. View request history for details.'
+                      : addStatus === 'pending' ? 'Request recorded and awaiting approval.'
+                      : addStatus === 'approved' ? 'Request approved. Dispatch status is shown separately below.'
+                      : addStatus === 'processing' ? 'Legacy request queued. Checking title-level library status…'
+                      : addStatus === 'registered' ? 'Library entry found.'
+                      : addStatus === 'wanted' ? 'This title is waiting for a release. Check request history for your request.'
+                      : addStatus === 'upcoming' ? 'Request accepted. This title is upcoming.'
+                      : 'Submitting request…'}</p>
+                    {requestFlow.attempt.dispatch && ['approved', 'approval_error', 'checking_approval'].includes(addStatus) && (
+                      <RequestDispatchStatus info={requestFlow.attempt.dispatch} />
+                    )}
+                    <div className="flex flex-wrap gap-3">
+                      {['pending', 'approved', 'approval_error', 'checking_approval'].includes(addStatus) && requestFlow.attempt.requestId && (
+                        <button type="button" onClick={() => void requestFlow.refreshApproval()} disabled={addStatus === 'checking_approval'}
+                          className="min-h-11 px-4 rounded-lg border border-border hover:bg-raised disabled:opacity-50">
+                          {addStatus === 'checking_approval' ? 'Checking request status…' : 'Refresh request status'}
+                        </button>
+                      )}
+                      {['status_error', 'failed', 'wanted', 'upcoming'].includes(addStatus) && requestFlow.attempt.imdb && (
+                        <button type="button" onClick={requestFlow.refreshStatus} className="min-h-11 px-4 rounded-lg border border-border hover:bg-raised">
+                          Refresh request status
+                        </button>
+                      )}
+                      <Link to="/requests" onClick={onClose} className="min-h-11 px-4 py-3 rounded-lg border border-border hover:bg-raised">View request history</Link>
+                    </div>
+                  </div>
+                )}
 
                 {detail.providers?.flatrate && detail.providers.flatrate.length > 0 && (
                   <div className="mt-5">
@@ -496,46 +485,27 @@ function LibraryButton({
   disabled: boolean;
   onAdd: () => void;
 }) {
-  if (libStatus === 'available' || libStatus === 'success') {
+  if (addStatus === 'idle' && (libStatus === 'available' || libStatus === 'success')) {
     return (
       <button type="button" disabled className="px-4 py-2 rounded-lg bg-green-600 text-white font-semibold text-sm cursor-default">
         In library
       </button>
     );
   }
-  if (libStatus === 'wanted' || libStatus === 'upcoming' || libStatus === 'pending' || libStatus === 'failed') {
-    return (
-      <button type="button" disabled className="px-4 py-2 rounded-lg bg-yellow-600 text-white font-semibold text-sm cursor-default">
-        Wanted
-      </button>
-    );
+  if (addStatus === 'idle' && ['wanted', 'upcoming', 'pending', 'failed'].includes(libStatus || '')) {
+    const labels: Record<string, string> = { wanted: 'Wanted', upcoming: 'Upcoming', pending: 'Processing', failed: 'Previous processing failed' };
+    return <button type="button" disabled className="px-4 py-2 rounded-lg bg-yellow-600 text-white font-semibold text-sm cursor-default">{labels[libStatus!]}</button>;
   }
-  if (addStatus === 'wanted' || addStatus === 'upcoming') {
-    return (
-      <button type="button" disabled className="px-4 py-2 rounded-lg bg-yellow-600 text-white font-semibold text-sm cursor-default">
-        {addStatus === 'upcoming' ? 'Upcoming' : 'Wanted'}
-      </button>
-    );
-  }
-  const isbusy = addStatus === 'adding' || addStatus === 'added' || addStatus === 'pending';
+  const labels: Record<string, string> = {
+    approved: 'Approved', checking_approval: 'Checking request status…', approval_error: 'Request status unavailable', denied: 'Request denied',
+    submitting: 'Submitting…', processing: 'Processing…', registered: 'Library entry found',
+    pending: 'Pending approval', wanted: 'Wanted', upcoming: 'Upcoming', failed: 'Library processing failed',
+    unknown: 'Outcome unknown', status_error: 'Status unavailable',
+  };
   return (
-    <button
-      type="button"
-      onClick={onAdd}
-      disabled={isbusy || disabled}
-      className="px-4 py-2 rounded-lg bg-accent hover:bg-accent/90 disabled:opacity-60 disabled:cursor-not-allowed font-semibold text-sm"
-    >
-      {addStatus === 'adding'
-        ? 'Processing...'
-        : addStatus === 'added'
-        ? 'Added'
-        : addStatus === 'pending'
-        ? 'Pending approval'
-        : addStatus === 'error'
-        ? 'Retry'
-        : mediaType === 'tv'
-        ? '+ Monitor series'
-        : '+ Add to library'}
+    <button type="button" onClick={onAdd} disabled={addStatus !== 'idle' || disabled}
+      className="min-h-11 px-4 py-2 rounded-lg bg-accent hover:bg-accent/90 disabled:opacity-60 disabled:cursor-not-allowed font-semibold text-sm">
+      {labels[addStatus] || (mediaType === 'tv' ? '+ Monitor series' : '+ Add to library')}
     </button>
   );
 }

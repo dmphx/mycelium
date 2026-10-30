@@ -1,10 +1,11 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import { usePluginSlot } from '../hooks/usePluginSlots';
 import PosterCard from '../components/PosterCard';
 import DetailModal from '../components/DetailModal';
 import type { TmdbItem } from '../types';
+import { useLibraryRead } from '../hooks/readLibrary';
 
 type Tab = 'movies' | 'series';
 
@@ -20,6 +21,7 @@ export default function Library() {
             key={t}
             type="button"
             onClick={() => setTab(t)}
+            aria-pressed={tab === t}
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px capitalize transition ${
               tab === t ? 'border-accent text-white' : 'border-transparent text-muted hover:text-white'
             }`}
@@ -34,10 +36,8 @@ export default function Library() {
 }
 
 function MoviesPanel() {
-  const { data, isLoading } = useQuery({
-    queryKey: ['library-movies'],
-    queryFn: api.libraryMovies,
-  });
+  const library = useLibraryRead('movies');
+  const data = library.data;
   const { data: session } = useQuery({ queryKey: ['session'], queryFn: api.session });
   const clickJellyfin = !!(session?.user as any)?.library_click_jellyfin;
 
@@ -45,6 +45,14 @@ function MoviesPanel() {
   const [page, setPage] = useState(1);
   const [filter, setFilter] = useState<'all' | 'available' | 'wanted'>('all');
   const [modalItem, setModalItem] = useState<{ tmdb_id: number; media_type: string; title: string } | null>(null);
+  // A lookup belongs to the selection that started it. Closing, navigating away,
+  // or selecting another title must prevent a late result from opening a modal.
+  const selectionGeneration = useRef(0);
+  useEffect(() => () => { selectionGeneration.current += 1; }, []);
+  const closeModal = useCallback(() => {
+    selectionGeneration.current += 1;
+    setModalItem(null);
+  }, []);
 
   const items = useMemo(() => data?.items || [], [data]);
 
@@ -73,15 +81,17 @@ function MoviesPanel() {
   }, [items, filter, search]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const visiblePage = Math.min(page, totalPages);
   const paginated = useMemo(
-    () => filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
-    [filtered, page],
+    () => filtered.slice((visiblePage - 1) * PAGE_SIZE, visiblePage * PAGE_SIZE),
+    [filtered, visiblePage],
   );
 
   const handleSearch = (v: string) => { setSearch(v); setPage(1); };
   const handleFilter = (v: typeof filter) => { setFilter(v); setPage(1); };
 
   const openModal = useCallback(async (m: any) => {
+    const generation = ++selectionGeneration.current;
     // Resolve tmdb_id if missing (older items may not have it)
     let tmdbId: number | null = m.tmdb_id ?? null;
     let mediaType: string = m.media_type ?? 'movie';
@@ -91,7 +101,9 @@ function MoviesPanel() {
         if (found.tmdb_id) { tmdbId = found.tmdb_id; mediaType = found.media_type ?? 'movie'; }
       } catch { /* ignore */ }
     }
-    if (tmdbId) setModalItem({ tmdb_id: tmdbId, media_type: mediaType, title: m.title });
+    if (tmdbId && generation === selectionGeneration.current) {
+      setModalItem({ tmdb_id: tmdbId, media_type: mediaType, title: m.title });
+    }
   }, []);
 
   const handlePosterClick = useCallback((m: any) => {
@@ -99,6 +111,7 @@ function MoviesPanel() {
       const jid = jellyfinMap[m.imdb_id];
       const jurl = (jellyfinData?.jellyfin_url || jellyfinUrl || '').replace(/\/$/, '');
       if (jid && jurl) {
+        selectionGeneration.current += 1;
         window.open(`${jurl}/web/index.html#!/details?id=${jid}`, '_blank');
         return;
       }
@@ -107,24 +120,27 @@ function MoviesPanel() {
     openModal(m);
   }, [clickJellyfin, jellyfinUrl, jellyfinData, jellyfinMap, openModal]);
 
-  if (isLoading) return <div className="text-muted">Loading...</div>;
+
 
   const available = items.filter((m: any) => m.status === 'success').length;
   const wanted    = items.length - available;
 
   return (
     <>
+      <LibraryReadStatus kind="movies" library={library} />
+      {data && <>
       {/* Toolbar */}
       <div className="flex flex-col sm:flex-row gap-3 mb-5">
         <input
           type="search"
+          aria-label="Search library movies"
           placeholder="Search movies..."
           value={search}
           onChange={(e) => handleSearch(e.target.value)}
           className="flex-1 bg-card border border-border rounded-lg px-3 py-2 text-sm
                      placeholder:text-muted focus:outline-none focus:border-accent"
         />
-        <div className="flex gap-1">
+        <div className="flex flex-wrap gap-1">
           {([
             ['all',       `All (${items.length})`],
             ['available', `Available (${available})`],
@@ -134,6 +150,7 @@ function MoviesPanel() {
               key={v}
               type="button"
               onClick={() => handleFilter(v)}
+              aria-pressed={filter === v}
               className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
                 filter === v
                   ? 'border-accent bg-accent/10 text-white'
@@ -166,20 +183,20 @@ function MoviesPanel() {
         <div className="flex items-center justify-center gap-2 mt-6">
           <button
             type="button"
-            onClick={() => setPage(p => Math.max(1, p - 1))}
-            disabled={page === 1}
+            onClick={() => setPage(Math.max(1, visiblePage - 1))}
+            disabled={visiblePage === 1}
             className="px-3 py-1 rounded border border-border text-sm text-muted
                        hover:text-white disabled:opacity-30 transition"
           >
             Prev
           </button>
           <span className="text-sm text-muted">
-            {page} / {totalPages}
+            {visiblePage} / {totalPages}
           </span>
           <button
             type="button"
-            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-            disabled={page === totalPages}
+            onClick={() => setPage(Math.min(totalPages, visiblePage + 1))}
+            disabled={visiblePage === totalPages}
             className="px-3 py-1 rounded border border-border text-sm text-muted
                        hover:text-white disabled:opacity-30 transition"
           >
@@ -188,13 +205,15 @@ function MoviesPanel() {
         </div>
       )}
 
+      </>}
       {/* Detail modal */}
       {modalItem && (
         <DetailModal
           tmdbId={modalItem.tmdb_id}
           mediaType={modalItem.media_type as any}
-          onClose={() => setModalItem(null)}
+          onClose={closeModal}
           onSelectItem={(item: TmdbItem) => {
+            selectionGeneration.current += 1;
             if (item.tmdb_id) setModalItem({ tmdb_id: item.tmdb_id, media_type: item.media_type, title: item.title });
           }}
         />
@@ -245,13 +264,8 @@ function LibraryPosterCard({ movie, onClick }: { movie: any; onClick: () => void
 
 function SeriesPanel() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const { data, isLoading } = useQuery({
-    queryKey: ['library-series-episodes'],
-    queryFn: () => fetch('/ui/api/library/series-episodes').then(r => {
-      if (!r.ok) throw new Error(`${r.status}`);
-      return r.json();
-    }),
-  });
+  const library = useLibraryRead('series');
+  const data = library.data;
   const { data: session } = useQuery({ queryKey: ['session'], queryFn: api.session });
   const canPlay = !!(session?.user as any)?.webplayer_enabled;
   const traktConnected = !!(session?.user as any)?.trakt_connected;
@@ -273,7 +287,7 @@ function SeriesPanel() {
     [watchedEpsData],
   );
 
-  if (isLoading) return <div className="text-muted">Loading...</div>;
+
   const series: any[] = data?.series || [];
 
   const toggle = (title: string) => {
@@ -286,8 +300,9 @@ function SeriesPanel() {
 
   return (
     <>
-    <div>
-      <p className="text-muted text-sm mb-4">{series.length} series in library</p>
+    <LibraryReadStatus kind="series" library={library} />
+    {data && <div>
+      <p className="text-muted text-sm mb-4">{series.length ? `${series.length} series in library` : 'No series found.'}</p>
       <div className="space-y-1">
         {series.map((s: any) => {
           const isOpen = expanded.has(s.title);
@@ -301,6 +316,7 @@ function SeriesPanel() {
               <button
                 type="button"
                 onClick={() => toggle(s.title)}
+                aria-expanded={isOpen}
                 className="w-full flex items-center justify-between px-4 py-3 text-sm hover:bg-card transition text-left"
               >
                 <span className="font-medium">{s.title}</span>
@@ -389,7 +405,7 @@ function SeriesPanel() {
           );
         })}
       </div>
-    </div>
+    </div>}
 
     {playEp && PlayerModal && (
       <PlayerModal
@@ -403,4 +419,16 @@ function SeriesPanel() {
     )}
     </>
   );
+}
+
+function LibraryReadStatus({ kind, library }: { kind: 'movies' | 'series'; library: ReturnType<typeof useLibraryRead> }) {
+  return <div className="mb-4 space-y-2">
+    {library.isFetching && <p role="status" className="text-sm text-muted">{library.data ? 'Refreshing' : 'Loading'} {kind} library...</p>}
+    {library.isError && <p role="alert" className="text-sm text-red-400">Could not load {kind} library. {library.data ? `Previously loaded ${kind} are shown and may be out of date.` : 'The collection is unavailable, not confirmed empty.'} Refresh to try again.</p>}
+    {!library.isFetching && !library.isError && library.refreshed && <p role="status" className="text-sm text-muted">Library refreshed.</p>}
+    <button type="button" disabled={library.isFetching} onClick={library.refresh}
+      className="min-h-[44px] px-3 py-2 rounded border border-border text-sm text-muted hover:text-white disabled:opacity-50">
+      Refresh {kind} library
+    </button>
+  </div>;
 }
