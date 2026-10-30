@@ -1,6 +1,10 @@
 import importlib.util
+import json
+import stat
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import pytest
 
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "nfo_generator.py"
@@ -8,6 +12,11 @@ _SPEC = importlib.util.spec_from_file_location("nfo_generator_runtime_test", _MO
 nfo_generator = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(nfo_generator)
+
+
+@pytest.fixture(autouse=True)
+def _private_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setattr(nfo_generator, "DB_PATH", str(tmp_path / "requests.db"))
 
 
 def test_movie_nfo_includes_runtime_minutes():
@@ -164,5 +173,94 @@ def test_title_repair_reports_nfos_it_cannot_read(tmp_path, monkeypatch):
 
     result = nfo_generator.repair_tvshow_titles()
 
-    assert result == {"fixed": 0, "skipped": 0, "unreadable": 1}
+    assert result["fixed"] == result["skipped"] == 0
+    assert result["unreadable"] == 1
+    assert result["unreadable_report"]["status"] == "written"
     assert sent == []
+
+
+def test_all_unreadable_nfos_have_private_attribution_without_public_paths(
+        tmp_path, monkeypatch, caplog):
+    paths = [_show(tmp_path, f"Private Show {i}", "Season 01", f"tt{i}") / "tvshow.nfo"
+             for i in range(23)]
+    before = {path: (path.read_bytes(), path.stat()) for path in paths}
+    monkeypatch.setattr(nfo_generator, "MEDIA_PATH", str(tmp_path))
+    monkeypatch.setattr(nfo_generator.db, "get_all_monitored_series", lambda: [])
+    reads = []
+
+    def denied(path):
+        reads.append(path)
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(nfo_generator.ET, "parse", denied)
+    monkeypatch.setattr(nfo_generator, "atomic_write_text",
+                        lambda *args: pytest.fail("Unreadable NFO must not be written"))
+    result = nfo_generator.repair_tvshow_titles()
+    report_dir = tmp_path / ".nfo-diagnostics"
+    report_path = report_dir / result["unreadable_report"]["name"]
+    details = json.loads(report_path.read_text())["unreadable"]
+
+    assert result["unreadable"] == len(details) == len(reads) == 23
+    assert {entry["path"] for entry in details} == {str(path) for path in paths}
+    assert len({entry["path_sha256"] for entry in details}) == 23
+    assert stat.S_IMODE(report_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
+    for entry in details:
+        assert entry["error_class"] == "PermissionError" and entry["errno"] == 13
+        assert entry["metadata"]["uid"] == before[Path(entry["path"])][1].st_uid
+        assert entry["metadata"]["source"] == "lstat"
+        assert entry["path_sha256"] in caplog.text
+    assert "Private Show" not in caplog.text + json.dumps(result)
+    assert str(tmp_path) not in caplog.text + json.dumps(result)
+    for path, (content, metadata) in before.items():
+        assert path.read_bytes() == content
+        assert path.stat().st_ctime_ns == metadata.st_ctime_ns
+
+
+def test_unreadable_metadata_denial_is_explicit_and_does_not_retry(tmp_path, monkeypatch):
+    path = tmp_path / "private" / "tvshow.nfo"
+    calls = []
+
+    def denied_stat(self):
+        calls.append(self)
+        raise PermissionError(13, "private path", str(self))
+
+    monkeypatch.setattr(Path, "lstat", denied_stat)
+    detail = nfo_generator._unreadable_nfo(path, PermissionError(13, "private path"))
+    assert calls == [path]
+    assert "metadata" not in detail
+    assert detail["metadata_error"] == {"error_class": "PermissionError", "errno": 13}
+
+
+@pytest.mark.parametrize("unsafe", ["public", "symlink"])
+def test_private_report_refuses_unsafe_directory_without_changing_it(tmp_path, unsafe):
+    directory = tmp_path / ".nfo-diagnostics"
+    target = tmp_path / "other"
+    if unsafe == "public":
+        directory.mkdir(mode=0o755)
+        directory.chmod(0o755)  # The runner's private umask must not hide this control.
+        before = directory.stat()
+    else:
+        target.mkdir(mode=0o700)
+        directory.symlink_to(target, target_is_directory=True)
+        before = directory.lstat()
+
+    result = nfo_generator._write_unreadable_nfo_report([{"path": "private"}])
+
+    assert result["status"] == "unavailable"
+    assert "private" not in json.dumps(result)
+    assert list(directory.iterdir()) == []
+    assert directory.lstat().st_ctime_ns == before.st_ctime_ns
+
+
+def test_private_report_write_failure_is_sanitized(tmp_path, monkeypatch):
+    real_open = nfo_generator.os.open
+
+    def denied_write(path, flags, *args, **kwargs):
+        if flags & nfo_generator.os.O_WRONLY:
+            raise OSError(28, "Private target /library/Secret Show/tvshow.nfo")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(nfo_generator.os, "open", denied_write)
+    assert nfo_generator._write_unreadable_nfo_report([{"path": "private"}]) == {
+        "status": "unavailable", "error_class": "OSError", "errno": 28}

@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v5.json'
-FIXTURE_SHA='dfbe2f56e8d2b60946b1699363cddfdb8cb5ebc0e9bcb05ff0296d828a921ae9'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v5.json')
-INVENTORY_SHA='013de3c56d9f2f77ab67c375f3365e2f6b55b758809adf052ab27b5c4d5c3437'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v6-nfo.json'
+FIXTURE_SHA='8824555d6d432e731a2725805258d03594635bd625eebdf8944c892e845ae807'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v6-nfo.json')
+INVENTORY_SHA='4a153eb9d4cd6cd52c69c53ed4330827d9982fe711a41546bdfc7299bdebdda0'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -88,13 +88,13 @@ def test_source_inventory_has_actual_unfenced_writers_and_reader_unknowns(case):
     assert all(not x['runtime_authority_complete'] for x in inventory['reader_domains'])
     for item in inventory['audited_python_files']+[pin for x in inventory['writer_groups']+inventory['reader_domains'] for pin in x['source_files']]:
         assert hashlib.sha256((source/item['path']).read_bytes()).hexdigest()==item['sha256']
-    assert len(inventory['audited_python_files'])==110 and len(inventory['static_sink_calls'])==173
+    assert len(inventory['audited_python_files'])==110 and len(inventory['static_sink_calls'])==174
     from tools.source_inventory import sink_calls
     assert inventory['static_sink_calls']==sink_calls(source, [x['path'] for x in inventory['audited_python_files']])
     assert inventory['omitted_runtime_domains']
     for runtime in ['app.py','db.py','processor.py','monitor.py','retry_queue.py','arr_import.py','cleanup.py','identity_repair.py']:
         assert 'import destination_authority' not in (source/runtime).read_text()
-    case['env'][5].update(source_writer_groups=14,source_reader_domains=6,audited_python_files=110,static_sink_calls=173)
+    case['env'][5].update(source_writer_groups=14,source_reader_domains=6,audited_python_files=110,static_sink_calls=174)
 
 
 def test_complete_closed_model_can_CAS_check_but_never_call_effect_adapter(case):
@@ -395,12 +395,23 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
     for item in fixed['reviewed_source_changes']:
         assert item['old_sha256']==integrated_pins[item['path']]
         assert item['new_sha256']==fixed_pins[item['path']]
-    drift={p for p in fixed_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=fixed_pins[p]}
-    assert drift=={'app.py'}
-    assert {x['path'] for x in current['reviewed_source_changes']}==drift
-    assert current['parent_inventory_sha256']==hashlib.sha256(fixed_path.read_bytes()).hexdigest()
-    for item in current['reviewed_source_changes']:
+    startup_path=INVENTORY.with_name('destination-path-inventory-v5.json')
+    startup_model=FIXTURE.with_name('destination-fence-model-v5.json')
+    assert hashlib.sha256(startup_path.read_bytes()).hexdigest()=='013de3c56d9f2f77ab67c375f3365e2f6b55b758809adf052ab27b5c4d5c3437'
+    assert hashlib.sha256(startup_model.read_bytes()).hexdigest()=='dfbe2f56e8d2b60946b1699363cddfdb8cb5ebc0e9bcb05ff0296d828a921ae9'
+    startup=json.loads(startup_path.read_text())
+    startup_pins={x['path']:x['sha256'] for x in startup['audited_python_files']}
+    assert {p for p in fixed_pins if fixed_pins[p]!=startup_pins[p]}=={'app.py'}
+    assert startup['parent_inventory_sha256']==hashlib.sha256(fixed_path.read_bytes()).hexdigest()
+    for item in startup['reviewed_source_changes']:
         assert item['old_sha256']==fixed_pins[item['path']]
+        assert item['new_sha256']==startup_pins[item['path']]
+    drift={p for p in startup_pins if hashlib.sha256((source/p).read_bytes()).hexdigest()!=startup_pins[p]}
+    assert drift=={'nfo_generator.py'}
+    assert {x['path'] for x in current['reviewed_source_changes']}==drift
+    assert current['parent_inventory_sha256']==hashlib.sha256(startup_path.read_bytes()).hexdigest()
+    for item in current['reviewed_source_changes']:
+        assert item['old_sha256']==startup_pins[item['path']]
         assert item['new_sha256']==hashlib.sha256((source/item['path']).read_bytes()).hexdigest()
     assert current['added_audited_paths']==[]
     assert current['runtime_completeness']=='UNPROVED' and not current['source_search_is_completeness_proof']
