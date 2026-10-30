@@ -664,6 +664,7 @@ class DirectSession:
     converting:   bool = False
     conversion_error: str | None = None
     generation_attempts: int = 0
+    retiring:     bool = False
     operation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     started_at:   float = field(default_factory=time.monotonic)
     last_request: float = field(default_factory=time.monotonic)
@@ -690,7 +691,25 @@ _direct_lock = threading.Lock()
 def get_direct_session(token: str, *, owner_id: int | None = None) -> DirectSession | None:
     with _direct_lock:
         session = _direct_sessions.get(token)
-        return session if session and (owner_id is None or session.owner_id == owner_id) else None
+        return session if session and not session.retiring and (owner_id is None or session.owner_id == owner_id) else None
+
+
+def touch_playback(token: str, *, owner_id: int, generation: str | None = None) -> bool:
+    """Renew only a still-published owned playback, serialized with retirement."""
+    with _direct_lock:
+        direct = _direct_sessions.get(token)
+        if direct is None or direct.retiring or direct.owner_id != owner_id:
+            return False
+        with _sessions_lock:
+            session = None
+            if generation is not None:
+                session = _generations.get((token, generation))
+                if session is None or session.owner_id != owner_id:
+                    return False
+            direct.touch()
+            if session is not None:
+                session.touch()
+        return True
 
 
 def _refresh_direct_cdn_url(session: DirectSession) -> None:
@@ -725,7 +744,7 @@ def start_hls_conversion(token: str, *, owner_id: int) -> bool:
     """One conversion per owned playback; competing calls cannot spawn workers."""
     with _direct_lock:
         s = _direct_sessions.get(token)
-        if not s or s.owner_id != owner_id:
+        if not s or s.retiring or s.owner_id != owner_id:
             return False
         if s.converting or get_session(token) is not None:
             return True
@@ -1310,29 +1329,48 @@ def list_subtitles(token: str, *, owner_id: int) -> list[dict]:
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 
 def cleanup_idle_sessions() -> None:
+    """Retire the entire token after its last owned reader becomes idle.
+
+    Keep earlier seek output while any generation is active. The operation lock
+    excludes conversions, seeks and position writes. Failed process/file cleanup
+    leaves an inaccessible retiring record so a later sweep can finish reaping.
+    """
     cutoff = time.monotonic() - SESSION_IDLE_CLEANUP
-
-    with _sessions_lock:
-        stale = [t for t, s in _sessions.items() if s.last_request < cutoff]
-    for token in stale:
-        with _sessions_lock:
-            session = _sessions.pop(token, None)
-        if session:
-            session.proc.terminate()
-            try:
-                session.proc.wait(timeout=5)
-            except Exception:
-                session.proc.kill()
-                try:
-                    session.proc.wait(timeout=2)
-                except Exception:
-                    pass
-            shutil.rmtree(session.tmp_dir, ignore_errors=True)
-            log.info("web_player: cleaned up idle HLS session token=%s", token)
-
     with _direct_lock:
-        stale_direct = [t for t, s in _direct_sessions.items() if s.last_request < cutoff]
-    for token in stale_direct:
-        with _direct_lock:
-            _direct_sessions.pop(token, None)
-        log.info("web_player: cleaned up idle direct session token=%s", token)
+        candidates = list(_direct_sessions.items())
+    for token, direct in candidates:
+        if not direct.operation_lock.acquire(blocking=False):
+            continue
+        try:
+            # Match the registry object and recheck activity after reserving it.
+            # Lock order is the same as conversion and touch_playback.
+            with _direct_lock, _sessions_lock:
+                if _direct_sessions.get(token) is not direct:
+                    continue
+                generations = [s for (t, _), s in _generations.items() if t == token]
+                current = _sessions.get(token)
+                if current is not None and all(current is not s for s in generations):
+                    generations.append(current)
+                latest = max([direct.last_request] + [s.last_request for s in generations])
+                if not direct.retiring and latest >= cutoff:
+                    continue
+                direct.retiring = True
+            # Do not hold global registry locks during process waits or disk I/O.
+            # New requests refuse the retiring owner; its operation stays locked.
+            for session in generations:
+                _stop_process(session.proc)
+            root = PLAYER_TMP_DIR / token
+            if root.exists():
+                shutil.rmtree(root)
+            with _direct_lock, _sessions_lock:
+                if _direct_sessions.get(token) is direct:
+                    _direct_sessions.pop(token)
+                    _sessions.pop(token, None)
+                    for key in [key for key in _generations if key[0] == token]:
+                        _generations.pop(key)
+            log.info("web_player: cleaned up idle playback token=%s", token)
+        except Exception:
+            # Keep evidence/references for a later cleanup sweep, never revive it.
+            log.warning("web_player: idle playback cleanup incomplete token=%s", token)
+        finally:
+            direct.operation_lock.release()
