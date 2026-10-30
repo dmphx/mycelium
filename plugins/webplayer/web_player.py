@@ -967,14 +967,14 @@ def seek_session(token: str, position_s: float, *, owner_id: int) -> dict | None
                 if len(data) <= 8 * 1024 * 1024:
                     (tmp_dir / subtitle.name).write_bytes(data)
         _publish_hls(session, previous)
-        if not list(tmp_dir.glob("sub_*.vtt")):
-            # A seek may precede completion of the first subtitle worker.
-            try:
-                threading.Thread(target=_extract_subtitles,
-                                 args=(previous.cdn_url, previous.file_info.get("subtitle_tracks", []), token, tmp_dir),
-                                 daemon=True).start()
-            except Exception:
-                log.warning("web_player: subtitle worker unavailable token=%s", token)
+        # A published VTT proves completion of that track only. A previous
+        # worker may still be extracting later tracks; finish every missing one.
+        try:
+            threading.Thread(target=_extract_subtitles,
+                             args=(previous.cdn_url, previous.file_info.get("subtitle_tracks", []), token, tmp_dir),
+                             daemon=True).start()
+        except Exception:
+            log.warning("web_player: subtitle worker unavailable token=%s", token)
         return _playback_state(session)
     except ValueError:
         raise
@@ -1266,14 +1266,23 @@ def _extract_subtitles(cdn_url: str, sub_tracks: list,
             continue
         lang = track["language"]
         out  = tmp_dir / f"sub_{track['index']}_{lang}.vtt"
+        if out.is_file() and not out.is_symlink():
+            continue  # Final names are published only after successful extraction.
+        pending = tmp_dir / f".{out.stem}.{uuid.uuid4().hex}.vtt"
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["ffmpeg", "-y", "-i", cdn_url,
-                 "-map", f"0:s:{track['index']}", "-c:s", "webvtt", str(out)],
+                 "-map", f"0:s:{track['index']}", "-c:s", "webvtt", str(pending)],
                 capture_output=True, timeout=120,
             )
+            if result.returncode == 0 and pending.is_file() and not pending.is_symlink():
+                pending.replace(out)
+            else:
+                log.warning("web_player: sub extract failed track=%d", track["index"])
         except Exception:
             log.warning("web_player: sub extract failed track=%d", track["index"])
+        finally:
+            pending.unlink(missing_ok=True)
 
 
 def _subtitles_task(cdn_url: str, file_info: dict,
@@ -1336,12 +1345,14 @@ def _fetch_external_subtitles(imdb_id: str, media_type: str,
         # Write raw file, then let ffmpeg normalise to WebVTT.
         raw_path = tmp_dir / f"sub_ext_{lang}.raw"
         raw_path.write_bytes(resp.content)
+        pending = tmp_dir / f".{vtt_path.stem}.{uuid.uuid4().hex}.vtt"
         try:
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(raw_path), str(vtt_path)],
+                ["ffmpeg", "-y", "-i", str(raw_path), str(pending)],
                 capture_output=True, timeout=30,
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and pending.is_file() and not pending.is_symlink():
+                pending.replace(vtt_path)
                 log.info("web_player: external subtitle saved lang=%s token=%s", lang, tmp_dir.name)
             else:
                 log.warning("web_player: ffmpeg vtt conversion failed lang=%s: %s",
@@ -1349,6 +1360,7 @@ def _fetch_external_subtitles(imdb_id: str, media_type: str,
         except Exception as exc:
             log.warning("web_player: vtt conversion error lang=%s: %s", lang, exc)
         finally:
+            pending.unlink(missing_ok=True)
             raw_path.unlink(missing_ok=True)
 
 

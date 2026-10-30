@@ -8,6 +8,8 @@ import pytest
 
 from plugins.webplayer import web_player as wp
 
+_REAL_EXTRACT_SUBTITLES = wp._extract_subtitles
+
 
 class Process:
     def __init__(self, command, **kwargs):
@@ -301,3 +303,105 @@ def test_seek_does_not_copy_a_subtitle_symlink(playback, tmp_path):
     assert wp.seek_session(direct.token, 10, owner_id=7)
     assert wp.list_subtitles(direct.token, owner_id=7) == []
     assert outside.read_bytes() == b'not a subtitle'
+
+
+def test_seek_during_subtitle_extraction_finishes_every_track(playback, monkeypatch):
+    direct = playback(); wp._do_hls_conversion(direct.token, direct.file_info)
+    old = wp.get_session(direct.token, owner_id=7)
+    tracks = [{'index': i, 'language': lang, 'codec': 'subrip'}
+              for i, lang in enumerate(('eng', 'spa'))]
+    old.file_info['subtitle_tracks'] = tracks
+    monkeypatch.setattr(wp, '_extract_subtitles', _REAL_EXTRACT_SUBTITLES)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    complete = b'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nComplete captions\n'
+
+    def extract(command, **kwargs):
+        output = wp.Path(command[-1]); calls.append(output)
+        if output.parent == old.tmp_dir and command[command.index('-map') + 1] == '0:s:0':
+            output.write_bytes(b'WEBVTT\n\nPartial')
+            entered.set()
+            assert release.wait(5)
+        output.write_bytes(complete)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(wp.subprocess, 'run', extract)
+    worker = threading.Thread(target=_REAL_EXTRACT_SUBTITLES,
+        args=(old.cdn_url, tracks, direct.token, old.tmp_dir))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        # In-progress output must not be listed or copied as a complete track.
+        assert wp.list_subtitles(direct.token, owner_id=7) == []
+        assert wp.seek_session(direct.token, 10, owner_id=7)
+        new = wp.get_session(direct.token, owner_id=7)
+        assert (new.tmp_dir / 'sub_0_eng.vtt').read_bytes() == complete
+        assert (new.tmp_dir / 'sub_1_spa.vtt').read_bytes() == complete
+        assert len([p for p in calls if p.parent == new.tmp_dir]) == 2
+        count = len(calls)
+        assert wp.seek_session(direct.token, 20, owner_id=7)
+        assert len(calls) == count  # Published tracks are carried, not re-extracted.
+        assert len(wp.list_subtitles(direct.token, owner_id=7)) == 2
+    finally:
+        release.set(); worker.join(5)
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize('fault', ['nonzero', 'timeout'])
+def test_failed_subtitle_extraction_never_publishes_partial_track(tmp_path, monkeypatch, fault):
+    def extract(command, **kwargs):
+        wp.Path(command[-1]).write_bytes(b'WEBVTT\n\nPartial')
+        if fault == 'timeout':
+            raise subprocess.TimeoutExpired('synthetic ffmpeg', 120)
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(wp.subprocess, 'run', extract)
+    _REAL_EXTRACT_SUBTITLES('https://synthetic.invalid/not-requested',
+        [{'index': 0, 'language': 'eng', 'codec': 'subrip'}], 'synthetic', tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_seek_with_one_finished_track_extracts_the_remaining_track(playback, monkeypatch):
+    direct = playback(); wp._do_hls_conversion(direct.token, direct.file_info)
+    old = wp.get_session(direct.token, owner_id=7)
+    old.file_info['subtitle_tracks'] = [
+        {'index': i, 'language': lang, 'codec': 'subrip'}
+        for i, lang in enumerate(('eng', 'spa'))]
+    ready = b'WEBVTT\n\nFinished English captions\n'
+    (old.tmp_dir / 'sub_0_eng.vtt').write_bytes(ready)
+    calls = []
+    def extract(command, **kwargs):
+        calls.append(command[command.index('-map') + 1])
+        wp.Path(command[-1]).write_bytes(b'WEBVTT\n\nFinished Spanish captions\n')
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(wp.subprocess, 'run', extract)
+    monkeypatch.setattr(wp, '_extract_subtitles', _REAL_EXTRACT_SUBTITLES)
+    assert wp.seek_session(direct.token, 10, owner_id=7)
+    new = wp.get_session(direct.token, owner_id=7)
+    assert calls == ['0:s:1']
+    assert (new.tmp_dir / 'sub_0_eng.vtt').read_bytes() == ready
+    assert len(wp.list_subtitles(direct.token, owner_id=7)) == 2
+
+
+@pytest.mark.parametrize('outcome', ['success', 'nonzero', 'timeout'])
+def test_external_subtitle_publication_is_complete_or_absent(tmp_path, monkeypatch, outcome):
+    monkeypatch.setattr(wp._settings, 'get', lambda key, *args:
+        {'OPENSUBTITLES_API_KEY': 'synthetic', 'OPENSUBTITLES_LANGUAGES': ['eng']}.get(key))
+    monkeypatch.setattr(wp._subtitles, '_search', lambda *args:
+        [{'attributes': {'files': [{'file_id': 42}]}}])
+    monkeypatch.setattr(wp._subtitles, '_request_download_url', lambda *args:
+        'https://synthetic.invalid/not-requested')
+    monkeypatch.setattr(wp.req_lib, 'get', lambda *args, **kwargs:
+        SimpleNamespace(content=b'Synthetic raw captions', raise_for_status=lambda: None))
+    final = tmp_path / 'sub_ext_eng.vtt'
+    def convert(command, **kwargs):
+        pending = wp.Path(command[-1]); pending.write_bytes(b'WEBVTT\n\nComplete\n')
+        assert not final.exists()
+        assert not list(tmp_path.glob('sub_*.vtt'))
+        if outcome == 'timeout':
+            raise subprocess.TimeoutExpired('synthetic ffmpeg', 30)
+        return SimpleNamespace(returncode=0 if outcome == 'success' else 1, stderr=b'')
+    monkeypatch.setattr(wp.subprocess, 'run', convert)
+    wp._fetch_external_subtitles('tt1234567', 'movie', None, None, tmp_path)
+    assert list(tmp_path.iterdir()) == ([final] if outcome == 'success' else [])
+    if outcome == 'success':
+        assert final.read_bytes() == b'WEBVTT\n\nComplete\n'
