@@ -8,9 +8,14 @@ posters without guessing from the folder name.  When multiple folders exist
 for the same series (different torrent sources), writing the same IMDb ID in
 all tvshow.nfo files allows Jellyfin to merge them into a single library entry.
 """
+import hashlib
+import json
 import logging
+import os
 import re
+import stat
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from xml.sax.saxutils import escape as _stdlib_xml_escape
@@ -19,7 +24,7 @@ import requests as _requests
 
 import db
 import tmdb
-from config import MEDIA_PATH
+from config import DB_PATH, MEDIA_PATH
 from io_utils import atomic_write_text
 
 _IMAGE_BASE_POSTER = "https://image.tmdb.org/t/p/w500"
@@ -224,6 +229,58 @@ def _tvshow_nfo(title: str, imdb_id: str) -> str:
 _BAD_TITLE_RE = re.compile(r'^Season\s+\d+$', re.IGNORECASE)
 
 
+def _unreadable_nfo(path: Path, exc: PermissionError) -> dict:
+    """Attribute a failed read without retrying content or guessing ownership."""
+    detail = {"path": str(path),
+              "path_sha256": hashlib.sha256(os.fsencode(path)).hexdigest(),
+              "error_class": type(exc).__name__, "errno": exc.errno}
+    try:
+        metadata = path.lstat()
+        detail["metadata"] = {"source": "lstat", "uid": metadata.st_uid,
+                              "gid": metadata.st_gid,
+                              "mode": oct(stat.S_IMODE(metadata.st_mode)),
+                              "symlink": stat.S_ISLNK(metadata.st_mode)}
+    except OSError as error:
+        detail["metadata_error"] = {"error_class": type(error).__name__,
+                                    "errno": error.errno}
+    return detail
+
+
+def _write_unreadable_nfo_report(details: list[dict]) -> dict:
+    """Keep full paths only in a private local report next to the database.
+
+    Existing directories must already be private and owned by this process.
+    Never change permissions or follow a substituted diagnostics symlink.
+    Reports are retained for operator review; no library files are changed.
+    """
+    directory = Path(DB_PATH).parent / ".nfo-diagnostics"
+    dir_fd = None
+    name = "title-repair-" + uuid.uuid4().hex + ".json"
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        metadata = os.fstat(dir_fd)
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise PermissionError(13, "Diagnostics directory is not private")
+        fd = os.open(name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=dir_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as report:
+            json.dump({"operation": "repair_tvshow_titles", "unreadable": details}, report)
+            report.write("\n")
+            report.flush()
+            os.fsync(report.fileno())
+        os.replace(name + ".tmp", name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+        return {"status": "written", "name": name}
+    except OSError as error:
+        # Exception strings can contain private paths, so expose only type/errno.
+        return {"status": "unavailable", "error_class": type(error).__name__,
+                "errno": error.errno}
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
 def repair_tvshow_titles() -> dict:
     """Rewrite tvshow.nfo files whose title is 'Season XX' instead of the real show name.
 
@@ -244,7 +301,7 @@ def repair_tvshow_titles() -> dict:
 
     fixed = skipped = 0
     repaired: list[Path] = []
-    unreadable: list[str] = []
+    unreadable: list[dict] = []
     for folder in sorted(series_dir.iterdir()):
         if not folder.is_dir():
             continue
@@ -253,8 +310,11 @@ def repair_tvshow_titles() -> dict:
             continue
         try:
             root = ET.parse(nfo_path).getroot()
-        except PermissionError:
-            unreadable.append(folder.name)
+        except PermissionError as exc:
+            detail = _unreadable_nfo(nfo_path, exc)
+            unreadable.append(detail)
+            log.warning("NFO read failure: %s", json.dumps(
+                {key: value for key, value in detail.items() if key != "path"}, sort_keys=True))
             continue
         except Exception:
             continue
@@ -284,10 +344,11 @@ def repair_tvshow_titles() -> dict:
             log.warning("NFO repair: could not write %s: %s", nfo_path, exc)
             skipped += 1
 
+    private_report = None
     if unreadable:
-        log.warning("NFO repair: %d tvshow.nfo file(s) could not be read, so their titles "
-                    "were not checked (owned by another user?): %s",
-                    len(unreadable), ", ".join(unreadable[:20]))
+        private_report = _write_unreadable_nfo_report(unreadable)
+        log.warning("NFO repair unreadable summary: %s", json.dumps(
+            {"count": len(unreadable), "private_report": private_report}, sort_keys=True))
     if repaired:
         try:
             import media_servers
@@ -296,7 +357,10 @@ def repair_tvshow_titles() -> dict:
             log.warning("NFO repair: could not ask Jellyfin to re-read %d show(s): %s",
                         len(repaired), exc)
     log.info("NFO repair complete: %d fixed, %d skipped", fixed, skipped)
-    return {"fixed": fixed, "skipped": skipped, "unreadable": len(unreadable)}
+    result = {"fixed": fixed, "skipped": skipped, "unreadable": len(unreadable)}
+    if private_report is not None:
+        result["unreadable_report"] = private_report
+    return result
 
 
 def _read_imdb_from_nfo(nfo_path: Path) -> str | None:
