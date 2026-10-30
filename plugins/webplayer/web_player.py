@@ -957,7 +957,24 @@ def seek_session(token: str, position_s: float, *, owner_id: int) -> dict | None
         _stop_process(previous.proc)
         session = _start_hls(token, previous.cdn_url, previous.file_info, tmp_dir,
                              seek_offset=float(position_s))
+        # WebVTT timestamps use the original media timeline. Preserve them
+        # unchanged under the new generation URL, including external tracks.
+        for subtitle in previous.tmp_dir.glob("sub_*.vtt"):
+            if (re.fullmatch(r"sub_[a-zA-Z0-9_]+[.]vtt", subtitle.name)
+                    and subtitle.is_file() and not subtitle.is_symlink()):
+                with subtitle.open("rb") as source:
+                    data = source.read(8 * 1024 * 1024 + 1)
+                if len(data) <= 8 * 1024 * 1024:
+                    (tmp_dir / subtitle.name).write_bytes(data)
         _publish_hls(session, previous)
+        if not list(tmp_dir.glob("sub_*.vtt")):
+            # A seek may precede completion of the first subtitle worker.
+            try:
+                threading.Thread(target=_extract_subtitles,
+                                 args=(previous.cdn_url, previous.file_info.get("subtitle_tracks", []), token, tmp_dir),
+                                 daemon=True).start()
+            except Exception:
+                log.warning("web_player: subtitle worker unavailable token=%s", token)
         return _playback_state(session)
     except ValueError:
         raise
@@ -1209,9 +1226,35 @@ def _wait_segments_pattern(tmp_dir: Path, pattern: str, count: int, timeout: flo
                 return False
             if rc == 0:
                 time.sleep(0.2)
-                return len(list(tmp_dir.glob(pattern))) >= count
+                return _completed_hls_pattern(tmp_dir, pattern)
         time.sleep(0.5)
     return False
+
+
+def _completed_hls_pattern(tmp_dir: Path, pattern: str) -> bool:
+    """A successful finite tail may have fewer segments than the live buffer.
+
+    Require the closed media playlist and every referenced local segment.
+    Running/failed encoders and empty or incomplete playlists never qualify.
+    """
+    if pattern == "seg*.ts":
+        name = "playlist.m3u8"
+    elif pattern == "seg_v*.ts":
+        name = "video.m3u8"
+    else:
+        audio = re.fullmatch(r"seg_a([0-9]+)_\*[.]ts", pattern)
+        if audio is None:
+            return False
+        name = f"audio_{audio[1]}.m3u8"
+    playlist = tmp_dir / name
+    if not playlist.is_file() or playlist.is_symlink() or playlist.stat().st_size > 1048576:
+        return False
+    lines = playlist.read_text().splitlines()
+    if "#EXT-X-ENDLIST" not in lines:
+        return False
+    segments = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+    available = {p.name for p in tmp_dir.glob(pattern) if p.is_file() and not p.is_symlink() and p.stat().st_size > 0}
+    return bool(segments) and all(segment in available for segment in segments)
 
 
 # ── Subtitles ──────────────────────────────────────────────────────────────────

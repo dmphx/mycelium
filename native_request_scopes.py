@@ -21,6 +21,23 @@ CREATE TRIGGER IF NOT EXISTS native_request_scopes_immutable_update
 CREATE TRIGGER IF NOT EXISTS native_request_scopes_immutable_delete
  BEFORE DELETE ON native_request_scopes BEGIN SELECT RAISE(ABORT,'immutable native scope'); END;
 ''')
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_requests'").fetchone():
+        # Scope contents stay immutable while their request exists. Account
+        # deletion already cascades requests; retire their snapshots in that
+        # same statement, before SQLite checks the remaining foreign keys.
+        # Replace the original unconditional guard atomically for existing DBs.
+        conn.executescript('''
+BEGIN IMMEDIATE;
+DROP TRIGGER native_request_scopes_immutable_delete;
+CREATE TRIGGER native_request_scopes_immutable_delete
+ BEFORE DELETE ON native_request_scopes
+ WHEN EXISTS (SELECT 1 FROM user_requests WHERE id=OLD.request_id)
+ BEGIN SELECT RAISE(ABORT,'immutable native scope'); END;
+CREATE TRIGGER IF NOT EXISTS native_request_scopes_parent_delete
+ AFTER DELETE ON user_requests
+ BEGIN DELETE FROM native_request_scopes WHERE request_id=OLD.id; END;
+COMMIT;
+''')
 
 
 def utc_today():

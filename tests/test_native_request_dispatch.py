@@ -279,3 +279,66 @@ with db._connect() as conn:
 Path(os.environ['RESULT']).write_text(json.dumps({'scenario':scenario,'origins':{'app':real.__file__,'db':db.__file__,'dispatch':dispatch.__file__},'HTTP':{'POST':post.status_code,'review_or_auto':response.status_code,'repeat_review':repeat.status_code,'retry':retry.status_code},'request_id':rid,'native_owner':uid,'review_status':history['status'],'first_dispatch':first,'final_dispatch':history['request_dispatch'],'scope_before':expected,'scope_after':history['request_scope'],'scope_sha256_before':before['scope_sha256'],'scope_sha256_after':after['scope_sha256'],'captured_before_POST_body_sha256':before_raw_sha,'stored_body_sha256_before':before['raw_body_sha256'],'stored_body_sha256_after':after['raw_body_sha256'],'dispatcher_calls':len(calls),'captured_dispatch':calls,'synthetic_handoff_markers':len(accepted),'real_executor_provider_monitor_executed':False},indent=2)+'\n')
 print('NATIVE_DISPATCH_BOUNDARY_PASS')
 '''
+
+@pytest.mark.parametrize('approved', [False, True])
+def test_account_deletion_retires_native_scope_and_dispatch_with_its_parent(fresh, approved):
+    db, uid, rid = fresh
+    # Another owner and immutable snapshots must remain untouched.
+    other = db.create_user('other-native-owner', 'fixture$disabled')
+    other_rid = db.create_user_request(other, 'tt2000102', 102, 'tv', 'Other',
+        status='approved', request_scope={'kind': 'all_seasons'}, raw_body_sha256='b'*64)
+    if not approved:
+        with db._connect() as conn:
+            conn.execute('DELETE FROM native_request_dispatch WHERE request_id=?', (rid,))
+            conn.execute("UPDATE user_requests SET status='pending' WHERE id=?", (rid,))
+    with db._connect() as conn:
+        before = tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (other_rid,)).fetchone())
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute('DELETE FROM native_request_scopes WHERE request_id=?', (rid,))
+    db.delete_user(uid)
+    assert db.get_user(uid) is None
+    with db._connect() as conn:
+        for table in ('user_requests', 'native_request_scopes', 'native_request_dispatch'):
+            key = 'id' if table == 'user_requests' else 'request_id'
+            assert conn.execute(f'SELECT count(*) FROM {table} WHERE {key}=?', (rid,)).fetchone()[0] == 0
+        assert tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (other_rid,)).fetchone()) == before
+        assert not list(conn.execute('PRAGMA foreign_key_check'))
+
+
+def test_native_retirement_upgrade_preserves_records_and_is_idempotent(fresh):
+    import native_request_scopes as scopes
+    db, uid, rid = fresh
+    with db._connect() as conn:
+        before = tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (rid,)).fetchone())
+        conn.executescript('''
+DROP TRIGGER native_request_scopes_parent_delete;
+DROP TRIGGER native_request_dispatch_parent_delete;
+DROP TRIGGER native_request_scopes_immutable_delete;
+CREATE TRIGGER native_request_scopes_immutable_delete BEFORE DELETE ON native_request_scopes
+ BEGIN SELECT RAISE(ABORT,'immutable native scope'); END;
+''')
+        for _ in range(2):
+            scopes.init_schema(conn)
+            dispatch.init_schema(conn)
+        assert tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (rid,)).fetchone()) == before
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute('UPDATE native_request_scopes SET scope_json=? WHERE request_id=?', ('{}', rid))
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute('DELETE FROM native_request_scopes WHERE request_id=?', (rid,))
+    db.delete_user(uid)
+    assert db.get_user(uid) is None
+
+
+def test_failed_parent_deletion_rolls_back_scope_and_dispatch_retirement(fresh):
+    db, uid, rid = fresh
+    with db._connect() as conn:
+        before = tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (rid,)).fetchone())
+        before_dispatch = state(db, rid)
+        conn.execute('CREATE TABLE synthetic_retained_owner (user_id INTEGER REFERENCES users(id))')
+        conn.execute('INSERT INTO synthetic_retained_owner VALUES (?)', (uid,))
+    with pytest.raises(sqlite3.IntegrityError):db.delete_user(uid)
+    assert db.get_user(uid) is not None
+    with db._connect() as conn:
+        assert tuple(conn.execute('SELECT * FROM native_request_scopes WHERE request_id=?', (rid,)).fetchone()) == before
+        assert state(db, rid) == before_dispatch
+        assert not list(conn.execute('PRAGMA foreign_key_check'))
