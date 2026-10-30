@@ -1,0 +1,1820 @@
+{
+  "schema_version": 1,
+  "baseline_source_manifest_sha256": "e2d4de04ff5563173b10d4db21f703fc958faf05b2cfc14e7882218c5ad9ac6d",
+  "writer_groups": [
+    {
+      "id": "native_and_compat_dispatch",
+      "source_files": [
+        {
+          "path": "app.py",
+          "sha256": "3768f0b7a007c97322905465cbde02a3f7d06df554e1de08bb5c1947a4fd75cb"
+        },
+        {
+          "path": "seerr_compat.py",
+          "sha256": "c3b1107d03999b24e114a997da779e8bda7088e992a68c10e08d3e965952be70"
+        }
+      ],
+      "finding": "Native approval/webhook/admin retry routes enqueue processor calls; dispatch bookkeeping is not a shared destination fence.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "processor",
+      "source_files": [
+        {
+          "path": "processor.py",
+          "sha256": "5ed348988a0d45d3e0a3fd7e0b72ecb419f6cd469449b4850091b0cf012eaaac"
+        },
+        {
+          "path": "locks.py",
+          "sha256": "ada8b64687869fc00b736b48f2837bd64293813d00a148ce4a03ebc8056384e1"
+        }
+      ],
+      "finding": "Process-local IMDb mutex and legacy output/monitor writes lack request/destination durable fencing.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "retry",
+      "source_files": [
+        {
+          "path": "retry_queue.py",
+          "sha256": "d341468859c897cb2abb78a804105a1e74442853e5c067da072764290a1a76ab"
+        },
+        {
+          "path": "request_intents.py",
+          "sha256": "9347afe68aea8ae41a37e366c256ca22bd551fed7683ff342b232a8002dfc9e3"
+        }
+      ],
+      "finding": "Legacy retry reconstructs MediaRequest without original native owner/scope generation. Intent outbox is a separate lease, not all-writer coverage.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "monitor_metadata",
+      "source_files": [
+        {
+          "path": "monitor.py",
+          "sha256": "33e8283853601ba1b2a6965e6e2aa77ac01f415ddb528bdc9018d9791f59cc23"
+        },
+        {
+          "path": "db.py",
+          "sha256": "bdec8ede2d061ead8e7a423bbd023077d1cc52d6d20295294a203f11b7e5cfd8"
+        }
+      ],
+      "finding": "IMDb-keyed upsert and metadata refresh can change seasons independently of exact native request.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "arr_import",
+      "source_files": [
+        {
+          "path": "arr_import.py",
+          "sha256": "742fe303c4971eebe7fbadf3e404401a70bd4d340d1904f78d807fb9d97cd9d0"
+        }
+      ],
+      "finding": "Radarr processor and Sonarr unconditional monitor import paths.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "library_import",
+      "source_files": [
+        {
+          "path": "library_sync.py",
+          "sha256": "4cb7e3a436431664fff66f92374009147c251adb523f12603208f4c1beb43dc3"
+        }
+      ],
+      "finding": "Existing library import, monitor upserts and duplicate-folder cleanup.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "automation",
+      "source_files": [
+        {
+          "path": "trending.py",
+          "sha256": "f218503e525a37b9dc1f38f4185e1e78b239cee6527bbfaabd8a99b00f6616a2"
+        },
+        {
+          "path": "auto_approve.py",
+          "sha256": "936cfb8c3a43e51a1267ccea114f09fd307fc3ce0c2685136e8684e712bcacf0"
+        },
+        {
+          "path": "mdblist.py",
+          "sha256": "778623b6087b8d4891cdc4eabd7110d7cf6f82787264fe38a88599479e4b1f7e"
+        }
+      ],
+      "finding": "Automation can enqueue independent processor/monitor work.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "strm_stub_cache",
+      "source_files": [
+        {
+          "path": "strm_generator.py",
+          "sha256": "4cc9fb1cc8abfa3b8788793a15ad3a4739a38e6a1f36d3de7fc4aa1c3d41d744"
+        },
+        {
+          "path": "catbox.py",
+          "sha256": "199e65ff478b18ebbb69111f6a11549d2dd2b8bee83a8fc7a4e5a97d9d0718e8"
+        },
+        {
+          "path": "mp4_faststart.py",
+          "sha256": "dc1989d8bbcdba0e483ae539fde42430c5e96550d9ff0ce78ee3db6649023867"
+        },
+        {
+          "path": "spore_readthrough.py",
+          "sha256": "f1f670acfae56e9d8c739dadca51f499adebd7d16ce3c4968628ce3778707e85"
+        },
+        {
+          "path": "io_utils.py",
+          "sha256": "75258e1b7fc36f35177740401e6068bb329070a9b145fe1ffcdc20568c48cef9"
+        }
+      ],
+      "finding": "STRM/NFO/MKV/minfo/cache writes, repair/rename/duplicate cleanup and per-title process-local locks.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "cleanup_repair",
+      "source_files": [
+        {
+          "path": "cleanup.py",
+          "sha256": "960fe9053314e23fae0b3786b0b21228900c25148e41ec4e8fd6e243a48bc472"
+        },
+        {
+          "path": "maintenance.py",
+          "sha256": "f394b9fa16cb0f523079399f37ab60bfb1c3e0d2c491e99e29836bc2d9bf152f"
+        }
+      ],
+      "finding": "Repair, merge, deletion and maintenance task summaries do not prove all-writer fencing.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "upgrade_pack",
+      "source_files": [
+        {
+          "path": "upgrader.py",
+          "sha256": "1970c37ea581d14baf873ddd990d483e8070e365113fc9f1fb46902d339f68f9"
+        }
+      ],
+      "finding": "Quality upgrades and season pack consolidation replace or remove outputs.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "identity_reidentify",
+      "source_files": [
+        {
+          "path": "identity_repair.py",
+          "sha256": "47b426554df97002f30d9eb9b5f0bd5d30005685209d4b43155efab81413e14a"
+        },
+        {
+          "path": "scripts/reidentify_series.py",
+          "sha256": "88de071f8ab0e5a53cd8ae7dceba7dac63c5b1511e6d88b743b5c379ee1eb2ac"
+        },
+        {
+          "path": "episode_scheme.py",
+          "sha256": "ea6a04e8b45857a6dc91482fd60649bf404bb076699b7f1c51332f7231f53e8b"
+        }
+      ],
+      "finding": "Identity metadata repair and explicit path move/repoint/rollback tool. Hotfix episode numbering reconciliation also moves/quarantines paths; it has no shared destination fence.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "enrichment",
+      "source_files": [
+        {
+          "path": "enrichment.py",
+          "sha256": "401931d986304ff797f28595be1a27be145400299aa10f57162d07f744d42c01"
+        },
+        {
+          "path": "scripts/rebuild_enrichment_queue.py",
+          "sha256": "86ccc8d57ff3353a42882d26031659d79f1d289c642fa00087c4d62b35b68411"
+        }
+      ],
+      "finding": "Staged media, overlay/restore, queue rebuild, analysis and cleanup are distinct writer paths.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "nfo_metadata",
+      "source_files": [
+        {
+          "path": "nfo_generator.py",
+          "sha256": "63f095ebdb9335578099d44eb5ce41930f751974ead8cb6e667c68ecb10d772a"
+        }
+      ],
+      "finding": "Metadata generation/backfill and TV title repair write sidecar files.",
+      "runtime_fenced": false
+    },
+    {
+      "id": "webplayer_generation",
+      "source_files": [
+        {
+          "path": "plugins/webplayer/web_player.py",
+          "sha256": "095095c333a4f2b85e4669f84b4a1fd83213dc3a2040e063401f60faee179c8e"
+        }
+      ],
+      "finding": "Generation/HLS/subtitle writes and idle session cleanup; old generations do not establish reader absence.",
+      "runtime_fenced": false
+    }
+  ],
+  "reader_domains": [
+    {
+      "id": "bearer_stream",
+      "gap": "Token stream/proxy and downstream cached materialized URLs are not an authoritative complete reader registry.",
+      "source_files": [
+        {
+          "path": "app.py",
+          "sha256": "3768f0b7a007c97322905465cbde02a3f7d06df554e1de08bb5c1947a4fd75cb"
+        },
+        {
+          "path": "catbox.py",
+          "sha256": "199e65ff478b18ebbb69111f6a11549d2dd2b8bee83a8fc7a4e5a97d9d0718e8"
+        }
+      ],
+      "runtime_authority_complete": false
+    },
+    {
+      "id": "nfs_external_handles",
+      "gap": "NFS Open/Read/Stat and downstream Plex handles are outside the Python model. No durable all-reader generation lease shown.",
+      "source_files": [
+        {
+          "path": "spore-nfs/main.go",
+          "sha256": "5ccf595f305bce259be293bc15716ced2a8578d345307d4cc4939918d585eb15"
+        }
+      ],
+      "runtime_authority_complete": false
+    },
+    {
+      "id": "external_servers_indexers",
+      "gap": "Plex session/recent-play observations cover known inputs only; Jellyfin, scanners, paused/offline players and open file handles cannot be inferred absent.",
+      "source_files": [
+        {
+          "path": "playback_guard.py",
+          "sha256": "6bdeb27934e8c066e7fd217cecfdf80608a13813361b8bc543e1f89c4426cbc3"
+        },
+        {
+          "path": "enrichment.py",
+          "sha256": "401931d986304ff797f28595be1a27be145400299aa10f57162d07f744d42c01"
+        }
+      ],
+      "runtime_authority_complete": false
+    },
+    {
+      "id": "webplayer_sessions",
+      "gap": "Owned session/generation access exists, but last_request idle cleanup and process-local dictionaries are not authoritative complete reader fencing.",
+      "source_files": [
+        {
+          "path": "plugins/webplayer/web_player.py",
+          "sha256": "095095c333a4f2b85e4669f84b4a1fd83213dc3a2040e063401f60faee179c8e"
+        },
+        {
+          "path": "plugins/webplayer/routes.py",
+          "sha256": "93faf3b9424ccb15c7dd12f9c02468626633d9d42a8ef16132dbd8e1032d49f4"
+        }
+      ],
+      "runtime_authority_complete": false
+    },
+    {
+      "id": "proxy_cache_range",
+      "gap": "Range/cache and staged-file readers require source identity, live handle and generation coverage across replacement.",
+      "source_files": [
+        {
+          "path": "mp4_faststart.py",
+          "sha256": "dc1989d8bbcdba0e483ae539fde42430c5e96550d9ff0ce78ee3db6649023867"
+        },
+        {
+          "path": "spore_readthrough.py",
+          "sha256": "f1f670acfae56e9d8c739dadca51f499adebd7d16ce3c4968628ce3778707e85"
+        },
+        {
+          "path": "enrichment.py",
+          "sha256": "401931d986304ff797f28595be1a27be145400299aa10f57162d07f744d42c01"
+        }
+      ],
+      "runtime_authority_complete": false
+    },
+    {
+      "id": "external_bearer_or_tools",
+      "gap": "External transcoder/tool invocations, copied URLs and omitted deployment/runtime processes are unknown; cannot enumerate by source search alone.",
+      "source_files": [
+        {
+          "path": "spore/plex_transcoder_wrapper.sh",
+          "sha256": "056c366228cea6cb74f1415c13d55e92facae2d25c526b8151b289ac6cc1d807"
+        }
+      ],
+      "runtime_authority_complete": false
+    }
+  ],
+  "audited_python_files": [
+    {
+      "path": "app.py",
+      "sha256": "3768f0b7a007c97322905465cbde02a3f7d06df554e1de08bb5c1947a4fd75cb"
+    },
+    {
+      "path": "app_cache.py",
+      "sha256": "c60773bb9339c3cf19ff959a3ac10de534b65982982ac39efcd447c4dcc97454"
+    },
+    {
+      "path": "arr_import.py",
+      "sha256": "742fe303c4971eebe7fbadf3e404401a70bd4d340d1904f78d807fb9d97cd9d0"
+    },
+    {
+      "path": "auth.py",
+      "sha256": "69b0c09c2d446e2ea76149bb819dd7dc31d090dd29ec33b15318c55099a65a7a"
+    },
+    {
+      "path": "auto_approve.py",
+      "sha256": "936cfb8c3a43e51a1267ccea114f09fd307fc3ce0c2685136e8684e712bcacf0"
+    },
+    {
+      "path": "backup.py",
+      "sha256": "8c24a230d16c6c7b9112d83fdae4d7d5172076ebdac9156fff75c36941f1ed89"
+    },
+    {
+      "path": "blacklist.py",
+      "sha256": "53f498fffbfc28e7533e85518cd9f418141a9feec9206b9563a43acf8acadd89"
+    },
+    {
+      "path": "catbox.py",
+      "sha256": "199e65ff478b18ebbb69111f6a11549d2dd2b8bee83a8fc7a4e5a97d9d0718e8"
+    },
+    {
+      "path": "catchup.py",
+      "sha256": "96daa505e926b2793fb6378bae306b30d43b5b06f4718c102e6c93feead0560b"
+    },
+    {
+      "path": "cleanup.py",
+      "sha256": "960fe9053314e23fae0b3786b0b21228900c25148e41ec4e8fd6e243a48bc472"
+    },
+    {
+      "path": "config.py",
+      "sha256": "eefdb15efc99489afa3e794c9610f92aa46d17796dff1057d8fcfa4d038cefdd"
+    },
+    {
+      "path": "configure.py",
+      "sha256": "62cba3cc773c2a1b08eae4e484d9d3824a5459888a957ba6a2d39e889652f092"
+    },
+    {
+      "path": "continue_watching.py",
+      "sha256": "a467512926e405b1915e3d1629d4f651c4d1e817f555f6a02161ceba5b100354"
+    },
+    {
+      "path": "db.py",
+      "sha256": "bdec8ede2d061ead8e7a423bbd023077d1cc52d6d20295294a203f11b7e5cfd8"
+    },
+    {
+      "path": "debrid.py",
+      "sha256": "38418a5bd1986187a000869745cbf5fa8e8c2293b826a22cfecb2977b7357ed6"
+    },
+    {
+      "path": "discord_integration.py",
+      "sha256": "d9f20405e0f6cc766b78ac1510b7175bd7e5fc942886798966fa7ca075520a04"
+    },
+    {
+      "path": "enrichment.py",
+      "sha256": "401931d986304ff797f28595be1a27be145400299aa10f57162d07f744d42c01"
+    },
+    {
+      "path": "episode_scheme.py",
+      "sha256": "ea6a04e8b45857a6dc91482fd60649bf404bb076699b7f1c51332f7231f53e8b"
+    },
+    {
+      "path": "health.py",
+      "sha256": "6feb7003653ee85695aa7fc1f23b673cfc26bde702ca6306f73a3e4aee4c3173"
+    },
+    {
+      "path": "health_cache.py",
+      "sha256": "31588be6b924f2cae4f7117b011638d620400b09414a58f151d366c17a3d22aa"
+    },
+    {
+      "path": "identity_repair.py",
+      "sha256": "47b426554df97002f30d9eb9b5f0bd5d30005685209d4b43155efab81413e14a"
+    },
+    {
+      "path": "indexer_backoff.py",
+      "sha256": "b96196fdc44ec205886942b4698f732c6708b288124bee3e57dd694d914746fc"
+    },
+    {
+      "path": "integration_api.py",
+      "sha256": "9daae05c42ca542c0c82a82c19568e37f597bb4ba0e65fc625cf4dc81a53da34"
+    },
+    {
+      "path": "integration_auth.py",
+      "sha256": "11653bb9a708ed7dcb58c0c129077f82e10ce5de3befb869c8e310c11a66c4ae"
+    },
+    {
+      "path": "integration_catalog.py",
+      "sha256": "f0aaa2baf67a08b775a94c0009ea8a32dc8c5ba53cc514f012dfc886e73e33b4"
+    },
+    {
+      "path": "integration_catalog_service.py",
+      "sha256": "15c113ebce00a476da068996d931276f14e395a4ae9801d297cc4e0768418c8f"
+    },
+    {
+      "path": "integration_personalization.py",
+      "sha256": "aa9cf5199855d2e0d2a0d15fe7918d15f5274237397f09cc337253dbc68f82a1"
+    },
+    {
+      "path": "integration_watchlist_overlay.py",
+      "sha256": "b5dceae91bc7c975087d0a9c1f9a053e0598c1200ca3a45e4542e9a9677b42d6"
+    },
+    {
+      "path": "integration_watchlist_service.py",
+      "sha256": "76cd948e8a71fee73f6a5075298841f2aca08a865db2a4e36df9132361e4d94d"
+    },
+    {
+      "path": "intent_metadata.py",
+      "sha256": "13524e32253bbe3fa6709dff97c8156afdebffaa718b53ef77943e7e14dd9609"
+    },
+    {
+      "path": "intent_snapshots.py",
+      "sha256": "dd6c2fbc2899a283ab421c480e2669fbc878a904d2d10866c690ca77f8dc5ffd"
+    },
+    {
+      "path": "io_utils.py",
+      "sha256": "75258e1b7fc36f35177740401e6068bb329070a9b145fe1ffcdc20568c48cef9"
+    },
+    {
+      "path": "jellyfin.py",
+      "sha256": "469aee6794089015ace1b5d6802bbaf86f85df35c818cdf6d72bd1f8ffef15d7"
+    },
+    {
+      "path": "jellyfin_login.py",
+      "sha256": "a3c3894ad3f243e8fb1ba9367215e915df139f2490544b9b9d4620187b4d1cd9"
+    },
+    {
+      "path": "library_status.py",
+      "sha256": "e7268c6506dacea5ffeb0688e67e98f1f0ef8282f011c5981a3b90c17bee79bb"
+    },
+    {
+      "path": "library_sync.py",
+      "sha256": "4cb7e3a436431664fff66f92374009147c251adb523f12603208f4c1beb43dc3"
+    },
+    {
+      "path": "locks.py",
+      "sha256": "ada8b64687869fc00b736b48f2837bd64293813d00a148ce4a03ebc8056384e1"
+    },
+    {
+      "path": "log_buffer.py",
+      "sha256": "70d9adcfd03e8d51ed5976102011416f1005b29f282988c04441a4504438529d"
+    },
+    {
+      "path": "lz_string.py",
+      "sha256": "0a0bf1e8461fb6611efdc849b01c1e0134b04c52294d3c50d1671d868cca0698"
+    },
+    {
+      "path": "maintenance.py",
+      "sha256": "f394b9fa16cb0f523079399f37ab60bfb1c3e0d2c491e99e29836bc2d9bf152f"
+    },
+    {
+      "path": "mdblist.py",
+      "sha256": "778623b6087b8d4891cdc4eabd7110d7cf6f82787264fe38a88599479e4b1f7e"
+    },
+    {
+      "path": "media_servers.py",
+      "sha256": "f63f0790ff24de920033cd5aded32064e28dc092e3778d4da19387de1bc5fde6"
+    },
+    {
+      "path": "mediafusion.py",
+      "sha256": "9b3551d9154690f810f8a4a89d20736980111a312d4b0ed8f375b1608da5825a"
+    },
+    {
+      "path": "metrics_prom.py",
+      "sha256": "a8974dcd97cf76ef6b0fc8c077254bb8e6b4a9e263098685f25dad1b3a7ed6ea"
+    },
+    {
+      "path": "monitor.py",
+      "sha256": "33e8283853601ba1b2a6965e6e2aa77ac01f415ddb528bdc9018d9791f59cc23"
+    },
+    {
+      "path": "mp4_faststart.py",
+      "sha256": "dc1989d8bbcdba0e483ae539fde42430c5e96550d9ff0ce78ee3db6649023867"
+    },
+    {
+      "path": "native_request_dispatch.py",
+      "sha256": "0950f540d21a38b64a2859dfef3cf609b67a9e538b1dcd7c70b4780a2cf29283"
+    },
+    {
+      "path": "native_request_scopes.py",
+      "sha256": "18d98606f0cfd7844f4fe13574d1e7adefbed8b3765aabf8e4537cbe394e3d78"
+    },
+    {
+      "path": "nfo_generator.py",
+      "sha256": "63f095ebdb9335578099d44eb5ce41930f751974ead8cb6e667c68ecb10d772a"
+    },
+    {
+      "path": "notify.py",
+      "sha256": "651c9a415e3718fa12f6186ca84dcf474d6177157b5b95608f7d9e2319f86b0b"
+    },
+    {
+      "path": "numbering.py",
+      "sha256": "51778e7146b61170fd19e80254a63f3529bc7838096a29e9247463eb6dcb520a"
+    },
+    {
+      "path": "oidc.py",
+      "sha256": "73a6c6c37138a688653f5e8dfd8f76e29570e904707b7453c1d44fc13b50a4db"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "sha256": "2590bcadc455f72b93f1c66c19fb50d4a152882e255bf068a49710b2ce0c7fd4"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "sha256": "adf0811df80c14abb28c0ebbbd9d59b66dc17595d58068ba61daf91f9377ed6d"
+    },
+    {
+      "path": "playback_guard.py",
+      "sha256": "6bdeb27934e8c066e7fd217cecfdf80608a13813361b8bc543e1f89c4426cbc3"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "sha256": "750f204fbd5a1123d1e0cefe73531de5a27c6b4bc543b44c005705dbec5ba6c6"
+    },
+    {
+      "path": "plugin_loader.py",
+      "sha256": "199f0b68e90af1ee5f9b9f4fa259000ca043be91ae33ba743334425e1a4468e1"
+    },
+    {
+      "path": "plugins/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "plugins/trakt/__init__.py",
+      "sha256": "ac959f819f98be11104f6d8cdfbca4f519df1242124b94e8c3f1d532c5249239"
+    },
+    {
+      "path": "plugins/trakt/routes.py",
+      "sha256": "77ef6a24ef51ebfb23aae342ee940f384bf11a7422a3aa948dc34f9fb2cea714"
+    },
+    {
+      "path": "plugins/trakt/trakt_api.py",
+      "sha256": "d6cf2f6d03372403e7349951e7655ed9793521abe644dcacb2899b5c22f1cd63"
+    },
+    {
+      "path": "plugins/webplayer/__init__.py",
+      "sha256": "6f084fca9bc5c7ad1a028407b252dabd4c65ec173a6694d761fa04dc1572de59"
+    },
+    {
+      "path": "plugins/webplayer/positions.py",
+      "sha256": "2c712d46308dccd788c925327060da977738675040d18a75e919302920d78e6a"
+    },
+    {
+      "path": "plugins/webplayer/routes.py",
+      "sha256": "93faf3b9424ccb15c7dd12f9c02468626633d9d42a8ef16132dbd8e1032d49f4"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "sha256": "095095c333a4f2b85e4669f84b4a1fd83213dc3a2040e063401f60faee179c8e"
+    },
+    {
+      "path": "processor.py",
+      "sha256": "5ed348988a0d45d3e0a3fd7e0b72ecb419f6cd469449b4850091b0cf012eaaac"
+    },
+    {
+      "path": "prowlarr.py",
+      "sha256": "9d5d1cd3f6ab8e65b5abcb89d2c686852a46a7b1d4f556707c5429ebcd221dce"
+    },
+    {
+      "path": "radarr.py",
+      "sha256": "6d28171eb7b47d2cded86bcf7ad1d0cfe4ce3e1d6f4bfe5fca3b4a8cf59785d1"
+    },
+    {
+      "path": "realdebrid.py",
+      "sha256": "cdb93d9c2e62f69ee5a11348a3c505471034c5442ba85ac5a9ac3606acece489"
+    },
+    {
+      "path": "recovery.py",
+      "sha256": "ff0113195efb34a0cbeb8127bf6e3b6d1c73833f70315034eba20ad86a09fcac"
+    },
+    {
+      "path": "redact.py",
+      "sha256": "e2999a3a07ba96451c04113f58b946ae1226fa36d72d2d0bf8f4ecb1d34c8690"
+    },
+    {
+      "path": "release_sanity.py",
+      "sha256": "10688510b6e98df01cd25f11742e522aed29fa922229bcd06a234a767a3f7798"
+    },
+    {
+      "path": "request_execution_plans.py",
+      "sha256": "8c3d646c70bcbf8ceb2a7b29df9cf4af42509f533ea5560b4537cc7973b0c202"
+    },
+    {
+      "path": "request_intents.py",
+      "sha256": "9347afe68aea8ae41a37e366c256ca22bd551fed7683ff342b232a8002dfc9e3"
+    },
+    {
+      "path": "request_plan_refresh.py",
+      "sha256": "785b58282f4c937abef3e3d973473a9f04fbe026141cc9a0bacd11849dcce39c"
+    },
+    {
+      "path": "request_preparation.py",
+      "sha256": "7a11c16c4f2f46b232ab466cd1dfd95c1a939bafe28c69ab809a8e688983ecf4"
+    },
+    {
+      "path": "request_preparation_tokens.py",
+      "sha256": "dd5b09b3dc430520a6299e87eaef5748d285ce18f7066db3dcb94cfa8050c074"
+    },
+    {
+      "path": "retry_queue.py",
+      "sha256": "d341468859c897cb2abb78a804105a1e74442853e5c067da072764290a1a76ab"
+    },
+    {
+      "path": "scripts/fill_missing_imdb.py",
+      "sha256": "3fdc4e74e1314b61a2e3e140424436093e3e0810e87363efe4a78ddb8151271f"
+    },
+    {
+      "path": "scripts/link_oidc_identity.py",
+      "sha256": "444363f689f330c690ca3d5fb870c7d97b807f04060d66fa673f25fc267a8676"
+    },
+    {
+      "path": "scripts/migrate_plex_media.py",
+      "sha256": "e139a5c866f3e8da17fb079897ef5aa9e20905543ca35d745a529e2fd635a2fc"
+    },
+    {
+      "path": "scripts/rebuild_enrichment_queue.py",
+      "sha256": "86ccc8d57ff3353a42882d26031659d79f1d289c642fa00087c4d62b35b68411"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "sha256": "88de071f8ab0e5a53cd8ae7dceba7dac63c5b1511e6d88b743b5c379ee1eb2ac"
+    },
+    {
+      "path": "scripts/repoint_series_identity.py",
+      "sha256": "905f4970ca8374c441b61bd30c30a11b113e92336d2c87a9ce637dca5cd7fc46"
+    },
+    {
+      "path": "scripts/sweep_mislabeled_releases.py",
+      "sha256": "dd5cb393e79c74e07481cd789965513f0e1a4bc1430b135c27ed5e315af3dd07"
+    },
+    {
+      "path": "scripts/sweep_series_identity.py",
+      "sha256": "6e6fe90028b31a9de8f5aa2464c74dd19eb2c2841f10b188f66146ee263b5089"
+    },
+    {
+      "path": "search_engine.py",
+      "sha256": "81149e4104ae432d59376c9e7affe70e5a06e4017ccb8c161dbd31c81fb96d38"
+    },
+    {
+      "path": "seerr.py",
+      "sha256": "0f226510c29614d05e0157bfae7290647f198b2b836cebb5a7e45e08c457f57a"
+    },
+    {
+      "path": "seerr_compat.py",
+      "sha256": "c3b1107d03999b24e114a997da779e8bda7088e992a68c10e08d3e965952be70"
+    },
+    {
+      "path": "settings.py",
+      "sha256": "3bdc2206bc35022be72f4c10ed45e33670207fb487d331fef1dbac34bc71091e"
+    },
+    {
+      "path": "sonarr.py",
+      "sha256": "04b3dd4590e5b47a483baad39b5ffedb7fa9763c2cbb74b5fd09a4d6e6ed3f78"
+    },
+    {
+      "path": "spore_cache.py",
+      "sha256": "0fddc891ce203ac6283449ced7e1c0917ded2583f32ab7a436e14782b012f5b9"
+    },
+    {
+      "path": "spore_readthrough.py",
+      "sha256": "f1f670acfae56e9d8c739dadca51f499adebd7d16ce3c4968628ce3778707e85"
+    },
+    {
+      "path": "spore_server.py",
+      "sha256": "184d923c5f2b66fd9043626527431da06b5009c1482762eab8ab3b395b59947a"
+    },
+    {
+      "path": "stats.py",
+      "sha256": "78baaf2e938b5456f72d7b143dc447b6c230893a422fb230da2a01128a8734f4"
+    },
+    {
+      "path": "stremio_addons.py",
+      "sha256": "3db34e7482aa9de3c00c968d179834af4dd657f4bb7094e0ea24e7ec942b2057"
+    },
+    {
+      "path": "strm_generator.py",
+      "sha256": "4cc9fb1cc8abfa3b8788793a15ad3a4739a38e6a1f36d3de7fc4aa1c3d41d744"
+    },
+    {
+      "path": "subtitles.py",
+      "sha256": "5ae1e315e5f8662967c2633099afea699ed8bf8f0b2467c13bc44ea4ffecc0a9"
+    },
+    {
+      "path": "tmdb.py",
+      "sha256": "1072c755af4342e846a8a433b0fb4fa298522eb778e217f7b9b1b2eb00e30a76"
+    },
+    {
+      "path": "tmdb_checked.py",
+      "sha256": "220844cafecfc8362a7ac98ed1683504e56f65ca7369bfb6064856fdbd6b76fa"
+    },
+    {
+      "path": "tools/hevc_remediation/probe_later.py",
+      "sha256": "d2bf55a6d14887821589e47b70b6c0b3e4a0c7e768f87eceb5fb76d39897f4a6"
+    },
+    {
+      "path": "torbox.py",
+      "sha256": "2ab75aecfbb8bdd8f387f623276391fa2e5420002d1844b78acbdaed06be45c9"
+    },
+    {
+      "path": "torrentio.py",
+      "sha256": "c80da24e2d60e3e2cd02ac4a654de6b05d2545be7bb51b340d09a7a001349ba6"
+    },
+    {
+      "path": "trending.py",
+      "sha256": "f218503e525a37b9dc1f38f4185e1e78b239cee6527bbfaabd8a99b00f6616a2"
+    },
+    {
+      "path": "upgrader.py",
+      "sha256": "1970c37ea581d14baf873ddd990d483e8070e365113fc9f1fb46902d339f68f9"
+    },
+    {
+      "path": "watchdog.py",
+      "sha256": "a660bced977b42cdb95d2c9a18ab5d2d5a3f3395821cf0eca6c6e91002d540b6"
+    },
+    {
+      "path": "webdav.py",
+      "sha256": "82657332419f71072c916dbbafa53fcda45268a5b45a01c1aa0c7686b005de2b"
+    },
+    {
+      "path": "webhook_parser.py",
+      "sha256": "667a23f005ee38f280187292262c62314060c3c3f6cb74a68f0a929f258ea87b"
+    },
+    {
+      "path": "zilean.py",
+      "sha256": "8c251cbb4d725dfa89a414c6fead51cc54ad9b97223d23a0b1cd71253525dddf"
+    },
+    {
+      "path": "zilean_index.py",
+      "sha256": "9bec5e1054dd813facda942380dad1136daee930ed5678a4fc5f5b758c1a086f"
+    }
+  ],
+  "static_sink_calls": [
+    {
+      "path": "app.py",
+      "line": 3220,
+      "function": "_kick_off_processing",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "app.py",
+      "line": 4104,
+      "function": "_spa_index",
+      "call": "html.replace"
+    },
+    {
+      "path": "app.py",
+      "line": 4108,
+      "function": "_spa_index",
+      "call": "html.replace"
+    },
+    {
+      "path": "arr_import.py",
+      "line": 156,
+      "function": "import_sonarr",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "backup.py",
+      "line": 57,
+      "function": "run",
+      "call": "dst.unlink"
+    },
+    {
+      "path": "backup.py",
+      "line": 66,
+      "function": "run",
+      "call": "old.unlink"
+    },
+    {
+      "path": "catbox.py",
+      "line": 240,
+      "function": "register",
+      "call": "db.insert_virtual_item"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 250,
+      "function": "_repair_strm",
+      "call": "path.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 251,
+      "function": "_repair_strm",
+      "call": "path.with_suffix('.nfo').unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 254,
+      "function": "_repair_strm",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 263,
+      "function": "_repair_strm",
+      "call": "path.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 264,
+      "function": "_repair_strm",
+      "call": "path.with_suffix('.nfo').unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 267,
+      "function": "_repair_strm",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 302,
+      "function": "_repair_strm",
+      "call": "path.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 303,
+      "function": "_repair_strm",
+      "call": "path.with_suffix('.nfo').unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 310,
+      "function": "_repair_strm",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 318,
+      "function": "_repair_strm",
+      "call": "path.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 322,
+      "function": "_repair_strm",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 386,
+      "function": "_remove_duplicates",
+      "call": "dup.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 390,
+      "function": "_remove_duplicates",
+      "call": "dup.with_suffix('.nfo').unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 392,
+      "function": "_remove_duplicates",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 443,
+      "function": "_regenerate_wrong_files",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 494,
+      "function": "remove_orphan_folders",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 507,
+      "function": "remove_orphan_folders",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 517,
+      "function": "remove_orphan_folders",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 656,
+      "function": "merge_series_duplicates",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 667,
+      "function": "merge_series_duplicates",
+      "call": "dest.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 673,
+      "function": "merge_series_duplicates",
+      "call": "strm.unlink"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 686,
+      "function": "merge_series_duplicates",
+      "call": "_shutil.rmtree"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 745,
+      "function": "rename_messy_series_folders",
+      "call": "folder.rename"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 875,
+      "function": "merge_movie_duplicates",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 884,
+      "function": "merge_movie_duplicates",
+      "call": "_shutil.rmtree"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 924,
+      "function": "rename_messy_movie_folders",
+      "call": "folder.rename"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 929,
+      "function": "rename_messy_movie_folders",
+      "call": "old_strm.rename"
+    },
+    {
+      "path": "cleanup.py",
+      "line": 931,
+      "function": "rename_messy_movie_folders",
+      "call": "old_nfo.rename"
+    },
+    {
+      "path": "db.py",
+      "line": 984,
+      "function": "get_series_folder_imdb_map",
+      "call": "r['strm_path'].replace"
+    },
+    {
+      "path": "db.py",
+      "line": 1621,
+      "function": "_escape_like",
+      "call": "s.replace"
+    },
+    {
+      "path": "db.py",
+      "line": 1621,
+      "function": "_escape_like",
+      "call": "s.replace('\\\\', '\\\\\\\\').replace"
+    },
+    {
+      "path": "db.py",
+      "line": 1621,
+      "function": "_escape_like",
+      "call": "s.replace('\\\\', '\\\\\\\\').replace('%', '\\\\%').replace"
+    },
+    {
+      "path": "db.py",
+      "line": 2436,
+      "function": "find_virtual_item_by_plex_path",
+      "call": "str(path or '').replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 238,
+      "function": "_library_part_path",
+      "call": "path.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 385,
+      "function": "_write_staged_metadata",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 392,
+      "function": "_write_staged_metadata",
+      "call": "temporary.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 444,
+      "function": "recover_overlays",
+      "call": "stub.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 445,
+      "function": "recover_overlays",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 596,
+      "function": "_download",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 608,
+      "function": "_download",
+      "call": "part.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 620,
+      "function": "_overlay",
+      "call": "stub.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 621,
+      "function": "_overlay",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 625,
+      "function": "_overlay",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 629,
+      "function": "_overlay",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 640,
+      "function": "_restore_overlay",
+      "call": "stub.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 641,
+      "function": "_restore_overlay",
+      "call": "os.replace"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 1152,
+      "function": "_discard_staged_media",
+      "call": "path.unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 1344,
+      "function": "run_once",
+      "call": "_cache_path(token).unlink"
+    },
+    {
+      "path": "enrichment.py",
+      "line": 1345,
+      "function": "run_once",
+      "call": "_cache_metadata_path(token).unlink"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 197,
+      "function": "_quarantine_move",
+      "call": "shutil.move"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 247,
+      "function": "reconcile",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 262,
+      "function": "reconcile",
+      "call": "shutil.move"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 291,
+      "function": "reconcile",
+      "call": "shutil.move"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 302,
+      "function": "reconcile",
+      "call": "shutil.move"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 305,
+      "function": "reconcile",
+      "call": "shutil.move"
+    },
+    {
+      "path": "episode_scheme.py",
+      "line": 310,
+      "function": "reconcile",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "integration_catalog.py",
+      "line": 105,
+      "function": "prose",
+      "call": "value.replace"
+    },
+    {
+      "path": "integration_catalog.py",
+      "line": 105,
+      "function": "prose",
+      "call": "value.replace('\\r\\n', '\\n').replace"
+    },
+    {
+      "path": "integration_catalog.py",
+      "line": 280,
+      "function": "_block",
+      "call": "key.replace"
+    },
+    {
+      "path": "integration_catalog_service.py",
+      "line": 239,
+      "function": "_rail",
+      "call": "rail.replace"
+    },
+    {
+      "path": "integration_watchlist_overlay.py",
+      "line": 603,
+      "function": "list_selected",
+      "call": "e['native_identity']['added_at'].replace"
+    },
+    {
+      "path": "io_utils.py",
+      "line": 41,
+      "function": "_write",
+      "call": "os.replace"
+    },
+    {
+      "path": "io_utils.py",
+      "line": 44,
+      "function": "_write",
+      "call": "os.unlink"
+    },
+    {
+      "path": "jellyfin_login.py",
+      "line": 83,
+      "function": "authenticate",
+      "call": "_CLIENT_HEADER.replace"
+    },
+    {
+      "path": "library_sync.py",
+      "line": 142,
+      "function": "import_series_to_monitored",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "library_sync.py",
+      "line": 178,
+      "function": "import_series_to_monitored",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "library_sync.py",
+      "line": 382,
+      "function": "dedup_movie_folders",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "lz_string.py",
+      "line": 102,
+      "function": "decompress_from_encoded_uri_component",
+      "call": "compressed.replace"
+    },
+    {
+      "path": "mediafusion.py",
+      "line": 44,
+      "function": "_to_stream",
+      "call": "binge_group.replace"
+    },
+    {
+      "path": "mediafusion.py",
+      "line": 44,
+      "function": "_to_stream",
+      "call": "binge_group.replace('|', ' ').replace"
+    },
+    {
+      "path": "monitor.py",
+      "line": 105,
+      "function": "add_series",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "monitor.py",
+      "line": 174,
+      "function": "_check_one_series",
+      "call": "db.update_monitored_series"
+    },
+    {
+      "path": "monitor.py",
+      "line": 178,
+      "function": "_check_one_series",
+      "call": "db.update_monitored_series"
+    },
+    {
+      "path": "monitor.py",
+      "line": 192,
+      "function": "_check_one_series",
+      "call": "db.update_monitored_series"
+    },
+    {
+      "path": "monitor.py",
+      "line": 196,
+      "function": "_check_one_series",
+      "call": "db.update_monitored_series"
+    },
+    {
+      "path": "mp4_faststart.py",
+      "line": 398,
+      "function": "build_and_cache._atomic_write",
+      "call": "tmp.write_bytes"
+    },
+    {
+      "path": "mp4_faststart.py",
+      "line": 399,
+      "function": "build_and_cache._atomic_write",
+      "call": "tmp.replace"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 150,
+      "function": "_write_xml_tree",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 161,
+      "function": "_merge_episode_metadata",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 272,
+      "function": "_write_unreadable_nfo_report",
+      "call": "os.replace"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 339,
+      "function": "repair_tvshow_titles",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 389,
+      "function": "_download_image",
+      "call": "dest.unlink"
+    },
+    {
+      "path": "nfo_generator.py",
+      "line": 397,
+      "function": "_write",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "line": 311,
+      "function": "cleanup",
+      "call": "shutil.move"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "line": 314,
+      "function": "cleanup",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "line": 329,
+      "function": "cleanup",
+      "call": "shutil.move"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "line": 338,
+      "function": "cleanup",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "line": 247,
+      "function": "cleanup",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "line": 285,
+      "function": "cleanup",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "line": 297,
+      "function": "cleanup",
+      "call": "shutil.move"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "line": 301,
+      "function": "cleanup",
+      "call": "shutil.move"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 25,
+      "function": "_iso",
+      "call": "value.isoformat(timespec='seconds').replace"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 31,
+      "function": "_parse",
+      "call": "value.replace"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 95,
+      "function": "_write_atomic",
+      "call": "os.replace"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 109,
+      "function": "_unlink_sync",
+      "call": "path.unlink"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 121,
+      "function": "_quarantine_invalid",
+      "call": "os.replace"
+    },
+    {
+      "path": "plex_scan_queue.py",
+      "line": 298,
+      "function": "claim",
+      "call": "os.replace"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 316,
+      "function": "_select_file",
+      "call": "name.replace"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 320,
+      "function": "_select_file",
+      "call": "name.replace"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 1106,
+      "function": "_spawn_hls",
+      "call": "(tmp_dir / 'master.m3u8').write_text"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 1295,
+      "function": "_fetch_external_subtitles",
+      "call": "raw_path.write_bytes"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 1309,
+      "function": "_fetch_external_subtitles",
+      "call": "raw_path.unlink"
+    },
+    {
+      "path": "plugins/webplayer/web_player.py",
+      "line": 1364,
+      "function": "cleanup_idle_sessions",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "release_sanity.py",
+      "line": 294,
+      "function": "_tokens",
+      "call": "s.replace"
+    },
+    {
+      "path": "release_sanity.py",
+      "line": 294,
+      "function": "_tokens",
+      "call": "s.replace(\"'\", '').replace"
+    },
+    {
+      "path": "scripts/link_oidc_identity.py",
+      "line": 43,
+      "function": "_norm_guid",
+      "call": "value.replace"
+    },
+    {
+      "path": "scripts/migrate_plex_media.py",
+      "line": 47,
+      "function": "main",
+      "call": "shutil.move"
+    },
+    {
+      "path": "scripts/migrate_plex_media.py",
+      "line": 64,
+      "function": "main",
+      "call": "shutil.move"
+    },
+    {
+      "path": "scripts/migrate_plex_media.py",
+      "line": 92,
+      "function": "main",
+      "call": "shutil.move"
+    },
+    {
+      "path": "scripts/rebuild_enrichment_queue.py",
+      "line": 84,
+      "function": "_move_staged",
+      "call": "source.replace"
+    },
+    {
+      "path": "scripts/rebuild_enrichment_queue.py",
+      "line": 107,
+      "function": "_move_staged",
+      "call": "source.replace"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 216,
+      "function": "_recently_played",
+      "call": "datetime.now(timezone.utc).replace"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 506,
+      "function": "_move_files",
+      "call": "shutil.move"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 524,
+      "function": "_retag_nfo",
+      "call": "io_utils.atomic_write_text"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 533,
+      "function": "_undo_moves",
+      "call": "shutil.move"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 546,
+      "function": "_delete_item",
+      "call": "path.unlink"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 547,
+      "function": "_delete_item",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 583,
+      "function": "_ensure_right_show",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 729,
+      "function": "_retitle_folder_nfo",
+      "call": "nfo.unlink"
+    },
+    {
+      "path": "scripts/reidentify_series.py",
+      "line": 873,
+      "function": "rollback",
+      "call": "nfo.write_text"
+    },
+    {
+      "path": "scripts/repoint_series_identity.py",
+      "line": 131,
+      "function": "_rewrite_stub",
+      "call": "path.unlink"
+    },
+    {
+      "path": "scripts/repoint_series_identity.py",
+      "line": 141,
+      "function": "_recently_played",
+      "call": "datetime.now(timezone.utc).replace"
+    },
+    {
+      "path": "spore_cache.py",
+      "line": 297,
+      "function": "_download",
+      "call": "os.replace"
+    },
+    {
+      "path": "spore_readthrough.py",
+      "line": 115,
+      "function": "_write_complete",
+      "call": "os.replace"
+    },
+    {
+      "path": "spore_readthrough.py",
+      "line": 118,
+      "function": "_write_complete",
+      "call": "tmp.unlink"
+    },
+    {
+      "path": "spore_readthrough.py",
+      "line": 264,
+      "function": "_evict",
+      "call": "path.unlink"
+    },
+    {
+      "path": "stremio_addons.py",
+      "line": 53,
+      "function": "_to_stream",
+      "call": "str(behavior.get('bingeGroup') or '').replace"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 628,
+      "function": "_write_nfo",
+      "call": "_YEAR_RE.sub('', strm_path.parent.name).replace"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 667,
+      "function": "_write_nfo",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 694,
+      "function": "update_nfo_streamdetails",
+      "call": "nfo_path.write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 941,
+      "function": "fix_imdb_titles",
+      "call": "vi['strm_path'].replace"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 968,
+      "function": "fix_imdb_titles",
+      "call": "child.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 971,
+      "function": "fix_imdb_titles",
+      "call": "old_folder_path.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1178,
+      "function": "update_minfo_preferred_audio",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1348,
+      "function": "create_lazy_movie_strm",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1448,
+      "function": "create_lazy_episode_strm",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1902,
+      "function": "_write_spore_stubs",
+      "call": "atomic_write_bytes"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1914,
+      "function": "_write_spore_stubs",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 1939,
+      "function": "_delete_spore_stubs",
+      "call": "stub.unlink"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2045,
+      "function": "regenerate_spore_stubs",
+      "call": "atomic_write_bytes"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2235,
+      "function": "update_stub_from_probe",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2274,
+      "function": "update_stub_from_probe",
+      "call": "atomic_write_bytes"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2338,
+      "function": "_write_strm",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2390,
+      "function": "_drop_unwritten_token",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2598,
+      "function": "create_series_strms_from_files",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2620,
+      "function": "create_episode_strm_from_url",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2642,
+      "function": "create_movie_strm_from_url",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2785,
+      "function": "_migrate_to_canonical_names_locked._do_rename",
+      "call": "old.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2801,
+      "function": "_migrate_to_canonical_names_locked._do_rename",
+      "call": "old_file.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2819,
+      "function": "_migrate_to_canonical_names_locked._do_delete",
+      "call": "db.delete_virtual_item_by_strm_path"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2823,
+      "function": "_migrate_to_canonical_names_locked._do_delete",
+      "call": "dest.write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2834,
+      "function": "_migrate_to_canonical_names_locked._do_delete",
+      "call": "shutil.rmtree"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 2988,
+      "function": "_repair_expired_strms_locked._requeue",
+      "call": "strm_path.unlink"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 3012,
+      "function": "_repair_expired_strms_locked._relink",
+      "call": "atomic_write_text"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 3168,
+      "function": "_cleanup_duplicate_strms_locked",
+      "call": "keep.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 3173,
+      "function": "_cleanup_duplicate_strms_locked",
+      "call": "nfo_old.rename"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 3188,
+      "function": "_cleanup_duplicate_strms_locked",
+      "call": "nfo.unlink"
+    },
+    {
+      "path": "strm_generator.py",
+      "line": 3193,
+      "function": "_cleanup_duplicate_strms_locked",
+      "call": "s.unlink"
+    },
+    {
+      "path": "subtitles.py",
+      "line": 104,
+      "function": "fetch_for",
+      "call": "target.write_bytes"
+    },
+    {
+      "path": "tmdb.py",
+      "line": 20,
+      "function": "_redact",
+      "call": "text.replace"
+    },
+    {
+      "path": "tools/hevc_remediation/probe_later.py",
+      "line": 187,
+      "function": "",
+      "call": "str(mkv).replace"
+    },
+    {
+      "path": "tools/hevc_remediation/probe_later.py",
+      "line": 187,
+      "function": "",
+      "call": "str(mkv).replace('/data/plex-media/series/', '/mnt/library/shows/').replace"
+    },
+    {
+      "path": "torbox.py",
+      "line": 205,
+      "function": "add_nzb",
+      "call": "(name or 'download').replace"
+    },
+    {
+      "path": "torrentio.py",
+      "line": 208,
+      "function": "_to_stream",
+      "call": "binge_group.replace"
+    },
+    {
+      "path": "trending.py",
+      "line": 64,
+      "function": "_queue_series",
+      "call": "db.upsert_monitored_series"
+    },
+    {
+      "path": "upgrader.py",
+      "line": 313,
+      "function": "run_pack_consolidation",
+      "call": "s.unlink"
+    },
+    {
+      "path": "zilean_index.py",
+      "line": 231,
+      "function": "sync",
+      "call": "shutil.rmtree"
+    }
+  ],
+  "runtime_completeness": "UNPROVED",
+  "source_search_is_completeness_proof": false,
+  "omitted_runtime_domains": [
+    "Excluded environment/generated/binary assets and deployment topology",
+    "Other hosts, shell/manual/admin/import/repair processes",
+    "Bearer/CDN consumers and open NFS/file handles",
+    "Dependencies, dynamic calls and reader/writer paths not found by this bounded static search"
+  ],
+  "required_before_live_authority": [
+    "Authoritative finite namespace/destination source identity and preimage",
+    "Every writer/import/retry/repair uses the same durable transactional fence at effect boundary",
+    "Every reader/proxy/NFS/bearer path has durable generation admission and verified completion; unknown domains block",
+    "Proof of no new admission while fenced, cross-process CAS and source-bound rollback; no timestamps or zero observed sessions as absence proof"
+  ],
+  "model_qualification_only": "Closed synthetic entrypoints can exercise mechanics. A registered hash/list is not an issued live authority or an unforgeable completeness certificate.",
+  "snapshot_revision": 5,
+  "parent_inventory_sha256": "4a153eb9d4cd6cd52c69c53ed4330827d9982fe711a41546bdfc7299bdebdda0",
+  "reviewed_source_changes": [
+    {
+      "path": "torrentio.py",
+      "old_sha256": "247118068dfcc319bceed4963be830d97f5bcf768e8d225bf0083665c90f307d",
+      "new_sha256": "c80da24e2d60e3e2cd02ac4a654de6b05d2545be7bb51b340d09a7a001349ba6"
+    }
+  ],
+  "review_scope": "Integrate unchanged reviewed hard-size policy after merged NFO diagnostics. Both v6 snapshots preserved; only torrentio.py differs from merged NFO base. Static completeness remains UNPROVED.",
+  "added_audited_paths": [],
+  "integration_base_commit": "bd84ca99a42e4ffc0535c9313fc5df9f0fde8442",
+  "static_policy": "tools.source_inventory.sink_calls; method-name matches include false positives, not live completeness or effect authority."
+}
