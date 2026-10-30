@@ -216,3 +216,88 @@ def test_process_timeout_uses_kill_and_reap():
     proc = Slow([])
     wp._stop_process(proc)
     assert (proc.terminations, proc.kills, proc.waits) == (1, 1, 2)
+
+
+def test_seek_keeps_existing_subtitles_on_the_new_owned_generation(playback):
+    direct = playback()
+    wp._do_hls_conversion(direct.token, direct.file_info)
+    old = wp.get_session(direct.token, owner_id=7)
+    subtitle = b'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nSynthetic caption\n'
+    (old.tmp_dir / 'sub_0_eng.vtt').write_bytes(subtitle)
+    (old.tmp_dir / 'sub_ext_nl.vtt').write_bytes(subtitle)
+    assert wp.seek_session(direct.token, 500, owner_id=7)
+    new = wp.get_session(direct.token, owner_id=7)
+    listed = wp.list_subtitles(direct.token, owner_id=7)
+    assert len(listed) == 2
+    assert all('/'+new.generation+'/' in row['url'] for row in listed)
+    assert (new.tmp_dir / 'sub_0_eng.vtt').read_bytes() == subtitle
+    assert (new.tmp_dir / 'sub_ext_nl.vtt').read_bytes() == subtitle
+    assert (old.tmp_dir / 'sub_0_eng.vtt').read_bytes() == subtitle
+    assert wp.list_subtitles(direct.token, owner_id=8) == []
+
+
+@pytest.mark.parametrize('tracks', [1, 2])
+def test_clean_completed_short_hls_tail_is_ready(playback, monkeypatch, tracks):
+    direct = playback(tracks=tracks)
+    def short(*args, **kwargs):
+        proc = Process(*args, **kwargs)
+        proc.returncode = 0
+        for part in proc.command:
+            if isinstance(part, str) and '%05d' in part:
+                for i in range(1,5):wp.Path(part % i).unlink()
+                seg = wp.Path(part % 0)
+                playlist = seg.parent / ('video.m3u8' if seg.name.startswith('seg_v') else
+                    'audio_'+seg.name.split('_')[1][1:]+'.m3u8' if seg.name.startswith('seg_a') else 'playlist.m3u8')
+                playlist.write_text('#EXTM3U\n#EXTINF:2.0,\n'+seg.name+'\n#EXT-X-ENDLIST\n')
+        return proc
+    monkeypatch.setattr(wp.subprocess, 'Popen', short)
+    monkeypatch.setattr(wp, 'SEGMENT_WAIT_TIMEOUT', 1)
+    wp._do_hls_conversion(direct.token, direct.file_info)
+    session = wp.get_session(direct.token, owner_id=7)
+    assert session is not None and session.proc.poll() == 0
+    assert wp.seek_session(direct.token, 999, owner_id=7)
+    assert wp.get_session(direct.token, owner_id=7).seek_offset == 999
+
+
+@pytest.mark.parametrize('fault', ['open-playlist', 'empty', 'missing-segment', 'failed', 'running', 'symlink'])
+def test_short_tail_needs_clean_exit_and_complete_local_playlist(tmp_path, monkeypatch, fault):
+    segment = tmp_path / 'seg00000.ts'
+    segment.write_bytes(b'synthetic')
+    playlist = tmp_path / 'playlist.m3u8'
+    playlist.write_text('#EXTM3U\n#EXTINF:1,\nseg00000.ts\n#EXT-X-ENDLIST\n')
+    if fault == 'open-playlist':playlist.write_text('#EXTM3U\nseg00000.ts\n')
+    if fault == 'empty':playlist.write_text('#EXTM3U\n#EXT-X-ENDLIST\n')
+    if fault == 'missing-segment':segment.unlink()
+    if fault == 'symlink':
+        segment.unlink();target=tmp_path/'outside';target.write_bytes(b'not an owned segment');segment.symlink_to(target)
+    proc = SimpleNamespace(poll=lambda: 1 if fault == 'failed' else None if fault == 'running' else 0)
+    monkeypatch.setattr(wp.time, 'sleep', lambda delay: None)
+    assert not wp._wait_segments_pattern(tmp_path, 'seg*.ts', 5, .01, proc=proc)
+
+
+def test_seek_reextracts_subtitles_when_first_worker_has_not_produced_files(playback, monkeypatch):
+    direct = playback()
+    wp._do_hls_conversion(direct.token, direct.file_info)
+    old = wp.get_session(direct.token, owner_id=7)
+    tracks = [{'index': 0, 'language': 'eng', 'codec': 'subrip'}]
+    old.file_info['subtitle_tracks'] = tracks
+    calls = []
+    def extract(url, observed_tracks, token, output):
+        calls.append((url, observed_tracks, token, output))
+        (output / 'sub_0_eng.vtt').write_text('WEBVTT\n\nSynthetic delayed extraction\n')
+    monkeypatch.setattr(wp, '_extract_subtitles', extract)
+    assert wp.seek_session(direct.token, 10, owner_id=7)
+    new = wp.get_session(direct.token, owner_id=7)
+    assert calls == [(old.cdn_url, tracks, direct.token, new.tmp_dir)]
+    assert len(wp.list_subtitles(direct.token, owner_id=7)) == 1
+    assert not (old.tmp_dir / 'sub_0_eng.vtt').exists()
+
+
+def test_seek_does_not_copy_a_subtitle_symlink(playback, tmp_path):
+    direct = playback();wp._do_hls_conversion(direct.token, direct.file_info)
+    old = wp.get_session(direct.token, owner_id=7)
+    outside = tmp_path / 'private';outside.write_bytes(b'not a subtitle')
+    (old.tmp_dir / 'sub_0_eng.vtt').symlink_to(outside)
+    assert wp.seek_session(direct.token, 10, owner_id=7)
+    assert wp.list_subtitles(direct.token, owner_id=7) == []
+    assert outside.read_bytes() == b'not a subtitle'

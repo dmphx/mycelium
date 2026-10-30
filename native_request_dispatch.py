@@ -25,6 +25,12 @@ CREATE TRIGGER IF NOT EXISTS native_request_dispatch_identity_immutable
  BEFORE UPDATE OF request_id,binding_json,binding_sha256 ON native_request_dispatch
  BEGIN SELECT RAISE(ABORT,'immutable native dispatch identity'); END;
 ''')
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_requests'").fetchone():
+        conn.executescript('''
+CREATE TRIGGER IF NOT EXISTS native_request_dispatch_parent_delete
+ AFTER DELETE ON user_requests
+ BEGIN DELETE FROM native_request_dispatch WHERE request_id=OLD.id; END;
+''')
 
 
 def _binding(conn, row):
