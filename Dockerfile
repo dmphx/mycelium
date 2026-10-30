@@ -12,7 +12,7 @@ FROM golang:1.25-alpine AS spore-nfs
 WORKDIR /src
 COPY spore-nfs/go.mod spore-nfs/go.sum* ./
 RUN go mod download
-COPY spore-nfs/main.go ./
+COPY spore-nfs/main.go spore-nfs/media_contract.go ./
 RUN CGO_ENABLED=0 go build -o /spore-nfs .
 
 # -- Stage 3: Python runtime ----------------------------------------------------------
