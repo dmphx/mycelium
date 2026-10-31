@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v9-subtitle-completion.json'
-FIXTURE_SHA='9cd9363d445847c825070c782d2997a8cfd6e965c62b1ff3022af3f09c409df9'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v9-subtitle-completion.json')
-INVENTORY_SHA='762ba3b049f877d08263c95b637981e508a9ea6ee82b178dce03c97430b76c0e'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v10-dash-maps.json'
+FIXTURE_SHA='b989a6502f04717a301612370e87c9727ea338101d4e87cd103df084062729b4'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v10-dash-maps.json')
+INVENTORY_SHA='c38d4532c427976b3ad8767457a6cab8f7b9791c32bb6433ede3d26f1b54ccc0'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -367,7 +367,9 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='6fdcbc7e7573a7dacc4fd519e71f6b0448ed60df835157bf9d8539fd68c3f465'
     assert hashlib.sha256(prior_model.read_bytes()).hexdigest()=='057fef162e62e7332f145281a048da11c145474984dfe516210723f059c7d9c5'
     old=json.loads(old_path.read_text());prior=json.loads(prior_path.read_text())
-    current=json.loads(INVENTORY.read_text());source=Path(__file__).resolve().parents[1]
+    subtitle_path=INVENTORY.with_name('destination-path-inventory-v9-subtitle-completion.json')
+    assert hashlib.sha256(subtitle_path.read_bytes()).hexdigest()=='762ba3b049f877d08263c95b637981e508a9ea6ee82b178dce03c97430b76c0e'
+    current=json.loads(subtitle_path.read_text());source=Path(__file__).resolve().parents[1]
     assert {x['path'] for x in prior['reviewed_source_changes']}=={'app.py','mdblist.py'}
     assert prior['parent_inventory_sha256']==hashlib.sha256(old_path.read_bytes()).hexdigest()
     def calls(items):return Counter((x['path'],x['function'],x['call']) for x in items)
@@ -464,3 +466,17 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
         assert item['new_sha256']==hashlib.sha256((source/item['path']).read_bytes()).hexdigest()
     assert current['added_audited_paths']==[]
     assert current['runtime_completeness']=='UNPROVED' and not current['source_search_is_completeness_proof']
+
+
+def test_dash_inventory_only_updates_wrapper_and_preserves_history():
+    old_path=INVENTORY.with_name('destination-path-inventory-v9-subtitle-completion.json')
+    old=json.loads(old_path.read_text());current=json.loads(INVENTORY.read_text())
+    def pins(inventory):
+        return {item['path']:item['sha256'] for group in inventory['writer_groups']+inventory['reader_domains'] for item in group['source_files']}
+    before,after=pins(old),pins(current)
+    assert before.keys()==after.keys()
+    assert {p for p in before if before[p]!=after[p]}=={'spore/plex_transcoder_wrapper.sh'}
+    assert current['parent_inventory_sha256']==hashlib.sha256(old_path.read_bytes()).hexdigest()
+    assert current['reviewed_source_changes']==[{'path':'spore/plex_transcoder_wrapper.sh','old_sha256':before['spore/plex_transcoder_wrapper.sh'],'new_sha256':after['spore/plex_transcoder_wrapper.sh']}]
+    for key in ['audited_python_files','static_sink_calls','omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof']:
+        assert current[key]==old[key]

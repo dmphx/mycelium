@@ -362,7 +362,13 @@ if [ "$spore_replaced" = "1" ]; then
     _vcodec_pre=""
     for idx in "${!newargs[@]}"; do
         [ "${newargs[$idx]}" = "-i" ] && break
-        [ "${newargs[$idx]}" = "-codec:0" ] && _vcodec_pre="${newargs[$((idx+1))]:-}"
+        # Plex writes the source video decoder hint as -codec:0 (decimal) on older
+        # builds and -codec:#0x01 (hex stream-id) on newer builds (>=1.42). Match
+        # both, else _src_fam is empty and the HEVC->H264 guard below misfires,
+        # force-copying HEVC to clients that cannot decode it.
+        case "${newargs[$idx]}" in
+            -codec:0|-codec:#0x01|-codec:#0x1) _vcodec_pre="${newargs[$((idx+1))]:-}" ;;
+        esac
     done
     _codec_family() {
         case "$1" in
@@ -558,22 +564,44 @@ if [ "$spore_replaced" = "1" ]; then
         fi
     fi
 
-    # ── Make subtitle stream mappings optional ─────────────────────────────────
-    # CDN MKV stream layout may differ from stub metadata. If Plex maps 0:2 for
-    # subtitles but the CDN file has no stream at index 2, FFmpeg exits with error.
-    # Append '?' to -map 0:N specifiers in the subtitle output section (after
-    # media-%05d.ts) so FFmpeg silently skips missing streams instead of crashing.
-    _past_first_out=0
+    # Plex's first output maps video at output stream 0 and the selected audio
+    # at _audio_stream_idx (an OUTPUT ordinal, not an input stream number).
+    # Preserve those source mappings, including hex IDs and non-default audio.
+    # Remaining explicit input-0 maps are auxiliary stub streams which may be
+    # absent in the real source. This applies before ANY output, including
+    # single-output DASH chunk-%05d. Labels, typed selectors, exclusions and
+    # other inputs stay untouched.
+    _spore_map_key() {
+        local _value="$1" _number _kind
+        if [[ "$_value" =~ ^0:([0-9]+)$ ]]; then
+            _number="${BASH_REMATCH[1]}"; _kind=index
+        elif [[ "$_value" =~ ^0:\#0[xX]([0-9a-fA-F]+)$ ]]; then
+            _number="${BASH_REMATCH[1],,}"; _kind=id
+        else
+            return 1
+        fi
+        # No integer conversion: avoid octal interpretation and overflow.
+        while [ "${#_number}" -gt 1 ] && [[ "$_number" == 0* ]]; do
+            _number="${_number#0}"
+        done
+        printf '%s:%s' "$_kind" "$_number"
+    }
+    _source_maps=()
+    for idx in "${!newargs[@]}"; do
+        [ "${newargs[$idx]}" = "-map" ] && _source_maps+=("${newargs[$((idx+1))]:-}")
+    done
+    _video_map_key=$(_spore_map_key "${_source_maps[0]:-}" || :)
+    _audio_map_key=$(_spore_map_key "${_source_maps[${_audio_stream_idx:-1}]:-}" || :)
     _sub_optional_count=0
     for idx in "${!newargs[@]}"; do
-        _a="${newargs[$idx]}"
-        [[ "$_a" == *"media-%05d"* ]] && _past_first_out=1
-        if [ "$_past_first_out" = "1" ] && [ "$_a" = "-map" ]; then
+        if [ "${newargs[$idx]}" = "-map" ]; then
             _nxt="${newargs[$((idx+1))]:-}"
-            if [[ "$_nxt" =~ ^0:[0-9]+$ ]]; then
-                newargs[$((idx+1))]="${_nxt}?"
-                _sub_optional_count=$((_sub_optional_count+1))
-                echo "$(date '+%H:%M:%S') WRAP sub-map optional: ${_nxt} -> ${_nxt}?" >> "$SPORE_LOG"
+            if _map_key=$(_spore_map_key "$_nxt"); then
+                if [ "$_map_key" != "$_video_map_key" ] && [ "$_map_key" != "$_audio_map_key" ]; then
+                    newargs[$((idx+1))]="${_nxt}?"
+                    _sub_optional_count=$((_sub_optional_count+1))
+                    echo "$(date '+%H:%M:%S') WRAP sub-map optional: ${_nxt} -> ${_nxt}?" >> "$SPORE_LOG"
+                fi
             fi
         fi
     done
@@ -618,6 +646,31 @@ if [ "$spore_replaced" = "1" ]; then
     echo "SPORE-WRAP: full command: ${newargs[*]}" >&2
     echo "$(date '+%H:%M:%S') WRAP final cmd: ${newargs[*]}" >> "$SPORE_LOG"
 fi
+
+# ── Ensure VAAPI can find Plex's iHD driver ───────────────────────────────
+# Plex spawns the transcoder WITHOUT LIBVA_DRIVERS_PATH, so for VAAPI commands
+# libva falls back to a dead build-time path -> "Failed to initialise VAAPI
+# connection: -1" -> h264_vaapi never starts and the session hangs (buffers
+# forever). If this is a VAAPI command and the path isn't already set, point it
+# at Plex's own downloaded iHD driver (stable Cache dir first, then the
+# version-hashed Drivers/imd-* dir).
+case " ${newargs[*]} " in
+    *vaapi*)
+        if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
+            for _drv in \
+                "/config/Library/Application Support/Plex Media Server/Cache/va-dri-linux-x86_64" \
+                "/config/Library/Application Support/Plex Media Server/Drivers/"imd-*-linux-x86_64/dri; do
+                if [ -f "$_drv/iHD_drv_video.so" ]; then
+                    export LIBVA_DRIVERS_PATH="$_drv"
+                    export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-iHD}"
+                    echo "$(date '+%H:%M:%S') WRAP set LIBVA_DRIVERS_PATH=$_drv" >> "$SPORE_LOG"
+                    break
+                fi
+            done
+        fi
+        ;;
+esac
+
 
 if [ "$spore_replaced" = "1" ]; then
     echo "=== $(date '+%H:%M:%S') SPORE session ===" >> "$FFMPEG_STDERR_LOG"
