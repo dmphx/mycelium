@@ -453,6 +453,38 @@ class TestDnFromMagnet:
 
 
 class TestWriteSporeStubs:
+    def test_special_uses_episode_runtime_instead_of_movie_runtime(self, tmp_path, monkeypatch):
+        import tmdb
+
+        media_root = tmp_path / "media"
+        monkeypatch.setattr(sg, "MEDIA_PATH", str(media_root))
+        monkeypatch.setattr(sg, "SPORE_MEDIA_PATH", str(tmp_path / "plex-media"))
+        sg.settings.get.return_value = True
+        monkeypatch.setattr(sg.db, "get_virtual_item", lambda _token: {
+            "imdb_id": "tt1234567", "season": 0, "episode": 2,
+        })
+        lookups = []
+        monkeypatch.setattr(tmdb, "get_episode_runtime_sec", lambda *args: (
+            lookups.append(("episode", args)) or 3720.0
+        ))
+        monkeypatch.setattr(tmdb, "get_movie_runtime_sec", lambda *args: (
+            lookups.append(("movie", args)) or 5400.0
+        ))
+        durations = []
+        monkeypatch.setattr(sg, "make_stub_mkv", lambda _title, _quality, **kwargs: (
+            durations.append(kwargs["duration_sec"]) or b"synthetic-stub"
+        ))
+        import media_servers
+        monkeypatch.setattr(media_servers, "mark", lambda _path: None)
+
+        strm_path = media_root / "series" / "Example" / "Season 00" / "Example S00E02.strm"
+        sg._write_spore_stubs(strm_path, "synthetic", "Example S00E02", "1080p", 1.0)
+
+        assert lookups == [("episode", ("tt1234567", 0, 2))]
+        assert durations == [3720.0]
+        assert (tmp_path / "plex-media" / "series" / "Example" / "Season 00"
+                / "Example S00E02.mkv").read_bytes() == b"synthetic-stub"
+
     def test_creates_mkv_and_minfo(self, tmp_path, monkeypatch):
         media_root = tmp_path / "media"
         spore_root = tmp_path / "plex-media"

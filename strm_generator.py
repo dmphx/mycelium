@@ -1880,7 +1880,7 @@ def _write_spore_stubs(strm_path: Path, token: str,
                     import tmdb as _tmdb
                     season  = vi.get("season")
                     episode = vi.get("episode")
-                    if season and episode:
+                    if season is not None and episode is not None:
                         dur = _tmdb.get_episode_runtime_sec(imdb_id, season, episode)
                     else:
                         dur = _tmdb.get_movie_runtime_sec(imdb_id)
