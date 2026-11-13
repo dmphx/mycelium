@@ -248,6 +248,12 @@ IDENTITY_REPAIR_INTERVAL_HOURS = _env_int("IDENTITY_REPAIR_INTERVAL_HOURS", 24)
 # how many items one episode-numbering run touches.
 EPISODE_HYGIENE_INTERVAL_HOURS = _env_int("EPISODE_HYGIENE_INTERVAL_HOURS", 168)
 EPISODE_HYGIENE_LIMIT = _env_int("EPISODE_HYGIENE_LIMIT", 500)
+# The host lock directory must be bind-mounted as a directory (read-only is
+# sufficient). Missing locks or invalid window settings defer destructive work.
+EPISODE_HYGIENE_HOST_LOCK_DIR = _env("EPISODE_HYGIENE_HOST_LOCK_DIR", "/run/host-media-locks")
+EPISODE_HYGIENE_TIMEZONE = _env("EPISODE_HYGIENE_TIMEZONE", _env("TZ", "UTC"))
+EPISODE_HYGIENE_NIGHTLY_START = _env("EPISODE_HYGIENE_NIGHTLY_START", "01:00")
+EPISODE_HYGIENE_NIGHTLY_END = _env("EPISODE_HYGIENE_NIGHTLY_END", "06:00")
 IDENTITY_REPAIR_BATCH = _env_int("IDENTITY_REPAIR_BATCH", 500)
 
 # Candidate ranking can be tuned for the dominant client family. "balanced"

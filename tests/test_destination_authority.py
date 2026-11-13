@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v10-dash-maps.json'
-FIXTURE_SHA='b989a6502f04717a301612370e87c9727ea338101d4e87cd103df084062729b4'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v10-dash-maps.json')
-INVENTORY_SHA='c38d4532c427976b3ad8767457a6cab8f7b9791c32bb6433ede3d26f1b54ccc0'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v11-hygiene-fence.json'
+FIXTURE_SHA='fb633581762153420a357a980d2f2b1b031ee507937381cc9fad4d4a4e38d9a6'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v11-hygiene-fence.json')
+INVENTORY_SHA='c1a868a9a7eb2bab7670e22f29cd73813f925dbc6de0f192fb5c334be53de8a6'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -88,13 +88,13 @@ def test_source_inventory_has_actual_unfenced_writers_and_reader_unknowns(case):
     assert all(not x['runtime_authority_complete'] for x in inventory['reader_domains'])
     for item in inventory['audited_python_files']+[pin for x in inventory['writer_groups']+inventory['reader_domains'] for pin in x['source_files']]:
         assert hashlib.sha256((source/item['path']).read_bytes()).hexdigest()==item['sha256']
-    assert len(inventory['audited_python_files'])==110 and len(inventory['static_sink_calls'])==179
+    assert len(inventory['audited_python_files'])==111 and len(inventory['static_sink_calls'])==179
     from tools.source_inventory import sink_calls
     assert inventory['static_sink_calls']==sink_calls(source, [x['path'] for x in inventory['audited_python_files']])
     assert inventory['omitted_runtime_domains']
     for runtime in ['app.py','db.py','processor.py','monitor.py','retry_queue.py','arr_import.py','cleanup.py','identity_repair.py']:
         assert 'import destination_authority' not in (source/runtime).read_text()
-    case['env'][5].update(source_writer_groups=14,source_reader_domains=6,audited_python_files=110,static_sink_calls=174)
+    case['env'][5].update(source_writer_groups=14,source_reader_domains=6,audited_python_files=111,static_sink_calls=179)
 
 
 def test_complete_closed_model_can_CAS_check_but_never_call_effect_adapter(case):
@@ -470,7 +470,7 @@ def test_prior_inventory_versions_are_preserved_with_explicit_source_delta():
 
 def test_dash_inventory_only_updates_wrapper_and_preserves_history():
     old_path=INVENTORY.with_name('destination-path-inventory-v9-subtitle-completion.json')
-    old=json.loads(old_path.read_text());current=json.loads(INVENTORY.read_text())
+    old=json.loads(old_path.read_text());current=json.loads(INVENTORY.with_name('destination-path-inventory-v10-dash-maps.json').read_text())
     def pins(inventory):
         return {item['path']:item['sha256'] for group in inventory['writer_groups']+inventory['reader_domains'] for item in group['source_files']}
     before,after=pins(old),pins(current)
@@ -480,3 +480,26 @@ def test_dash_inventory_only_updates_wrapper_and_preserves_history():
     assert current['reviewed_source_changes']==[{'path':'spore/plex_transcoder_wrapper.sh','old_sha256':before['spore/plex_transcoder_wrapper.sh'],'new_sha256':after['spore/plex_transcoder_wrapper.sh']}]
     for key in ['audited_python_files','static_sink_calls','omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof']:
         assert current[key]==old[key]
+
+
+def test_hygiene_inventory_preserves_prior_authority_limits_and_observes_new_runner():
+    prior_path=INVENTORY.with_name('destination-path-inventory-v10-dash-maps.json')
+    assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='c38d4532c427976b3ad8767457a6cab8f7b9791c32bb6433ede3d26f1b54ccc0'
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    before={x['path']:x['sha256'] for x in prior['audited_python_files']}
+    after={x['path']:x['sha256'] for x in current['audited_python_files']}
+    assert before.keys() <= after.keys()
+    assert after.keys()-before.keys()=={'episode_hygiene.py'}
+    assert {p for p in before if before[p]!=after[p]}=={'app.py','config.py'}
+    assert current['added_audited_paths']==['episode_hygiene.py']
+    assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    assert {x['path'] for x in current['reviewed_source_changes']}=={'app.py','config.py'}
+    for item in current['reviewed_source_changes']:
+        assert item['old_sha256']==before[item['path']]
+        assert item['new_sha256']==after[item['path']]
+    for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
+        assert current[key]==prior[key]
+    assert not any(x['runtime_fenced'] for x in current['writer_groups'])
+    cleanup=next(x for x in current['writer_groups'] if x['id']=='cleanup_repair')
+    assert {'phantom_cleanup.py','episode_hygiene.py'} <= {x['path'] for x in cleanup['source_files']}
+    assert 'import destination_authority' not in (Path(__file__).parents[1]/'episode_hygiene.py').read_text()

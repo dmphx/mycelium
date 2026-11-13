@@ -732,17 +732,7 @@ def _start_scheduler() -> BackgroundScheduler:
         log.info("Scheduled TorBox quota check every %dh", QUOTA_CHECK_INTERVAL_HOURS)
 
     if cfg.EPISODE_HYGIENE_INTERVAL_HOURS > 0:
-        def _episode_hygiene():
-            import episode_scheme
-            import phantom_cleanup
-            phantoms = phantom_cleanup.cleanup(dry_run=False)
-            numbering = episode_scheme.reconcile(
-                dry_run=False, limit=cfg.EPISODE_HYGIENE_LIMIT)
-            log.info("Episode hygiene: phantoms %s (%d quarantined), numbering %s "
-                     "(%d duplicates, %d renumbered)",
-                     phantoms.get("status"), len(phantoms.get("quarantined") or []),
-                     numbering.get("status"), numbering.get("duplicates_removed", 0),
-                     numbering.get("renumbered", 0))
+        from episode_hygiene import run as _episode_hygiene
 
         scheduler.add_job(
             _episode_hygiene, trigger="interval",

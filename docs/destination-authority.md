@@ -8,6 +8,11 @@ unfenced by this new model. Excluded runtime assets, dynamic/manual writers and
 external readers remain unknown. In particular timestamps, idle player cleanup,
 zero Plex sessions or an empty observed list never prove all readers absent.
 
+The weekly hygiene host flocks serialize that job with cooperating Plex host
+edit and scanner jobs only. They are not this model's durable destination fence
+and do not establish all-reader or all-writer completeness. The source inventory
+includes the hygiene runner while preserving those unproved runtime limits.
+
 `destination_authority.py` is explicitly initialized on a disposable owned SQLite
 connection only. It models an opaque synthetic destination, not a filesystem path.
 It is not imported by startup, dispatch, db.init, import, retry, repair or scheduler.
