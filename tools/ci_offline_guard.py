@@ -1,12 +1,14 @@
-"""Pytest plugin that keeps the CI test run offline.
+"""Pytest plugin that names the tests which try to reach the network.
 
 Loaded only by CI: python -m pytest -p tools.ci_offline_guard tests/
 
-Untrusted Woodpecker repos cannot drop a step's network, and unshare is
-refused by the default seccomp profile, so the guard sits in the pytest
-process. Loopback and Unix sockets stay allowed for in-process test servers.
-Every other connect or name lookup is refused and recorded; a recorded
-attempt fails the session even when the code under test swallowed the error.
+Diagnostics only. The CI test step runs with network_mode: none, and
+tools/ci_network_probe.py proves that boundary before the suite starts; this
+plugin cannot see child processes, the base _socket type or native code.
+What it adds is attribution: in-process connects, sends and name lookups to
+anything but loopback or Unix sockets are refused, recorded with the running
+test's node id and listed in the terminal summary, so a test that silently
+depends on the network (and swallows the failure) shows up by name.
 """
 import ipaddress
 import socket
@@ -48,7 +50,9 @@ def _check_address(sock, address):
 _real_connect = socket.socket.connect
 _real_connect_ex = socket.socket.connect_ex
 _real_sendto = socket.socket.sendto
+_real_sendmsg = socket.socket.sendmsg
 _real_getaddrinfo = socket.getaddrinfo
+_real_gethostbyaddr = socket.gethostbyaddr
 _real_gethostbyname = socket.gethostbyname
 _real_gethostbyname_ex = socket.gethostbyname_ex
 
@@ -66,6 +70,18 @@ def _connect_ex(self, address):
 def _sendto(self, data, *args):
     _check_address(self, args[-1])
     return _real_sendto(self, data, *args)
+
+
+def _sendmsg(self, buffers, *args):
+    if len(args) >= 3 and args[2] is not None:
+        _check_address(self, args[2])
+    return _real_sendmsg(self, buffers, *args)
+
+
+def _gethostbyaddr(host):
+    if not _is_local(host):
+        _refuse("reverse lookup", host)
+    return _real_gethostbyaddr(host)
 
 
 def _getaddrinfo(host, *args, **kwargs):
@@ -89,6 +105,8 @@ def _gethostbyname_ex(host):
 socket.socket.connect = _connect
 socket.socket.connect_ex = _connect_ex
 socket.socket.sendto = _sendto
+socket.socket.sendmsg = _sendmsg
+socket.gethostbyaddr = _gethostbyaddr
 socket.getaddrinfo = _getaddrinfo
 socket.gethostbyname = _gethostbyname
 socket.gethostbyname_ex = _gethostbyname_ex
@@ -105,12 +123,6 @@ def pytest_runtest_protocol(item, nextitem):
 
 def pytest_terminal_summary(terminalreporter):
     if _ATTEMPTS:
-        terminalreporter.section("ci_offline_guard: refused network access")
+        terminalreporter.section("ci_offline_guard: tests that tried to reach the network")
         for attempt in sorted(set(_ATTEMPTS)):
             terminalreporter.write_line(attempt)
-
-
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session, exitstatus):
-    if _ATTEMPTS and session.exitstatus == 0:
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED

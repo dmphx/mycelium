@@ -52,14 +52,24 @@ for _mod in ("db", "jellyfin", "settings", "torbox", "nfo_generator", "mp4_fasts
     sys.modules[_mod] = MagicMock()
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_tmdb_get: houd de echte tmdb._get aan (geen offline-stub); de test "
+        "levert zelf een lokale nep-transport via tmdb.req_lib.get.")
+
+
 @pytest.fixture(autouse=True)
-def _tmdb_offline(monkeypatch):
+def _tmdb_offline(request, monkeypatch):
     """De suite draait offline: elke TMDB-lookup krijgt het antwoord van een
     onbereikbare TMDB (None). Zonder deze stub gingen o.a. webhook_parser.parse,
     release_sanity en strm_generator met een MagicMock-key echt naar
     api.themoviedb.org, en welke tests dat deden hing af van de volgorde.
     Tests die TMDB-data nodig hebben patchen tmdb._get daarna zelf, of zetten
-    een eigen tmdb in sys.modules; beide winnen van deze default."""
+    een eigen tmdb in sys.modules; beide winnen van deze default. Tests van
+    _get zelf markeren zich met @pytest.mark.real_tmdb_get."""
+    if request.node.get_closest_marker("real_tmdb_get"):
+        return
     tmdb = sys.modules.get("tmdb")
     if not hasattr(tmdb, "_get"):
         tmdb = importlib.import_module("tmdb")
