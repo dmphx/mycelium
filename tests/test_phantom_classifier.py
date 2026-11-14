@@ -606,3 +606,37 @@ def test_any_single_release_identity_is_a_recorded_release(tmp_path, identity):
     rows = {_key(row): row for row in lib.discover()["review"]}
 
     assert rows[("tt1", 1, 9)]["reason"] == "not legacy blind-registration shape"
+
+
+def test_review_only_run_still_writes_a_manifest(monkeypatch, tmp_path, caplog):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 10),
+                                   list(range(1, 9)) + [{"episode": 9, "hash": ""}])
+    report = lib.discover()
+    assert report["candidates"] == [] and len(report["review"]) == 1
+    marked, deleted = _patch_apply(monkeypatch, lib, report)
+
+    with caplog.at_level("INFO", logger="phantom_cleanup"):
+        result = phantom_cleanup.cleanup(dry_run=False, quarantine_root=tmp_path / "q")
+
+    assert "0 quarantined, 0 failed, 1 for review" in caplog.text
+    assert result["quarantine"] is None and marked == [] and deleted == []
+    manifest = json.loads(Path(result["manifest"]).read_text())
+    assert manifest["quarantined"] == [] and manifest["failed"] == []
+    assert [(row["episode"], row["reason"]) for row in manifest["review"]] == [
+        (9, "second provider lists episode")]
+    assert Path(report["review"][0]["strm_path"]).is_file()
+
+
+def test_apply_time_downgrade_alone_still_writes_a_manifest(monkeypatch, tmp_path):
+    lib = _audit_library(tmp_path)
+    report = lib.discover()
+    duplicate = next(row for row in report["candidates"]
+                     if _key(row) == ("tt1933073", 6, 8))
+    lib.stub("My Cat From Hell", 7, 8).unlink()
+    _patch_apply(monkeypatch, lib, {"candidates": [duplicate], "review": [], "skipped": []})
+
+    result = phantom_cleanup.cleanup(dry_run=False, quarantine_root=tmp_path / "q")
+
+    manifest = json.loads(Path(result["manifest"]).read_text())
+    assert [row["reason"] for row in manifest["review"]] == ["canonical slot missing"]
+

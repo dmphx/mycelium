@@ -22,7 +22,9 @@ episode above TMDB's self-consistent season boundary is now classified:
 
 TVmaze is read without a key, at most once a second, with one bounded retry
 after a 429, through a fresh cache for each discovery run. A season it can't confirm is skipped. Unnumbered specials never
-veto. Review rows are reported in the result and the manifest and never moved.
+veto. Review rows are reported in the result and never moved. A run that applies
+anything, or finds any review row, writes `manifest.json` with every quarantined,
+failed and review row, so review-only runs still leave a report.
 
 | Setting | Default |
 | --- | --- |

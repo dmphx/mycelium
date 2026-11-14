@@ -604,7 +604,8 @@ def cleanup(imdb_ids: set[str] | None = None, dry_run: bool = True,
             "reason": over,
             **report,
         }, indent=2, default=str))
-        log.warning("Phantom cleanup over cap, proposal only: %s", over)
+        log.warning("Phantom cleanup over cap, proposal only: %s; %d for review",
+                    over, len(report.get("review") or []))
         return {"status": "over_cap", "reason": over,
                 "proposal": str(quarantine / "proposal.json"), **report}
 
@@ -657,7 +658,8 @@ def cleanup(imdb_ids: set[str] | None = None, dry_run: bool = True,
                         shutil.move(str(destination), str(source))
                 failed.append({**candidate, "reason": str(exc)})
 
-        if quarantined or failed:
+        # Review-only runs keep their evidence too: the scheduler logs counts only.
+        if quarantined or failed or review:
             manifest = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "quarantined": quarantined,
@@ -669,9 +671,13 @@ def cleanup(imdb_ids: set[str] | None = None, dry_run: bool = True,
     finally:
         strm_generator._maintenance_lock.release()
 
+    log.info("Phantom cleanup: %d quarantined, %d failed, %d for review%s",
+             len(quarantined), len(failed), len(review),
+             f"; manifest {quarantine / 'manifest.json'}" if (quarantined or failed or review) else "")
     return {
         "status": "complete",
         "quarantine": str(quarantine) if quarantined else None,
+        "manifest": str(quarantine / "manifest.json") if (quarantined or failed or review) else None,
         "quarantined": quarantined,
         "failed": failed,
         "review": review,
