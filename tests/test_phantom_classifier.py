@@ -585,3 +585,24 @@ def test_each_discovery_run_gets_a_fresh_second_provider_cache(monkeypatch, tmp_
                                  media_root=lib.media, spore_root=lib.spore)
 
     assert len(created) == 2 and created[0] is not created[1]
+
+
+def test_punctuation_only_titles_never_prove_a_duplicate(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 2, range(1, 3), [
+        {"episode": 1, "title": "?!"}, 2,
+        {"episode": 3, "title": "...", "hash": ""}])
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 1, 3)]["reason"] == "sidecar carries a provider title"
+
+
+@pytest.mark.parametrize("identity", ["magnet", "nzb_url", "usenet_id"])
+def test_any_single_release_identity_is_a_recorded_release(tmp_path, identity):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 9),
+                                   list(range(1, 9)) + [{"episode": 9, "size": None, "hash": ""}])
+    lib.items[-1][identity] = "present"
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 1, 9)]["reason"] == "not legacy blind-registration shape"
