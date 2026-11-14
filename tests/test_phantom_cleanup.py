@@ -16,6 +16,11 @@ class FakeTmdb:
         return [{"episode_number": number} for number in range(1, 9)]
 
 
+class FakeTvmaze:
+    def regular_numbers(self, imdb_id, season):
+        return set(range(1, 9))
+
+
 def _item(episode, **updates):
     item = {
         "token": f"token-{episode}",
@@ -35,6 +40,7 @@ def test_discover_only_returns_unplayed_episodes_past_confirmed_boundary():
     result = phantom_cleanup.discover(
         items=[_item(8), _item(9), _item(10, last_played="2026-08-01 12:00:00")],
         tmdb_client=FakeTmdb(),
+        tvmaze_client=FakeTvmaze(),
     )
 
     assert [row["episode"] for row in result["candidates"]] == [9]
@@ -48,7 +54,8 @@ def test_discover_fails_closed_when_tmdb_payloads_disagree():
         {"episode_number": number} for number in range(1, 8)
     ]
 
-    result = phantom_cleanup.discover(items=[_item(9)], tmdb_client=client)
+    result = phantom_cleanup.discover(items=[_item(9)], tmdb_client=client,
+                                      tvmaze_client=FakeTvmaze())
 
     assert result["candidates"] == []
     assert result["skipped"][0]["reason"] == "TMDB season boundary not authoritative"
@@ -64,6 +71,7 @@ def test_discover_finds_explicit_orphan_spore_stubs(monkeypatch, tmp_path):
     result = phantom_cleanup.discover(
         items=[],
         tmdb_client=FakeTmdb(),
+        tvmaze_client=FakeTvmaze(),
         orphan_show_ids={"Short Season": "tt1234567"},
         spore_root=tmp_path / "spore",
     )
@@ -83,6 +91,7 @@ def test_discover_finds_orphan_source_beyond_boundary(tmp_path):
     result = phantom_cleanup.discover(
         items=[],
         tmdb_client=FakeTmdb(),
+        tvmaze_client=FakeTvmaze(),
         orphan_show_ids={"Short Season": "tt1234567"},
         media_root=tmp_path / "media",
         spore_root=tmp_path / "spore",
@@ -107,6 +116,7 @@ def test_source_candidate_deduplicates_matching_orphan_stub(tmp_path):
     result = phantom_cleanup.discover(
         items=[],
         tmdb_client=FakeTmdb(),
+        tvmaze_client=FakeTvmaze(),
         orphan_show_ids={"Short Season": "tt1234567"},
         media_root=tmp_path / "media",
         spore_root=tmp_path / "spore",
@@ -138,6 +148,7 @@ def test_cleanup_quarantines_exact_files_and_deletes_row(monkeypatch, tmp_path):
     monkeypatch.setattr(phantom_cleanup, "MEDIA_PATH", str(media_root))
     monkeypatch.setattr(phantom_cleanup, "SPORE_MEDIA_PATH", str(spore_root))
     monkeypatch.setattr(phantom_cleanup, "tmdb", FakeTmdb())
+    monkeypatch.setattr(phantom_cleanup, "tvmaze", FakeTvmaze())
     monkeypatch.setattr(phantom_cleanup.playback_guard, "active", lambda force=False: False)
     monkeypatch.setattr(phantom_cleanup.strm_generator, "_maintenance_lock", threading.Lock())
     monkeypatch.setitem(__import__("sys").modules, "media_servers", fake_servers)

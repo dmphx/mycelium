@@ -2,7 +2,38 @@
 
 The `episode_hygiene` scheduler job runs phantom quarantine and episode-numbering
 reconciliation. It keeps their existing playback and in-process maintenance
-gates. The quarantine rules and manifests are unchanged.
+gates.
+
+## Phantom classification
+
+TMDB agreeing with itself is not enough evidence: on 2026-11-13 seventeen of
+59 quarantined episodes were real (a merged two-part finale, spin-off arcs
+TMDB dropped, specials and a restructured web series). Every never-played
+episode above TMDB's self-consistent season boundary is now classified:
+
+| Class | Rule | Applied |
+| --- | --- | --- |
+| `review` | TVmaze lists the episode number as a regular episode | never |
+| `review` | its own `.nfo` has a real title (not `Episode N`) that matches no live canonical slot, or an air date | never |
+| `duplicate` | its `.nfo` title equals a live canonical slot in the same show whose `.strm` and Spore stub exist, rechecked at apply time | quarantined |
+| `phantom` | no provenance, and either no payload (`size_gb` empty or 0) or the legacy blind 1..24 registration on one pack | quarantined |
+| `review` | anything else | never |
+
+TVmaze is read without a key, at most once a second, with one bounded retry
+after a 429. A season it can't confirm is skipped. Unnumbered specials never
+veto. Review rows are reported in the result and the manifest and never moved.
+
+| Setting | Default |
+| --- | --- |
+| `EPISODE_HYGIENE_MAX_QUARANTINE` | `10` per run |
+| `EPISODE_HYGIENE_MAX_PER_SHOW` | `5` per show |
+
+A run over either cap moves nothing and queues no scan. It writes
+`proposal.json` in the quarantine stamp folder for a person to review. Each
+manifest row keeps the complete `virtual_items` row, so a restore never needs a
+database backup.
+
+## Host fence
 
 Before either pass, the job takes exclusive, nonblocking `flock` locks on the
 host's existing `convert-cached.lock` and `plex-targeted-scan.lock`, in that
