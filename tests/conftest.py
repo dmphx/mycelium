@@ -22,9 +22,12 @@ Die twee tests faalden alleen in de volledige suite, niet in isolatie.
 We gebruiken hier expres directe toewijzing (geen setdefault) zodat de mock altijd
 wint, ongeacht of een eerdere import al een echt module achterliet.
 """
+import importlib
 import os
 import sys
 from unittest.mock import MagicMock
+
+import pytest
 
 # Verplichte env vars voor config.py (wordt NIET gemockt)
 os.environ.setdefault("TORBOX_API_KEY", "test")
@@ -47,3 +50,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # eerder geimporteerde module het echte module al in sys.modules zette.
 for _mod in ("db", "jellyfin", "settings", "torbox", "nfo_generator", "mp4_faststart"):
     sys.modules[_mod] = MagicMock()
+
+
+@pytest.fixture(autouse=True)
+def _tmdb_offline(monkeypatch):
+    """De suite draait offline: elke TMDB-lookup krijgt het antwoord van een
+    onbereikbare TMDB (None). Zonder deze stub gingen o.a. webhook_parser.parse,
+    release_sanity en strm_generator met een MagicMock-key echt naar
+    api.themoviedb.org, en welke tests dat deden hing af van de volgorde.
+    Tests die TMDB-data nodig hebben patchen tmdb._get daarna zelf, of zetten
+    een eigen tmdb in sys.modules; beide winnen van deze default."""
+    tmdb = sys.modules.get("tmdb")
+    if not hasattr(tmdb, "_get"):
+        tmdb = importlib.import_module("tmdb")
+    monkeypatch.setattr(tmdb, "_get", lambda *_args, **_kwargs: None)
