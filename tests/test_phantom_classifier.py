@@ -300,6 +300,27 @@ def test_t6_duplicate_rechecked_at_apply_time(monkeypatch, tmp_path):
     assert Path(duplicate["strm_path"]).is_file()
 
 
+def test_t5_generic_title_on_several_canonical_slots_is_review(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 3, range(1, 4), [
+        {"episode": 1, "title": "Reunion"}, 2, {"episode": 3, "title": "Reunion"}])
+    lib.season("tt1", "Show", 2, 2, range(1, 3), [
+        1, 2, {"episode": 3, "title": "Reunion"}])
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 2, 3)]["reason"] == "title matches more than one canonical slot"
+
+
+def test_t5_same_title_with_different_air_date_is_review(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 2, range(1, 3), [
+        {"episode": 1, "title": "Pilot", "aired": "2020-01-01"}, 2,
+        {"episode": 3, "title": "Pilot", "aired": "2021-05-05"}])
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 1, 3)]["reason"] == "air date differs from canonical slot"
+
+
 def test_t7_restructured_show_is_review(tmp_path):
     classes = _classes(_audit_library(tmp_path).discover())
 

@@ -15,7 +15,7 @@ episode above TMDB's self-consistent season boundary is now classified:
 | --- | --- | --- |
 | `review` | TVmaze lists the episode number as a regular episode | never |
 | `review` | its own `.nfo` has a real title (not `Episode N`) that matches no live canonical slot, or an air date | never |
-| `duplicate` | its `.nfo` title equals a live canonical slot in the same show whose `.strm` and Spore stub exist, rechecked at apply time | quarantined |
+| `duplicate` | its `.nfo` title equals exactly one live canonical slot in the same show, with no conflicting air date, whose `.strm` and Spore stub exist, rechecked at apply time | quarantined |
 | `phantom` | no provenance, and either no payload (`size_gb` empty or 0) or the legacy blind 1..24 registration on one pack | quarantined |
 | `review` | anything else | never |
 
