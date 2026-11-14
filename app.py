@@ -413,37 +413,22 @@ def _spore_mark_cached(token: str) -> None:
 
 
 def _spore_plex_rescan(item: dict) -> None:
-    """Best-effort: poke Plex to re-scan just this title's folder so a stub->real
-    flip is re-analyzed and Direct Plays. Needs PLEX_URL + PLEX_TOKEN and the
-    section id (PLEX_MOVIE_SECTION / PLEX_SERIES_SECTION) in the env; if any is
-    missing this is skipped and Plex's own scheduled scan is the backstop."""
-    plex_url = _os.environ.get("PLEX_URL", "").rstrip("/")
-    plex_token = _os.environ.get("PLEX_TOKEN", "")
-    is_series = (item.get("media_type") == "series"
-                 or item.get("season") is not None
-                 or item.get("episode") is not None)
-    section = _os.environ.get(
-        "PLEX_SERIES_SECTION" if is_series else "PLEX_MOVIE_SECTION", "")
-    if not (plex_url and plex_token and section):
+    """Queue a targeted Plex scan of this title's folder after a stub->cached flip.
+
+    It goes through media_servers.mark, the path every other Mycelium scan takes,
+    so the host consumer's folder guard (Onyx #473) decides whether the scan is
+    safe. A direct refresh of the NFS folder bypassed that guard, and a folder
+    scan can trash attached NFS parts. Plex may therefore find the NFS file later
+    or not at all; the stub keeps playing through /spore-stream either way."""
+    strm_path = item.get("strm_path")
+    if not strm_path:
         return
-    strm_path_str = item.get("strm_path")
-    if not strm_path_str:
-        return
-    from pathlib import Path as _P
-    parts = _P(strm_path_str).parts
-    rel_idx = next((i for i in range(len(parts) - 1, -1, -1)
-                    if parts[i] in ("movies", "series")), None)
-    if rel_idx is None:
-        return
-    media_root = _os.environ.get("SPORE_NFS_PLEX_ROOT", "/spore-nfs-media")
-    folder = str(_P(media_root, *parts[rel_idx:-1]))
     try:
-        import requests as _rq
-        _rq.get(f"{plex_url}/library/sections/{section}/refresh",
-                params={"path": folder, "X-Plex-Token": plex_token}, timeout=10)
-        log.debug("spore-nfs: poked Plex re-scan section=%s path=%s", section, folder)
+        import media_servers
+        media_servers.mark(strm_path)
+        log.debug("spore-nfs: queued guarded Plex scan for %s", strm_path)
     except Exception as exc:
-        log.debug("spore-nfs: Plex re-scan poke failed: %s", exc)
+        log.debug("spore-nfs: Plex scan enqueue failed: %s", exc)
 
 
 # Bounded flip pipeline. /spore-stream fires on every read (and the preload hits

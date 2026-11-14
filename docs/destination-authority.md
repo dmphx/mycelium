@@ -18,6 +18,11 @@ cold-start header build gained a one-time stale-link retry. It adds no writer or
 reader: the `.fsh` atomic write keeps its path and only moves into
 `_build_once`. Runtime completeness stays UNPROVED.
 
+The v13 inventory re-pins `app.py` and `media_servers.py` after the direct Plex
+refresh calls were removed: every Plex folder scan, including the Spore flip
+rescan, now goes through the guarded host scan queue. Sink calls are unchanged
+and runtime completeness stays UNPROVED.
+
 `destination_authority.py` is explicitly initialized on a disposable owned SQLite
 connection only. It models an opaque synthetic destination, not a filesystem path.
 It is not imported by startup, dispatch, db.init, import, retry, repair or scheduler.
