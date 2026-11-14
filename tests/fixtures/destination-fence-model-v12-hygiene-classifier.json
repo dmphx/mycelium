@@ -2,7 +2,7 @@
   "version": 1,
   "mode": "isolated_model_no_external_entrypoints",
   "domain_id": "synthetic_destination",
-  "source_inventory_sha256": "8cb932905ec30ed3932f4feb570e6a3e4a27bded1a9f30c8197a48ffdaaf7933",
+  "source_inventory_sha256": "a38ffd288ee8ce21d90e164303e4d9e6ea1dd203c05aaa1ec17ee45f2933c97e",
   "writers": [
     "arr_import",
     "automation",

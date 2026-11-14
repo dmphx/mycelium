@@ -48,6 +48,7 @@ _EPISODE_FILE_RE = re.compile(r"S(\d{1,3})E(\d{1,4})$", re.IGNORECASE)
 _PLACEHOLDER_TITLE_RE = re.compile(r"^(?:episode|ep\.?)\s*\d+$", re.IGNORECASE)
 _NFO_MAX_BYTES = 64 * 1024
 LEGACY_FIXED_COUNT = 24
+_AMBIGUOUS: dict = {}
 
 
 def _env_cap(name: str, default: int) -> int:
@@ -252,6 +253,11 @@ def _classify(candidate: dict, item: dict | None, season_items: list[dict],
         target = canonical.get(_normalize_title(title))
         if target is None:
             return "review", "sidecar carries a provider title"
+        if target is _AMBIGUOUS:
+            return "review", "title matches more than one canonical slot"
+        target_aired = target.get("_aired")
+        if sidecar.get("aired") and target_aired and sidecar["aired"] != target_aired:
+            return "review", "air date differs from canonical slot"
         if not _canonical_slot(media_root, spore_root, target):
             return "review", "canonical slot missing"
         candidate["canonical"] = {
@@ -273,6 +279,7 @@ def _classify(candidate: dict, item: dict | None, season_items: list[dict],
 
 
 def _canonical_titles(show_items: list[dict], boundaries: dict[int, int | None]) -> dict[str, dict]:
+    """Normalized title to its one canonical row; a title on several slots is ambiguous."""
     titles: dict[str, dict] = {}
     for row in show_items:
         season = _int_or_none(row.get("season"))
@@ -280,9 +287,12 @@ def _canonical_titles(show_items: list[dict], boundaries: dict[int, int | None])
         last = boundaries.get(season)
         if season is None or episode is None or last is None or episode > last:
             continue
-        title = _sidecar(row.get("strm_path")).get("title")
-        if not _is_placeholder(title):
-            titles.setdefault(_normalize_title(title), row)
+        sidecar = _sidecar(row.get("strm_path"))
+        title = sidecar.get("title")
+        if _is_placeholder(title):
+            continue
+        key = _normalize_title(title)
+        titles[key] = _AMBIGUOUS if key in titles else {**row, "_aired": sidecar.get("aired")}
     return titles
 
 
