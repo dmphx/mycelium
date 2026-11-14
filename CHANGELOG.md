@@ -6,6 +6,12 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- Mycelium no longer calls Plex's refresh API directly. The Spore stub-to-cached
+  flip and every other targeted scan go through the host scan queue, whose
+  folder guard holds scans that would trash attached NFS parts. Plex may now
+  find a flipped NFS file later or not at all; the stub keeps playing through
+  Spore. `TARGETED_SCAN_PACE_SEC` is retired because the host consumer paces
+  its own scans
 - A first Plex play whose cached CDN link had expired no longer leaves the
   title unplayable until a restart. The fast-start header build re-resolves a
   retired link once and retries (auth, gone and throttled responses stay
