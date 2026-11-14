@@ -304,6 +304,7 @@ def test_failed_cold_build_self_heals_without_restart(client, real_builder):
     tok = "synthetic-heal"
     # 1-3: no fresh link exists yet. The build fails and no size is invented.
     first = client.get(f"/spore-stream/{tok}", headers={"Range": "bytes=0-4095"})
+    first.close()
     assert first.status_code == 502
     assert _real_fs.load(tok) is None
     assert tok not in app_mod._spore_cold_sizes
@@ -316,6 +317,7 @@ def test_failed_cold_build_self_heals_without_restart(client, real_builder):
     assert second.status_code == 206
     assert second.headers["Content-Range"] == f"bytes 0-4095/{SIZE}"
     assert second.data == media[:4096]
+    second.close()
     assert app_mod._spore_cold_sizes[tok] == SIZE
     # Once the backoff lapses the header builds too, still without a restart.
     _wait_for_builders()
@@ -323,6 +325,7 @@ def test_failed_cold_build_self_heals_without_restart(client, real_builder):
     third = client.get(f"/spore-stream/{tok}", headers={"Range": "bytes=0-15"})
     assert third.status_code == 206
     assert third.headers["Content-Range"] == f"bytes 0-15/{SIZE}"
+    third.close()
     assert _real_fs.load(tok)["cdn_size"] == SIZE
 
 
@@ -331,11 +334,12 @@ def test_failed_build_is_not_retried_on_every_range_request(client, real_builder
     for _ in range(3):
         resp = client.get("/spore-stream/synthetic-backoff",
                           headers={"Range": "bytes=0-15"})
+        resp.close()
         assert resp.status_code == 502
         _wait_for_builders()
     assert state["builds"] == 1
     app_mod._spore_build_failed.clear()
-    client.get("/spore-stream/synthetic-backoff", headers={"Range": "bytes=0-15"})
+    client.get("/spore-stream/synthetic-backoff", headers={"Range": "bytes=0-15"}).close()
     _wait_for_builders()
     assert state["builds"] == 2
 
@@ -416,6 +420,7 @@ def test_warm_request_waits_for_header_not_probe(client, real_builder, monkeypat
         resp = client.get("/spore-stream/synthetic-warm", headers={"Range": "bytes=0-15"})
         assert resp.status_code == 206
         assert resp.data == media[:16]
+        resp.close()
         assert probing.wait(2)
         assert time.monotonic() - started < 4.0
     finally:
@@ -440,8 +445,9 @@ def test_concurrent_requests_share_one_inflight_build(client, real_builder, monk
 
     def request_first():
         with app_mod.app.test_client() as other:
-            result.append(other.get("/spore-stream/synthetic-shared",
-                                    headers={"Range": "bytes=0-15"}).status_code)
+            resp = other.get("/spore-stream/synthetic-shared", headers={"Range": "bytes=0-15"})
+            result.append(resp.status_code)
+            resp.close()
 
     first = threading.Thread(target=request_first)
     first.start()
@@ -451,6 +457,7 @@ def test_concurrent_requests_share_one_inflight_build(client, real_builder, monk
         resp = client.get("/spore-stream/synthetic-shared", headers={"Range": "bytes=0-15"})
         assert resp.status_code == 206
         assert resp.data == media[:16]
+        resp.close()
         assert state["builds"] == 1
     finally:
         release.set()
