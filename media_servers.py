@@ -8,6 +8,9 @@ affected show/movie folder instead of firing a blanket /Library/Refresh.
   Plex:     deliver the exact operation through a durable JSON spool; a
             host-side consumer runs the Plex Media Scanner CLI per folder.
             Legacy deployments retain the original two-column scan queue.
+            Mycelium never calls Plex's refresh API itself: the host consumer
+            guards each folder before scanning it (Onyx #473), and a direct
+            refresh would bypass that guard.
 
 Path translation (container -> server-visible):
   MEDIA_PATH (/data/media)      -> JELLYFIN_LIBRARY_ROOT (/mnt/library-mycelium)
@@ -21,7 +24,6 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 
 import requests
@@ -69,10 +71,6 @@ try:
     _DEBOUNCE = float(_cfg("TARGETED_SCAN_DEBOUNCE_SEC", "20"))
 except (TypeError, ValueError):
     _DEBOUNCE = 20.0
-try:
-    _SCAN_PACE = float(_cfg("TARGETED_SCAN_PACE_SEC", "0.5"))
-except (TypeError, ValueError):
-    _SCAN_PACE = 0.5
 
 _lock = threading.Lock()
 _pending = set()       # {(kind, folder)}
@@ -198,28 +196,17 @@ def _flush():
                      "UpdateType": ("Deleted" if mode == "remove" else
                                     "Modified" if mode == "analyze" else "Created")}
                     for kind, folder, mode in batch])
+    # Every Plex operation goes to the host consumer, which guards the folder
+    # before scanning and paces its own Scanner runs.
     plex_queue_requests = []
-    scanned = 0
     for kind, folder, mode in batch:
         section = PLEX_SECTION_TV if kind == "series" else PLEX_SECTION_MOVIE
         root    = PLEX_TV_ROOT if kind == "series" else PLEX_MOVIE_ROOT
         plex_path = "%s/%s" % (root, folder)
-        # Pace successive Plex partial scans so a large batch (e.g. a bulk Spore
-        # backfill marking hundreds of show folders) trickles into Plex's scan
-        # queue instead of bursting. A burst of scanner spawns is what piles up
-        # in D-state and deadlocks SQLite; a small gap keeps Plex responsive.
-        if scanned and _SCAN_PACE > 0:
-            time.sleep(_SCAN_PACE)
-        # A direct Plex API partial scan re-reads changed files, so a stub
-        # rewritten with a corrected codec lands in Plex's DB. Falls back to the
-        # host-drained queue file when no Plex token is configured.
-        if _plex_api_scan(section, plex_path, mode):
-            scanned += 1
-        else:
-            plex_queue_requests.append((
-                (kind, folder, mode),
-                {"mode": mode, "section": section, "path": plex_path},
-            ))
+        plex_queue_requests.append((
+            (kind, folder, mode),
+            {"mode": mode, "section": section, "path": plex_path},
+        ))
     if plex_queue_requests:
         requests_to_queue = [item for _, item in plex_queue_requests]
         try:
@@ -260,40 +247,6 @@ def _scan_jellyfin(updates):
             log.info("Targeted Jellyfin scan: %d folder(s)", len(updates))
     except Exception as exc:
         log.warning("Targeted Jellyfin scan failed (%s); full-refresh backstop will catch it", exc)
-
-
-def _plex_api_scan(section, plex_path, mode="scan"):
-    """Trigger a Plex partial scan of one folder over the HTTP API.
-
-    Returns True only when Plex actually accepted the scan, so the caller skips the
-    host-queue fallback; returns False when no Plex creds are set OR when the request
-    failed/was rejected, letting the caller queue the folder for plex_targeted_scan.sh
-    (Scanner CLI, no token needed). Reporting an HTTP failure as success used to
-    silently disable that fallback whenever the token went stale.
-    A partial scan re-reads changed files, so a stub rewritten with a
-    corrected codec updates Plex's cached media info."""
-    # Spool mode requires positive host-consumer acknowledgement for every
-    # operation. The refresh API also cannot express Scanner CLI analysis.
-    if PLEX_QUEUE_MODE == "spool" or mode == "analyze":
-        return False
-    url   = _cfg("PLEX_URL", "")
-    token = _cfg("PLEX_TOKEN", "")
-    if not url or not token:
-        return False
-    try:
-        resp = requests.get("%s/library/sections/%s/refresh" % (url.rstrip("/"), section),
-                            params={"path": plex_path, "X-Plex-Token": token},
-                            timeout=15)
-        if resp.status_code >= 400:
-            log.warning("Plex API scan HTTP %s for %s; falling back to host scan queue",
-                        resp.status_code, plex_path)
-            return False
-        log.info("Plex API partial scan: section %s path %s", section, plex_path)
-        return True
-    except Exception as exc:
-        log.warning("Plex API scan failed for %s (%s); falling back to host scan queue",
-                    plex_path, exc)
-        return False
 
 
 def _queue_plex(requests_to_queue):

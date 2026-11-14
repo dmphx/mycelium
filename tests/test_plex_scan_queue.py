@@ -245,7 +245,6 @@ def test_flush_reschedules_spool_enqueue_failure(monkeypatch):
         media_servers._pending.add(("series", "Example", "analyze"))
         media_servers._timer = None
     monkeypatch.setattr(media_servers, "_scan_jellyfin", lambda updates: None)
-    monkeypatch.setattr(media_servers, "_plex_api_scan", lambda *a, **k: False)
     monkeypatch.setattr(media_servers, "_queue_plex", lambda requests: requests)
     monkeypatch.setattr(media_servers.threading, "Timer", Timer)
 
@@ -274,7 +273,6 @@ def test_flush_reschedules_unexpected_spool_exception(monkeypatch):
         media_servers._pending.add(("movies", "Example", "scan"))
         media_servers._timer = None
     monkeypatch.setattr(media_servers, "_scan_jellyfin", lambda updates: None)
-    monkeypatch.setattr(media_servers, "_plex_api_scan", lambda *a, **k: False)
     monkeypatch.setattr(
         media_servers, "_queue_plex",
         lambda requests: (_ for _ in ()).throw(OSError("spool unavailable")),
@@ -290,25 +288,30 @@ def test_flush_reschedules_unexpected_spool_exception(monkeypatch):
         media_servers._timer = None
 
 
-def test_analyze_never_degrades_to_refresh_api(monkeypatch):
-    called = []
-    monkeypatch.setattr(media_servers.requests, "get", lambda *a, **k: called.append(1))
+@pytest.mark.parametrize("queue_mode", ["legacy", "spool"])
+@pytest.mark.parametrize("mode", ["scan", "remove", "analyze"])
+def test_flush_queues_every_plex_operation_and_never_calls_refresh(monkeypatch,
+                                                                    queue_mode, mode):
+    """Plex scans go only to the guarded host consumer, even with a token set."""
+    called, queued = [], []
+    monkeypatch.setattr(media_servers, "PLEX_QUEUE_MODE", queue_mode)
+    monkeypatch.setattr(media_servers, "_cfg", lambda key, default="": {
+        "PLEX_URL": "http://plex.test:32400", "PLEX_TOKEN": "synthetic",
+    }.get(key, default))
+    monkeypatch.setattr(media_servers.requests, "get", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(media_servers, "_scan_jellyfin", lambda updates: None)
+    monkeypatch.setattr(media_servers, "_queue_plex",
+                        lambda requests: queued.extend(requests) or [])
+    with media_servers._lock:
+        media_servers._pending.clear()
+        media_servers._pending.add(("series", "Example/Season 01", mode))
+        media_servers._timer = None
 
-    assert media_servers._plex_api_scan(
-        "8", "/mnt/library/shows/Example", "analyze"
-    ) is False
+    media_servers._flush()
+
     assert called == []
-
-
-def test_spool_mode_never_bypasses_acknowledged_delivery(monkeypatch):
-    called = []
-    monkeypatch.setattr(media_servers, "PLEX_QUEUE_MODE", "spool")
-    monkeypatch.setattr(media_servers.requests, "get", lambda *a, **k: called.append(1))
-
-    assert media_servers._plex_api_scan(
-        "8", "/mnt/library/shows/Example", "scan"
-    ) is False
-    assert called == []
+    assert queued == [{"mode": mode, "section": media_servers.PLEX_SECTION_TV,
+                       "path": "%s/Example/Season 01" % media_servers.PLEX_TV_ROOT}]
 
 
 @pytest.mark.parametrize(

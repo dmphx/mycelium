@@ -479,3 +479,21 @@ def test_fetch_client_errors_fail_fast_and_transient_ones_retry(monkeypatch, sta
         _real_fs._get(FRESH, 0, 15, tries=4)
     assert exc.value.status == status
     assert len(sent) == expected_tries
+
+
+def test_flip_rescan_queues_a_guarded_scan_and_never_refreshes_plex(monkeypatch):
+    import media_servers
+    marked, called = [], []
+    monkeypatch.setattr(media_servers, "mark", marked.append)
+    monkeypatch.setattr(app_mod._os, "environ", {
+        "PLEX_URL": "http://plex.test:32400", "PLEX_TOKEN": "synthetic",
+        "PLEX_SERIES_SECTION": "8", "PLEX_MOVIE_SECTION": "7",
+    })
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: called.append(a))
+    strm = "/data/media/series/Example/Season 01/Example S01E01.strm"
+    app_mod._spore_plex_rescan({"media_type": "series", "strm_path": strm})
+    app_mod._spore_plex_rescan({"media_type": "series", "strm_path": None})
+    assert marked == [strm]
+    assert called == []
+
