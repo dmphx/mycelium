@@ -13,6 +13,11 @@ edit and scanner jobs only. They are not this model's durable destination fence
 and do not establish all-reader or all-writer completeness. The source inventory
 includes the hygiene runner while preserving those unproved runtime limits.
 
+The v12 inventory re-pins `app.py` and `mp4_faststart.py` after the Spore
+cold-start header build gained a one-time stale-link retry. It adds no writer or
+reader: the `.fsh` atomic write keeps its path and only moves into
+`_build_once`. Runtime completeness stays UNPROVED.
+
 `destination_authority.py` is explicitly initialized on a disposable owned SQLite
 connection only. It models an opaque synthetic destination, not a filesystem path.
 It is not imported by startup, dispatch, db.init, import, retry, repair or scheduler.
