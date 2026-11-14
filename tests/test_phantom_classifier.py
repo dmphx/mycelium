@@ -226,7 +226,11 @@ def test_audit_none_of_the_17_restored_entries_is_flagged(tmp_path):
     assert flagged & AUDIT_RESTORE_17 == set()
     assert AUDIT_RESTORE_17 <= reviewed
     # Everything the classifier still flags is an audited phantom (42 of 59 total).
-    assert len(flagged) == 36
+    # Only the legacy blind-24 season and duplicates of live slots still qualify.
+    # Audited phantoms that carry a release hash go to review instead.
+    assert flagged == {("tt19226058", 1, n) for n in range(11, 25)} | {
+        ("tt1933073", 5, n) for n in (11, 14, 15, 16, 17)} | {
+        ("tt1933073", 6, n) for n in (8, 9, 10)}
     assert all(row["class"] in {"phantom", "duplicate"} for row in result["candidates"])
 
 
@@ -236,14 +240,14 @@ def test_t1_legacy_blind_registration_is_phantom(tmp_path):
     assert {classes[("tt19226058", 1, n)] for n in range(11, 25)} == {"phantom"}
 
 
-def test_t2_merged_two_parter_is_review_but_empty_slot_is_phantom(tmp_path):
+def test_t2_merged_two_parter_is_review(tmp_path):
     result = _audit_library(tmp_path).discover()
     rows = {_key(row): row for row in result["candidates"] + result["review"]}
 
     assert rows[("tt0410975", 8, 23)]["class"] == "review"
     assert rows[("tt0410975", 8, 23)]["reason"] == "second provider lists episode"
-    assert rows[("tt0410975", 8, 24)]["class"] == "phantom"
-    assert rows[("tt0410975", 8, 24)]["reason"] == "no payload"
+    # E24 has no title but does have a release hash, so it isn't affirmatively empty.
+    assert rows[("tt0410975", 8, 24)]["class"] == "review"
 
 
 def test_t3_spin_off_arc_listed_by_second_provider_is_review(tmp_path):
@@ -260,7 +264,7 @@ def test_t4_moved_to_specials_is_review_by_provenance(tmp_path):
     assert rows[("tt1252370", 6, 28)]["reason"] == "sidecar carries a provider title"
     assert rows[("tt1252370", 6, 29)]["class"] == "review"
     assert rows[("tt1252370", 6, 30)]["reason"] == "not legacy blind-registration shape"
-    assert rows[("tt1252370", 6, 31)]["class"] == "phantom"
+    assert rows[("tt1252370", 6, 31)]["class"] == "review"
 
 
 def test_t5_duplicate_of_live_canonical_slot_records_target(tmp_path):
@@ -346,9 +350,22 @@ def test_t9_second_provider_unavailable_skips_season(tmp_path):
 
 
 def test_t10_unnumbered_specials_do_not_veto(tmp_path):
-    classes = _classes(_audit_library(tmp_path).discover())
+    replies = [{"id": 5}, [
+        {"season": 7, "number": n, "type": "regular"} for n in range(1, 9)] + [
+        {"season": 7, "number": None, "type": "insignificant_special"} for _ in range(9)]]
+    session = SimpleNamespace(get=lambda url, timeout: SimpleNamespace(
+        status_code=200, headers={}, json=lambda payload=replies.pop(0): payload))
+    lib = Library(tmp_path).season(
+        "tt3321546", "George Clarke's Amazing Spaces", 7, 8, None,
+        list(range(1, 9)) + [{"episode": n, "size": None, "hash": ""} for n in range(10, 17)])
 
-    assert {classes[("tt3321546", 7, n)] for n in range(10, 17)} == {"phantom"}
+    result = phantom_cleanup.discover(
+        items=lib.items, tmdb_client=FakeTmdb(lib.tmdb),
+        tvmaze_client=phantom_cleanup.TvmazeClient(session=session, min_interval=0),
+        media_root=lib.media, spore_root=lib.spore)
+
+    assert {(row["episode"], row["reason"]) for row in result["candidates"]} == {
+        (n, "no recorded release") for n in range(10, 17)}
 
 
 def test_t11_placeholder_title_with_air_date_is_review(tmp_path):
@@ -379,7 +396,7 @@ def _empty_slots(tmp_path, shows, per_show):
     lib = Library(tmp_path)
     for index in range(shows):
         lib.season(f"tt{index:07d}", f"Show {index}", 1, 4, range(1, 5),
-                   list(range(1, 5)) + [{"episode": n, "size": None, "hash": f"h{index}-{n}"}
+                   list(range(1, 5)) + [{"episode": n, "size": None, "hash": ""}
                                         for n in range(5, 5 + per_show)])
     return lib
 
@@ -433,7 +450,8 @@ def test_audit_run_as_a_whole_is_over_cap(monkeypatch, tmp_path):
 def test_t14_played_episode_is_skipped(tmp_path):
     lib = Library(tmp_path).season(
         "tt1", "Show", 1, 8, range(1, 9),
-        list(range(1, 9)) + [{"episode": 9, "size": None, "last_played": "2026-09-14 21:01:22"}])
+        list(range(1, 9)) + [{"episode": 9, "size": None, "hash": "",
+                              "last_played": "2026-09-14 21:01:22"}])
 
     result = lib.discover()
 
@@ -444,7 +462,7 @@ def test_t14_played_episode_is_skipped(tmp_path):
 def test_t15_manifest_keeps_restorable_row(monkeypatch, tmp_path):
     lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 9),
                                    list(range(1, 9)) + [{"episode": 9, "size": None,
-                                                         "hash": "hash-9"}])
+                                                         "hash": ""}])
     original = dict(next(item for item in lib.items if item["episode"] == 9))
     report = lib.discover()
     marked, deleted = _patch_apply(monkeypatch, lib, report)
@@ -510,3 +528,60 @@ def test_tvmaze_client_fails_closed(monkeypatch, failure):
 
     assert client.regular_numbers("tt1", 1) is None
     assert phantom_cleanup._second_provider("tt1", 1, client) is None
+
+
+def test_unknown_size_with_a_release_hash_is_not_an_empty_slot(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 9),
+                                   list(range(1, 9)) + [{"episode": 9, "size": 0.0,
+                                                         "hash": "hash-own"}])
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 1, 9)]["reason"] == "not legacy blind-registration shape"
+
+
+def test_unreadable_sidecar_is_review(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 9),
+                                   list(range(1, 9)) + [{"episode": 9, "size": None, "hash": ""}])
+    nfo = Path(lib.items[-1]["strm_path"]).with_suffix(".nfo")
+    nfo.mkdir()
+
+    rows = {_key(row): row for row in lib.discover()["review"]}
+
+    assert rows[("tt1", 1, 9)]["reason"] == "sidecar unreadable"
+
+
+def test_non_latin_titles_never_collapse_into_a_duplicate(tmp_path):
+    lib = Library(tmp_path).season("tt1", "Show", 1, 2, range(1, 3), [
+        {"episode": 1, "title": "旅立ち"}, 2,
+        {"episode": 3, "title": "再会", "aired": "2021-05-05", "hash": ""},
+        {"episode": 4, "title": "旅立ち", "hash": ""},
+        {"episode": 5, "title": "!!!", "hash": ""}])
+
+    result = lib.discover()
+    rows = {_key(row): row for row in result["candidates"] + result["review"]}
+
+    assert rows[("tt1", 1, 3)]["reason"] == "sidecar carries a provider title"
+    assert rows[("tt1", 1, 4)]["class"] == "duplicate"
+    assert rows[("tt1", 1, 5)]["reason"] == "sidecar carries a provider title"
+
+
+def test_each_discovery_run_gets_a_fresh_second_provider_cache(monkeypatch, tmp_path):
+    created = []
+
+    class Counting:
+        def __init__(self):
+            created.append(self)
+
+        def regular_numbers(self, imdb_id, season):
+            return set(range(1, 9))
+
+    lib = Library(tmp_path).season("tt1", "Show", 1, 8, range(1, 9),
+                                   list(range(1, 9)) + [{"episode": 9, "hash": ""}])
+    monkeypatch.setattr(phantom_cleanup, "tvmaze", Counting)
+
+    for _ in range(2):
+        phantom_cleanup.discover(items=lib.items, tmdb_client=FakeTmdb(lib.tmdb),
+                                 media_root=lib.media, spore_root=lib.spore)
+
+    assert len(created) == 2 and created[0] is not created[1]

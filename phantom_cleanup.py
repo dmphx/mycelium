@@ -2,7 +2,7 @@
 
 Older Mycelium builds could register a fixed 24 episodes when TMDB metadata was
 temporarily unavailable. This module removes only that narrow failure shape,
-plus slots that carry no payload at all and exact duplicates of a live
+plus slots with no recorded release at all and exact duplicates of a live
 canonical episode. Discovery is read only. Applying a cleanup is playback
 gated, serialized with other media maintenance, and moves files into
 quarantine before deleting the corresponding virtual item row.
@@ -11,8 +11,9 @@ TMDB agreeing with itself is not enough evidence (2026-11-13: 17 of 59
 quarantined entries were real). Every candidate above the TMDB boundary is
 classified:
 
-  phantom    no second-provider listing, no provider title or air date in its
-             own sidecar, and either no payload or the legacy blind-24 shape;
+  phantom    no second-provider listing, a readable sidecar with no provider
+             title or air date, and either no recorded release (no hash,
+             magnet or usenet id) or the legacy blind-24 shape;
   duplicate  its sidecar title equals a live canonical slot in the same show;
   review     anything else. Reported, never moved.
 
@@ -29,6 +30,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -147,7 +149,9 @@ class TvmazeClient:
         return numbers
 
 
-tvmaze = TvmazeClient()
+# A factory, not a shared instance: each discovery run gets a fresh cache, so a
+# transient failure or a stale episode list never outlives the run.
+tvmaze = TvmazeClient
 
 
 def _official_last(tmdb_id: int | None, show_info: dict | None, season_number: int,
@@ -180,15 +184,20 @@ def _second_provider(imdb_id: str, season_number: int, tvmaze_client) -> set[int
 
 
 def _sidecar(strm_path) -> dict:
-    """Title and air date from the item's own .nfo, written from provider metadata."""
+    """Title and air date from the item's own .nfo, written from provider metadata.
+
+    A missing sidecar is empty. One that exists but can't be read is marked
+    unreadable: unavailable evidence is not absent evidence."""
     if not strm_path:
         return {}
     nfo = Path(strm_path).with_suffix(".nfo")
     try:
         with nfo.open("rb") as handle:
             text = handle.read(_NFO_MAX_BYTES).decode("utf-8", errors="replace")
-    except OSError:
+    except FileNotFoundError:
         return {}
+    except OSError:
+        return {"unreadable": True}
     found = {}
     for key in ("title", "aired"):
         match = re.search(rf"<{key}>(.*?)</{key}>", text, re.S)
@@ -199,7 +208,9 @@ def _sidecar(strm_path) -> dict:
 
 
 def _normalize_title(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", html.unescape(value or "").casefold())
+    """Casefolded letters and digits in any script; punctuation and spacing dropped."""
+    text = unicodedata.normalize("NFKC", html.unescape(value or "")).casefold()
+    return "".join(char for char in text if char.isalnum())
 
 
 def _is_placeholder(title: str | None) -> bool:
@@ -207,11 +218,10 @@ def _is_placeholder(title: str | None) -> bool:
 
 
 def _no_payload(item: dict) -> bool:
-    size = item.get("size_gb")
-    try:
-        return size is None or float(size) <= 0
-    except (TypeError, ValueError):
-        return True
+    """Affirmative absence: no release identity at all. An unknown size is not enough,
+    since providers record a missing size as 0."""
+    return not any(str(item.get(key) or "").strip()
+                   for key in ("info_hash", "magnet", "nzb_url", "usenet_id"))
 
 
 def _legacy_shape(item: dict, season_items: list[dict], official_last: int) -> bool:
@@ -248,9 +258,12 @@ def _classify(candidate: dict, item: dict | None, season_items: list[dict],
     if episode in provider_numbers:
         return "review", "second provider lists episode"
     sidecar = _sidecar(candidate.get("strm_path"))
+    if sidecar.get("unreadable"):
+        return "review", "sidecar unreadable"
     title = sidecar.get("title")
     if not _is_placeholder(title):
-        target = canonical.get(_normalize_title(title))
+        key = _normalize_title(title)
+        target = canonical.get(key) if key else None
         if target is None:
             return "review", "sidecar carries a provider title"
         if target is _AMBIGUOUS:
@@ -272,7 +285,7 @@ def _classify(candidate: dict, item: dict | None, season_items: list[dict],
     if item is None:
         return "phantom", "orphan file without a virtual item"
     if _no_payload(item):
-        return "phantom", "no payload"
+        return "phantom", "no recorded release"
     if _legacy_shape(item, season_items, official_last):
         return "phantom", "legacy blind registration"
     return "review", "not legacy blind-registration shape"
@@ -292,6 +305,8 @@ def _canonical_titles(show_items: list[dict], boundaries: dict[int, int | None])
         if _is_placeholder(title):
             continue
         key = _normalize_title(title)
+        if not key:
+            continue
         titles[key] = _AMBIGUOUS if key in titles else {**row, "_aired": sidecar.get("aired")}
     return titles
 
@@ -309,7 +324,7 @@ def discover(imdb_ids: set[str] | None = None, items: list[dict] | None = None,
     evidence for removal. Only phantom and duplicate rows are candidates.
     """
     tmdb_client = tmdb_client or tmdb
-    tvmaze_client = tvmaze_client or tvmaze
+    tvmaze_client = tvmaze_client or tvmaze()
     wanted_ids = {value for value in (imdb_ids or set()) if value}
     rows = items if items is not None else db.get_all_virtual_items()
     source_root = Path(media_root or MEDIA_PATH)

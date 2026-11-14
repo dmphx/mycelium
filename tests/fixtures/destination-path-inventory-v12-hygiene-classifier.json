@@ -143,7 +143,7 @@
         },
         {
           "path": "phantom_cleanup.py",
-          "sha256": "3dc65d8ba826ad5f2aeea9c64a71cbae17cb7db04c810a4801cb490001b741ae"
+          "sha256": "22a96d0fb2f8c5a2d6ca1c54715e33f8ef16ecff1d740e8d268cb18dc155f9b0"
         },
         {
           "path": "episode_hygiene.py",
@@ -524,7 +524,7 @@
     },
     {
       "path": "phantom_cleanup.py",
-      "sha256": "3dc65d8ba826ad5f2aeea9c64a71cbae17cb7db04c810a4801cb490001b741ae"
+      "sha256": "22a96d0fb2f8c5a2d6ca1c54715e33f8ef16ecff1d740e8d268cb18dc155f9b0"
     },
     {
       "path": "placeholder_cleanup.py",
@@ -1298,31 +1298,31 @@
     },
     {
       "path": "phantom_cleanup.py",
-      "line": 587,
+      "line": 602,
       "function": "cleanup",
       "call": "atomic_write_text"
     },
     {
       "path": "phantom_cleanup.py",
-      "line": 624,
+      "line": 639,
       "function": "cleanup",
       "call": "shutil.move"
-    },
-    {
-      "path": "phantom_cleanup.py",
-      "line": 627,
-      "function": "cleanup",
-      "call": "db.delete_virtual_item"
     },
     {
       "path": "phantom_cleanup.py",
       "line": 642,
       "function": "cleanup",
+      "call": "db.delete_virtual_item"
+    },
+    {
+      "path": "phantom_cleanup.py",
+      "line": 657,
+      "function": "cleanup",
       "call": "shutil.move"
     },
     {
       "path": "phantom_cleanup.py",
-      "line": 652,
+      "line": 667,
       "function": "cleanup",
       "call": "atomic_write_text"
     },
@@ -1858,7 +1858,7 @@
     {
       "path": "phantom_cleanup.py",
       "old_sha256": "2590bcadc455f72b93f1c66c19fb50d4a152882e255bf068a49710b2ce0c7fd4",
-      "new_sha256": "3dc65d8ba826ad5f2aeea9c64a71cbae17cb7db04c810a4801cb490001b741ae"
+      "new_sha256": "22a96d0fb2f8c5a2d6ca1c54715e33f8ef16ecff1d740e8d268cb18dc155f9b0"
     }
   ],
   "review_scope": "Episode hygiene phantom classifier: TVmaze second-provider veto, sidecar provenance veto with a duplicate class, legacy-shape gate and run/show caps; no complete destination authority. Runtime completeness remains UNPROVED.",

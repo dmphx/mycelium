@@ -148,7 +148,7 @@ def test_cleanup_quarantines_exact_files_and_deletes_row(monkeypatch, tmp_path):
     monkeypatch.setattr(phantom_cleanup, "MEDIA_PATH", str(media_root))
     monkeypatch.setattr(phantom_cleanup, "SPORE_MEDIA_PATH", str(spore_root))
     monkeypatch.setattr(phantom_cleanup, "tmdb", FakeTmdb())
-    monkeypatch.setattr(phantom_cleanup, "tvmaze", FakeTvmaze())
+    monkeypatch.setattr(phantom_cleanup, "tvmaze", FakeTvmaze)
     monkeypatch.setattr(phantom_cleanup.playback_guard, "active", lambda force=False: False)
     monkeypatch.setattr(phantom_cleanup.strm_generator, "_maintenance_lock", threading.Lock())
     monkeypatch.setitem(__import__("sys").modules, "media_servers", fake_servers)
