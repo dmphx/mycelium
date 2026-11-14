@@ -4,9 +4,27 @@ when:
     branch: main
   - event: manual
 
+# Each toolchain has a deps step (network on) that stages everything under
+# /woodpecker/ci-deps, outside the checkout, and a test step on the same image
+# digest with network_mode: none (loopback only). Woodpecker 3.13 allows
+# network_mode: none without trusted network. Every offline step first proves it
+# has no network interface but lo before it runs anything.
+
 steps:
+  - name: python-deps
+    image: python:3.12.13-bookworm@sha256:3cd9086bdb30f7c9bc08a3fa621d9842e0d3f6f9291aeb4677e0547817c10b12
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    commands:
+      - mkdir -p /woodpecker/ci-deps/apt-python/partial
+      - apt-get update
+      - apt-get install -y --no-install-recommends --download-only -o Dir::Cache::archives=/woodpecker/ci-deps/apt-python ffmpeg
+      - python -m venv /woodpecker/ci-deps/venv
+      - /woodpecker/ci-deps/venv/bin/pip install --disable-pip-version-check -r requirements.txt pytest==8.4.2
+
   - name: python-tests
     image: python:3.12.13-bookworm@sha256:3cd9086bdb30f7c9bc08a3fa621d9842e0d3f6f9291aeb4677e0547817c10b12
+    network_mode: none
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
@@ -25,37 +43,62 @@ steps:
       JELLYFIN_URL: ""
       PLEX_URL: ""
     commands:
+      - test "$$(ls /sys/class/net)" = "lo"
+      - python -I tools/ci_network_probe.py
+      - dpkg -i /woodpecker/ci-deps/apt-python/*.deb > /dev/null
+      - ffmpeg -version | head -1
       - mkdir -p /tmp/mycelium-ci/media /tmp/mycelium-ci/spore /tmp/mycelium-ci/enrichment
+      - /woodpecker/ci-deps/venv/bin/python -c 'import pytest, sys; assert pytest.__version__ == "8.4.2", pytest.__version__; print(sys.version)'
+      # The guard only attributes in-process network attempts to tests; the
+      # container network boundary is what keeps the run offline.
+      - /woodpecker/ci-deps/venv/bin/python -B -m pytest -p tools.ci_offline_guard tests/ -q --tb=short -p no:cacheprovider --junitxml=python-tests.xml
+
+  - name: go-deps
+    image: golang:1.25.12-bookworm@sha256:6359592445455f2dbe2412bed411336035bc019a50017720d77454ffdd6d0f82
+    environment:
+      GOTOOLCHAIN: local
+      GOMODCACHE: /woodpecker/ci-deps/gomod
+    commands:
+      - mkdir -p /woodpecker/ci-deps/apt-go/partial
       - apt-get update
-      - apt-get install -y --no-install-recommends ffmpeg
-      - pip install --disable-pip-version-check -r requirements.txt pytest==8.4.2
-      - python -c 'import pytest, sys; assert pytest.__version__ == "8.4.2", pytest.__version__; print(sys.version)'
-      # Network is only for the installs above. The guard refuses and records every
-      # non-loopback connect or lookup made by the suite, and fails the run if any happened.
-      - python -B -m pytest -p tools.ci_offline_guard tests/ -q --tb=short -p no:cacheprovider --junitxml=python-tests.xml
+      - apt-get install -y --no-install-recommends --download-only -o Dir::Cache::archives=/woodpecker/ci-deps/apt-go ffmpeg
+      - cd spore-nfs
+      - go mod download
 
   - name: go-tests
     image: golang:1.25.12-bookworm@sha256:6359592445455f2dbe2412bed411336035bc019a50017720d77454ffdd6d0f82
+    network_mode: none
     environment:
       GOTOOLCHAIN: local
       GOMAXPROCS: "4"
       GOMEMLIMIT: 4GiB
+      GOMODCACHE: /woodpecker/ci-deps/gomod
+      GOPROXY: "off"
+      GOFLAGS: -mod=readonly
     commands:
-      - apt-get update
-      - apt-get install -y --no-install-recommends ffmpeg
+      - test "$$(ls /sys/class/net)" = "lo"
+      - if getent ahosts proxy.golang.org; then echo "DNS resolved offline"; exit 1; fi
+      - dpkg -i /woodpecker/ci-deps/apt-go/*.deb > /dev/null
       - mkdir -p /tmp/mycelium-ci
       - ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 4 -c:v ffv1 -threads 2 -c:a pcm_s16le /tmp/mycelium-ci/synthetic.mkv
       - test "$$(stat -c %s /tmp/mycelium-ci/synthetic.mkv)" -ge 1048576
       - cd spore-nfs
-      - go mod download
-      - GOPROXY=off GOFLAGS=-mod=readonly SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 -mod=readonly ./...
+      - SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 ./...
 
-  - name: frontend-checks
+  - name: frontend-deps
     image: node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb
-    environment:
-      NODE_OPTIONS: --max-old-space-size=4096
     commands:
       - cd frontend
       - npm ci --no-audit --no-fund
+
+  - name: frontend-checks
+    image: node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb
+    network_mode: none
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
+    commands:
+      - test "$$(ls /sys/class/net)" = "lo"
+      - if getent ahosts registry.npmjs.org; then echo "DNS resolved offline"; exit 1; fi
+      - cd frontend
       - npm run build
       - npx --no-install tsc --noEmit
