@@ -16,11 +16,12 @@ episode above TMDB's self-consistent season boundary is now classified:
 | `review` | TVmaze lists the episode number as a regular episode | never |
 | `review` | its own `.nfo` has a real title (not `Episode N`) that matches no live canonical slot, or an air date | never |
 | `duplicate` | its `.nfo` title equals exactly one live canonical slot in the same show, with no conflicting air date, whose `.strm` and Spore stub exist, rechecked at apply time | quarantined |
-| `phantom` | no provenance, and either no payload (`size_gb` empty or 0) or the legacy blind 1..24 registration on one pack | quarantined |
+| `review` | its `.nfo` exists but can't be read | never |
+| `phantom` | a readable or absent `.nfo` with no provenance, and either no recorded release (no hash, magnet or usenet id; an unknown size is not enough) or the legacy blind 1..24 registration on one pack | quarantined |
 | `review` | anything else | never |
 
 TVmaze is read without a key, at most once a second, with one bounded retry
-after a 429. A season it can't confirm is skipped. Unnumbered specials never
+after a 429, through a fresh cache for each discovery run. A season it can't confirm is skipped. Unnumbered specials never
 veto. Review rows are reported in the result and the manifest and never moved.
 
 | Setting | Default |
