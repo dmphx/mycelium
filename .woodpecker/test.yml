@@ -1,9 +1,12 @@
 when:
-  - event: [push, pull_request, manual]
+  - event: pull_request
+  - event: push
+    branch: main
+  - event: manual
 
 steps:
   - name: python-tests
-    image: python:3.12-bookworm
+    image: python:3.12.13-bookworm@sha256:3cd9086bdb30f7c9bc08a3fa621d9842e0d3f6f9291aeb4677e0547817c10b12
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
@@ -26,10 +29,13 @@ steps:
       - apt-get update
       - apt-get install -y --no-install-recommends ffmpeg
       - pip install --disable-pip-version-check -r requirements.txt pytest==8.4.2
-      - python -B -m pytest tests/ -q --tb=short -p no:cacheprovider --junitxml=python-tests.xml
+      - python -c 'import pytest, sys; assert pytest.__version__ == "8.4.2", pytest.__version__; print(sys.version)'
+      # Network is only for the installs above. The guard refuses and records every
+      # non-loopback connect or lookup made by the suite, and fails the run if any happened.
+      - python -B -m pytest -p tools.ci_offline_guard tests/ -q --tb=short -p no:cacheprovider --junitxml=python-tests.xml
 
   - name: go-tests
-    image: golang:1.25.12-bookworm
+    image: golang:1.25.12-bookworm@sha256:6359592445455f2dbe2412bed411336035bc019a50017720d77454ffdd6d0f82
     environment:
       GOTOOLCHAIN: local
       GOMAXPROCS: "4"
@@ -39,12 +45,13 @@ steps:
       - apt-get install -y --no-install-recommends ffmpeg
       - mkdir -p /tmp/mycelium-ci
       - ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 4 -c:v ffv1 -threads 2 -c:a pcm_s16le /tmp/mycelium-ci/synthetic.mkv
-      - test "$(stat -c %s /tmp/mycelium-ci/synthetic.mkv)" -ge 1048576
+      - test "$$(stat -c %s /tmp/mycelium-ci/synthetic.mkv)" -ge 1048576
       - cd spore-nfs
-      - SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 -mod=readonly ./...
+      - go mod download
+      - GOPROXY=off GOFLAGS=-mod=readonly SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 -mod=readonly ./...
 
   - name: frontend-checks
-    image: node:22-bookworm
+    image: node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb
     environment:
       NODE_OPTIONS: --max-old-space-size=4096
     commands:
