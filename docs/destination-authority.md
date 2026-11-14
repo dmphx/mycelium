@@ -23,6 +23,10 @@ refresh calls were removed: every Plex folder scan, including the Spore flip
 rescan, now goes through the guarded host scan queue. Sink calls are unchanged
 and runtime completeness stays UNPROVED.
 
+The v14 inventory re-pins `phantom_cleanup.py` for the hygiene phantom
+classifier. Its one new sink is the over-cap `proposal.json` atomic write; it
+adds no writer group or reader. Runtime completeness stays UNPROVED.
+
 `destination_authority.py` is explicitly initialized on a disposable owned SQLite
 connection only. It models an opaque synthetic destination, not a filesystem path.
 It is not imported by startup, dispatch, db.init, import, retry, repair or scheduler.
