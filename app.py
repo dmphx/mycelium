@@ -1899,8 +1899,14 @@ def stream_redirect(token: str):
 import cachetools as _cachetools
 # Bounded to keep memory finite when a Plex transcoder churns through many
 # distinct tokens; entries are cheap (int file_size) so 10k is generous.
-_spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=86400)
-_spore_probing: set  = set()  # tokens currently running a background probe
+# A cold size only spares FFmpeg's seek burst a HEAD per Range request, so it is
+# short-lived and never decides whether a header build may run.
+_spore_cold_sizes: "_cachetools.TTLCache[str, int]" = _cachetools.TTLCache(maxsize=10000, ttl=60)
+_spore_probing: set  = set()  # tokens with a header build or probe in flight
+# Tokens whose header build just failed: the next attempt waits this long, so a
+# dead link is not rebuilt on every Range request.
+_spore_build_failed: "_cachetools.TTLCache[str, bool]" = _cachetools.TTLCache(maxsize=10000, ttl=30)
+_spore_build_lock = threading.Lock()
 
 
 def _spore_source_key(token: str) -> str:
@@ -2096,12 +2102,21 @@ def spore_stream_proxy(token: str):
 
     cdn_url = url
 
-    def _build_then_probe(cdn_url_: str, tok: str) -> None:
+    def _build_then_probe(cdn_url_: str, tok: str,
+                          built: "threading.Event | None" = None) -> None:
         import json as _json, subprocess as _sp
         import strm_generator as _sg, db as _db, mp4_faststart as _fs
         try:
-            ok = mp4_faststart.build_and_cache(
-                cdn_url_, tok, source_key=_spore_source_key(tok))
+            ok = False
+            try:
+                ok = mp4_faststart.build_and_cache(
+                    cdn_url_, tok, source_key=_spore_source_key(tok))
+            finally:
+                if not ok:
+                    with _spore_build_lock:
+                        _spore_build_failed[tok] = True
+                if built is not None:
+                    built.set()
             if not ok:
                 return
 
@@ -2112,6 +2127,8 @@ def spore_stream_proxy(token: str):
 
             cp = _fs.extract_codec_private(tok)
             v_extra_hex = cp.hex() if cp else ""
+            # The build may have replaced a retired link; probe the current one.
+            cdn_url_ = catbox.materialize(tok, record_playback=False) or cdn_url_
 
             res = _sp.run(
                 ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -2145,38 +2162,39 @@ def spore_stream_proxy(token: str):
         except Exception as exc:
             log.warning("spore-stream: post-build probe failed for %s: %s", tok, exc)
         finally:
-            _spore_probing.discard(tok)
+            with _spore_build_lock:
+                _spore_probing.discard(tok)
 
-    if info is None and token not in _spore_cold_sizes:
+    def _start_build() -> "threading.Event | None":
+        """Start the header build and probe unless one is in flight or one
+        failed moments ago. The event fires when the header attempt ends,
+        before the slower ffprobe."""
+        with _spore_build_lock:
+            if token in _spore_probing or token in _spore_build_failed:
+                return None
+            _spore_probing.add(token)
+        built = threading.Event()
+        try:
+            threading.Thread(target=_build_then_probe, args=(cdn_url, token, built),
+                             daemon=True, name=f"fsh-{token[:8]}").start()
+        except BaseException:
+            with _spore_build_lock:
+                _spore_probing.discard(token)
+            raise
+        return built
+
+    if info is None:
         # First play of a cold catalog item (most of the backfilled library was
-        # probed with build_fsh=False, so its .fsh is unbuilt). Build the
-        # fast-start header synchronously but *bounded*: if it finishes quickly
-        # this play uses the moov-first path (fast start, no seek-to-EOF for the
-        # moov). If it is slow or fails, fall through to the hardened cold proxy
-        # — the join timeout guarantees we never block the request thread long.
-        _warm: dict = {}
-
-        def _warm_build() -> None:
-            try:
-                if mp4_faststart.build_and_cache(
-                        cdn_url, token, source_key=_spore_source_key(token)):
-                    _warm["info"] = mp4_faststart.load(token)
-            except Exception as exc:
-                log.warning("spore-stream: sync warm failed token=%s: %s", token, exc)
-
-        _wt = threading.Thread(target=_warm_build, daemon=True, name=f"warm-{token[:8]}")
-        _wt.start()
-        _wt.join(5.0)
-        warm_info = _warm.get("info")
-        if warm_info is not None:
-            info = warm_info
-            log.info("spore-stream: token=%s warmed synchronously (%.1fs)",
-                     token, _t.monotonic() - started)
-            # Header is built; run the audio/subtitle probe in the background.
-            if token not in _spore_probing:
-                _spore_probing.add(token)
-                threading.Thread(target=_build_then_probe, args=(cdn_url, token),
-                                 daemon=True, name=f"probe-{token[:8]}").start()
+        # probed with build_fsh=False, so its .fsh is unbuilt). Wait briefly for
+        # the header: if it finishes quickly this play uses the moov-first path
+        # (fast start, no seek-to-EOF for the moov). A slow or failed build, or
+        # one another request already started, falls through to the cold proxy.
+        built = _start_build()
+        if built is not None and built.wait(5.0):
+            info = mp4_faststart.load(token)
+            if info is not None:
+                log.info("spore-stream: token=%s warmed synchronously (%.1fs)",
+                         token, _t.monotonic() - started)
 
     source_identity = _spore_source_key(token)
 
@@ -2301,25 +2319,30 @@ def spore_stream_proxy(token: str):
         return resp
 
     if info is None:
-        # Cold cache: build .fsh in background, immediately proxy Range requests
-        # to CDN so FFmpeg doesn't stall. _spore_cold_sizes caches file_size so
-        # repeated Range requests (FFmpeg seeks) skip the HEAD round-trip.
-        if token not in _spore_cold_sizes:
-            threading.Thread(
-                target=_build_then_probe,
-                args=(cdn_url, token),
-                daemon=True,
-                name=f"fsh-{token[:8]}",
-            ).start()
-            import requests as _req
+        # Cold cache: proxy Range requests to the CDN while the header builds,
+        # so FFmpeg doesn't stall. Only a validated HEAD sets the size; a retired
+        # link is re-resolved once, as _fetch_chunk does, rather than serving its
+        # error body's length as the file.
+        file_size = _spore_cold_sizes.get(token, 0)
+        if file_size < mp4_faststart.MIN_MEDIA_BYTES:
             try:
-                head = _req.head(cdn_url, timeout=10, allow_redirects=True)
-                _spore_cold_sizes[token] = int(head.headers.get("Content-Length", 0))
+                file_size = mp4_faststart.probe_size(cdn_url)
             except Exception as exc:
-                log.warning("spore-stream: HEAD failed for cold token=%s: %s", token, exc)
-                abort(502)
+                fresh = None
+                if mp4_faststart.stale_link_status(getattr(exc, "status", None)):
+                    fresh = mp4_faststart.refresh_url(token, cdn_url)
+                if not fresh:
+                    log.warning("spore-stream: HEAD failed for cold token=%s: %s", token, exc)
+                    abort(502)
+                cdn_url = fresh
+                try:
+                    file_size = mp4_faststart.probe_size(cdn_url)
+                except Exception as exc:
+                    log.warning("spore-stream: HEAD failed for cold token=%s: %s", token, exc)
+                    abort(502)
+            _spore_cold_sizes[token] = file_size
 
-        return _cold_proxy_response(_spore_cold_sizes.get(token, 0))
+        return _cold_proxy_response(file_size)
 
     # CDN file is already moov-first (or a non-MP4 sentinel).
     # Non-MP4 files are proxied through the same shared read cache. A direct CDN
@@ -2330,14 +2353,7 @@ def spore_stream_proxy(token: str):
     #   our server which resolves a fresh CDN URL — expired URLs never reach clients.
     if info.get("already_fast"):
         existing = db.load_spore_tracks(token)
-        if (not existing or "preferred_audio_idx" not in existing) and token not in _spore_probing:
-            _spore_probing.add(token)
-            threading.Thread(
-                target=_build_then_probe,
-                args=(cdn_url, token),
-                daemon=True,
-                name=f"probe-{token[:8]}",
-            ).start()
+        if (not existing or "preferred_audio_idx" not in existing) and _start_build():
             log.info("spore-stream: token=%s triggering background probe", token)
         if info["ftyp_size"] == 0:
             log.info("spore-stream: token=%s non-MP4 sentinel, shared proxy", token)

@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v11-hygiene-fence.json'
-FIXTURE_SHA='fb633581762153420a357a980d2f2b1b031ee507937381cc9fad4d4a4e38d9a6'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v11-hygiene-fence.json')
-INVENTORY_SHA='c1a868a9a7eb2bab7670e22f29cd73813f925dbc6de0f192fb5c334be53de8a6'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v12-spore-cold-size.json'
+FIXTURE_SHA='92ef5ad8813b2a540fbe4063e5708284b7ec1001aba96869a166ca5125b79b92'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v12-spore-cold-size.json')
+INVENTORY_SHA='f9f1103747cbd5e393650fc85517a31a62ebeef6ba9200585bd5925bdb044a22'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -485,7 +485,9 @@ def test_dash_inventory_only_updates_wrapper_and_preserves_history():
 def test_hygiene_inventory_preserves_prior_authority_limits_and_observes_new_runner():
     prior_path=INVENTORY.with_name('destination-path-inventory-v10-dash-maps.json')
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='c38d4532c427976b3ad8767457a6cab8f7b9791c32bb6433ede3d26f1b54ccc0'
-    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    current_path=INVENTORY.with_name('destination-path-inventory-v11-hygiene-fence.json')
+    assert hashlib.sha256(current_path.read_bytes()).hexdigest()=='c1a868a9a7eb2bab7670e22f29cd73813f925dbc6de0f192fb5c334be53de8a6'
+    prior=json.loads(prior_path.read_text());current=json.loads(current_path.read_text())
     before={x['path']:x['sha256'] for x in prior['audited_python_files']}
     after={x['path']:x['sha256'] for x in current['audited_python_files']}
     assert before.keys() <= after.keys()
@@ -503,3 +505,34 @@ def test_hygiene_inventory_preserves_prior_authority_limits_and_observes_new_run
     cleanup=next(x for x in current['writer_groups'] if x['id']=='cleanup_repair')
     assert {'phantom_cleanup.py','episode_hygiene.py'} <= {x['path'] for x in cleanup['source_files']}
     assert 'import destination_authority' not in (Path(__file__).parents[1]/'episode_hygiene.py').read_text()
+
+
+def test_spore_cold_size_inventory_only_moves_existing_sinks_and_preserves_limits():
+    prior_path=INVENTORY.with_name('destination-path-inventory-v11-hygiene-fence.json')
+    prior_model=FIXTURE.with_name('destination-fence-model-v11-hygiene-fence.json')
+    assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='c1a868a9a7eb2bab7670e22f29cd73813f925dbc6de0f192fb5c334be53de8a6'
+    assert hashlib.sha256(prior_model.read_bytes()).hexdigest()=='fb633581762153420a357a980d2f2b1b031ee507937381cc9fad4d4a4e38d9a6'
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    before={x['path']:x['sha256'] for x in prior['audited_python_files']}
+    after={x['path']:x['sha256'] for x in current['audited_python_files']}
+    assert before.keys()==after.keys() and current['added_audited_paths']==[]
+    assert {p for p in before if before[p]!=after[p]}=={'app.py','mp4_faststart.py'}
+    assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    assert {x['path'] for x in current['reviewed_source_changes']}=={'app.py','mp4_faststart.py'}
+    for item in current['reviewed_source_changes']:
+        assert item['old_sha256']==before[item['path']]
+        assert item['new_sha256']==after[item['path']]
+    # Same sink calls. Only line numbers move, and the .fsh writer's helper is
+    # renamed from build_and_cache to _build_once around the stale-link retry.
+    def calls(inventory):
+        from collections import Counter
+        return Counter((x['path'],x['function'].replace('build_and_cache.','_build_once.'),x['call']) for x in inventory['static_sink_calls'])
+    assert calls(current)==calls(prior)
+    assert any(x['function']=='_build_once._atomic_write' for x in current['static_sink_calls'])
+    for key in ['writer_groups','reader_domains']:
+        assert [(g['id'],[x['path'] for x in g['source_files']]) for g in current[key]]==[(g['id'],[x['path'] for x in g['source_files']]) for g in prior[key]]
+    for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
+        assert current[key]==prior[key]
+    assert not any(x['runtime_fenced'] for x in current['writer_groups'])
+    old_model=json.loads(prior_model.read_text())
+    assert {k:v for k,v in MODEL.items() if k!='source_inventory_sha256'}=={k:v for k,v in old_model.items() if k!='source_inventory_sha256'}

@@ -6,6 +6,12 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- A first Plex play whose cached CDN link had expired no longer leaves the
+  title unplayable until a restart. The fast-start header build re-resolves a
+  retired link once and retries (auth, gone and throttled responses stay
+  terminal), the cold proxy only accepts a size from a successful HEAD above a
+  64 KiB media floor, and a header build is held back only while one is in
+  flight or for 30 seconds after a failure, never by a cached size
 - Daily cleanup now groups series only from NFO or row-backed IMDb identity,
   isolates unreadable files and failed moves instead of aborting the run, and
   safely binds legacy Catbox rows whose `strm_path` is still null. Healthy

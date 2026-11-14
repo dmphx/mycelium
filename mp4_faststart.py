@@ -51,6 +51,22 @@ class SporeFetchError(Exception):
         self.status = status
         self.retry_after = retry_after
 
+
+# No real media object is this small. A HEAD that reports fewer bytes measured
+# an error body or a stub, not the file: a retired TorBox link answered HEAD with
+# a 2,250-byte 400 body, and that length was then served as the whole title.
+MIN_MEDIA_BYTES = 64 * 1024
+
+# Client errors that a fresh link cannot cure: auth, gone and throttled. Any
+# other 4xx from the CDN is treated as a retired link worth re-resolving once.
+_TERMINAL_CLIENT_STATUSES = frozenset({401, 403, 404, 410, 429})
+
+
+def stale_link_status(status: int | None) -> bool:
+    """True when a CDN status means the link expired rather than the file."""
+    return (isinstance(status, int) and 400 <= status < 500
+            and status not in _TERMINAL_CLIENT_STATUSES)
+
 _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT    = 60
 _MAX_MOOV_BYTES  = 128 * 1024 * 1024  # refuse to buffer a moov bigger than this
@@ -61,15 +77,16 @@ _CACHE_DIR: Path | None = None # set by init()
 # Not swept/evicted - same accepted tradeoff as catbox.py's _token_locks
 # (unbounded but slow growth vs. the risk of deleting a lock while it's
 # being handed out to another caller).
-_cache_locks: dict[str, threading.Lock] = {}
+# Reentrant so build_and_cache() can hold it across its stale-link retry.
+_cache_locks: dict[str, threading.RLock] = {}
 _cache_locks_registry_lock = threading.Lock()
 
 
-def _token_lock(token: str) -> threading.Lock:
+def _token_lock(token: str) -> threading.RLock:
     with _cache_locks_registry_lock:
         lock = _cache_locks.get(token)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _cache_locks[token] = lock
         return lock
 
@@ -313,7 +330,12 @@ def _get(url: str, start: int, end: int, tries: int = 4,
                 raise SporeFetchError("CDN returned no data")
             # Progress made. If still short (connection dropped mid-range) the
             # while-loop re-requests the remaining tail without burning a retry.
-        except SporeFetchError:
+        except SporeFetchError as exc:
+            # A client error repeats on the same URL. Retrying it only delays
+            # the caller's fresh-link recovery (and the build's 5 s warm window).
+            if (exc.status is not None and 400 <= exc.status < 500
+                    and exc.status not in (408, 429)):
+                raise
             attempts += 1
             if attempts >= tries:
                 raise
@@ -357,20 +379,78 @@ def _locate_moov(cdn_url: str, cdn_size: int, raw_fetch=None) -> tuple[int, int]
     return None
 
 
+def probe_size(cdn_url: str) -> int:
+    """Return the CDN object's size from a successful HEAD, else raise.
+
+    The status is checked and the length must clear MIN_MEDIA_BYTES, so a
+    retired link's error body can never be taken for the file.
+    """
+    head = req_lib.head(cdn_url, timeout=_CONNECT_TIMEOUT, allow_redirects=True)
+    try:
+        if head.status_code != 200:
+            raise SporeFetchError(f"CDN HEAD HTTP {head.status_code}",
+                                  status=head.status_code)
+        try:
+            size = int(head.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size < MIN_MEDIA_BYTES:
+            raise SporeFetchError(f"CDN size {size} below media floor")
+        return size
+    finally:
+        head.close()
+
+
+def refresh_url(token: str, stale_url: str) -> str | None:
+    """Re-resolve a retired CDN link once, as the stream path's _fetch_chunk does.
+
+    The URL cache entry is dropped first, otherwise materialize() hands back the
+    same dead link. Returns None when no different link is available.
+    """
+    import catbox
+    try:
+        catbox.invalidate_url_cache(token)
+        fresh = catbox.materialize(token, record_playback=False)
+    except Exception as exc:
+        log.warning("FastStart: CDN link refresh failed for %s: %s", token, exc)
+        return None
+    if not fresh or fresh == stale_url:
+        return None
+    return fresh
+
+
 def build_and_cache(cdn_url: str, token: str, source_key: str | None = None) -> bool:
     """
     Fetch ftyp + moov from CDN, build fast-start header, write to .fsh cache.
-    Scans box headers sequentially so moov is found regardless of its position.
     Returns True on success.
+
+    A retired CDN link fails with a client error. The link is re-resolved once
+    and the build retried; auth, gone and throttled statuses stay terminal.
     """
+    with _token_lock(token):
+        failure: dict = {}
+        if _build_once(cdn_url, token, source_key, failure):
+            return True
+        if not stale_link_status(failure.get("status")):
+            return False
+        fresh = refresh_url(token, cdn_url)
+        if not fresh:
+            return False
+        log.info("FastStart: retrying build for %s with a fresh CDN link", token)
+        return _build_once(fresh, token, source_key, {})
+
+
+def _build_once(cdn_url: str, token: str, source_key: str | None,
+                failure: dict) -> bool:
+    """One build attempt. Scans box headers sequentially so moov is found
+    regardless of its position. Records a failed CDN status in `failure`."""
     path = _cache_path(token)
     with _token_lock(token):
         if path.exists():
             return True
 
         try:
-            head = req_lib.head(cdn_url, timeout=_CONNECT_TIMEOUT, allow_redirects=True)
-            cdn_size = int(head.headers["Content-Length"])
+            cdn_size = probe_size(cdn_url)
 
             if source_key:
                 import spore_readthrough
@@ -468,6 +548,7 @@ def build_and_cache(cdn_url: str, token: str, source_key: str | None = None) -> 
             return True
 
         except Exception as exc:
+            failure["status"] = getattr(exc, "status", None)
             log.warning("FastStart: build failed for %s: %s", token, exc)
             return False
 
