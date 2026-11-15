@@ -36,6 +36,16 @@ A run over either cap moves nothing and queues no scan. It writes
 manifest row keeps the complete `virtual_items` row, so a restore never needs a
 database backup.
 
+## Episode numbering
+
+On seasons TMDB numbers by a running count, a per-season item whose absolute
+twin exists is folded away as a duplicate. A duplicate with playback history
+(`play_count` above 0 or a `last_played` time, or history that can't be read)
+is never quarantined: it is reported in `skipped` with the reason
+`duplicate has playback history`, at discovery and again just before applying.
+On 2026-11-13 the pass removed House Hunters International S157E01, played
+twice, as the twin of its absolute E03. Renumbering an only copy is unchanged.
+
 ## Host fence
 
 Before either pass, the job takes exclusive, nonblocking `flock` locks on the

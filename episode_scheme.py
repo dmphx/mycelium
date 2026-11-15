@@ -9,8 +9,10 @@ duplicates or as the only copy of a season.
 
 `tmdb_episode_number` maps a per-season number onto the season's absolute
 range for new registrations. `discover`/`reconcile` repair existing items:
-a per-season item whose absolute twin exists is a duplicate and is quarantined;
-one without a twin is renamed to the absolute number, so no episode is lost.
+a per-season item whose absolute twin exists is a duplicate and is quarantined,
+unless it has playback history (watched items are never removed: 2026-11-13
+removed a twice-played House Hunters International S157E01); one without a twin
+is renamed to the absolute number, so no episode is lost.
 Discovery is read only; applying is playback gated and serialized with other
 media maintenance, and every touched row and file is recorded in a manifest.
 """
@@ -164,10 +166,22 @@ def discover(imdb_ids: set[str] | None = None, items: list[dict] | None = None,
                 continue
             twin = by_episode.get(target)
             if twin is not None:
+                if _played(item):
+                    skipped.append({**entry, "twin_token": twin.get("token"),
+                                    "reason": "duplicate has playback history"})
+                    continue
                 duplicates.append({**entry, "twin_token": twin.get("token")})
             else:
                 renumber.append(entry)
     return {"duplicates": duplicates, "renumber": renumber, "skipped": skipped}
+
+
+def _played(item: dict) -> bool:
+    try:
+        plays = int(item.get("play_count") or 0)
+    except (TypeError, ValueError):
+        plays = 1   # unreadable history counts as watched
+    return plays > 0 or bool(item.get("last_played"))
 
 
 def _media_files(strm_path: Path) -> list[Path]:
@@ -230,6 +244,7 @@ def reconcile(imdb_ids: set[str] | None = None, dry_run: bool = True,
     quarantine = Path(quarantine_root or media_root.parent / "quarantine"
                       / "episode-numbering") / stamp
     done_duplicates, done_renumber, failed = [], [], []
+    skipped = list(plan["skipped"])
     budget = limit if limit is not None else len(plan["duplicates"]) + len(plan["renumber"])
     try:
         for entry in plan["duplicates"]:
@@ -238,6 +253,10 @@ def reconcile(imdb_ids: set[str] | None = None, dry_run: bool = True,
             budget -= 1
             row = db.get_virtual_item(entry["token"])
             if not row:
+                continue
+            if _played(row):
+                # Played since discovery: keep it; the next run reports it.
+                skipped.append({**entry, "reason": "duplicate has playback history"})
                 continue
             strm = Path(entry["strm_path"] or "")
             moved: list[tuple[Path, Path]] = []
@@ -322,7 +341,7 @@ def reconcile(imdb_ids: set[str] | None = None, dry_run: bool = True,
             "duplicates_removed": len(done_duplicates),
             "renumbered": len(done_renumber),
             "failed": failed,
-            "skipped": plan["skipped"]}
+            "skipped": skipped}
 
 
 def _under(path: Path, root: Path) -> bool:
