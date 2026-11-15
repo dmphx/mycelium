@@ -28,7 +28,7 @@ _TORRENT_ID_RE = re.compile(r"torrent_id[=:](\d+)", re.IGNORECASE)
 _FILE_ID_RE = re.compile(r"file_id[=:](\d+)", re.IGNORECASE)
 # Episode numbers run to four digits; the guard keeps E100 from reading as E10
 # (that collapse once deleted E100-E109 as "duplicates" of E10).
-_EP_FILENAME_RE = re.compile(r"S(\d{1,2})E(\d{1,4})(?!\d)", re.IGNORECASE)
+_EP_FILENAME_RE = re.compile(r"S(\d{1,4})E(\d{1,4})(?!\d)", re.IGNORECASE)
 _QUALITY_TIER_RE = re.compile(r'\b(2160[pi]?|4[Kk]|UHD|1080[pi]?|720[pi]?|480[pi]?)\b', re.IGNORECASE)
 _STREAM_TOKEN_RE = re.compile(r"/stream/([A-Za-z0-9_-]+)/*(?:[?#].*)?$")
 _IMDB_ID_RE = re.compile(r"^tt\d+$")
@@ -463,7 +463,7 @@ _SERIES_PREFIX_RE = re.compile(
 _SEASON_TRAIL2_RE = re.compile(r'\s+(?:S\d{1,2}(?:E\d+)?|Season\s+\d+).*$', re.IGNORECASE)
 _YEAR_TRAIL2_RE = re.compile(r'\s+\d{4}$')
 _SEASON_DIR_RE = re.compile(r'[Ss]eason\s*(\d+)', re.IGNORECASE)
-_EP_RE2 = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)', re.IGNORECASE)
+_EP_RE2 = re.compile(r'[Ss](\d{1,4})[Ee](\d{1,4})(?!\d)', re.IGNORECASE)
 
 
 def _series_clean_title(raw: str) -> str:

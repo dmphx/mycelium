@@ -24,7 +24,7 @@ from io_utils import atomic_write_text
 
 
 _PLACEHOLDER_RE = re.compile(r"^tmdb[:_ -]?\d+$", re.IGNORECASE)
-_EPISODE_RE = re.compile(r"S(\d{1,2})E(\d{1,4})(?!\d)", re.IGNORECASE)
+_EPISODE_RE = re.compile(r"S(\d{1,4})E(\d{1,4})(?!\d)", re.IGNORECASE)
 
 
 def _nfo_imdb(folder: Path) -> str | None:

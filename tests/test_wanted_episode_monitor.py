@@ -98,6 +98,25 @@ def test_episode_file_match_is_exact_not_a_prefix(tmp_path, monkeypatch, present
     assert monitor.strm_exists_episode("Bleach", 1, asked, imdb_id="tt0434665") is expected
 
 
+@pytest.mark.parametrize("folder,present,season,episode,expected", [
+    ("Season 157", "House Hunters International S157E01.strm", 157, 1, True),
+    ("Season 157", "House Hunters International S157E010.strm", 157, 1, False),
+    ("Season 2024", "Daily Show S2024E05.strm", 2024, 5, True),
+    ("Season 01", "Show XS01E05.strm", 1, 5, False),
+])
+def test_long_seasons_are_matched_exactly(tmp_path, monkeypatch, folder, present, season,
+                                          episode, expected):
+    # The substring test used to find S157E01; a two-digit season group would not.
+    monkeypatch.setattr(monitor, "MEDIA_PATH", str(tmp_path))
+    monitor.db.get_virtual_item_by_episode.return_value = None
+    show = present.rsplit(" S", 1)[0]
+    path = tmp_path / "series" / show / folder / present
+    path.parent.mkdir(parents=True)
+    path.write_text("https://example.invalid/stream", encoding="utf-8")
+
+    assert monitor.strm_exists_episode(show, season, episode, imdb_id="tt0000001") is expected
+
+
 def test_sync_puts_a_lost_episode_back_to_wanted(tmp_path, monkeypatch):
     """The collapse left E10 'found' beside a surviving E104; the next metadata
     sync must re-derive it as wanted, while the episode that exists stays found."""

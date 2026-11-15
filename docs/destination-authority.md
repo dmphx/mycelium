@@ -72,6 +72,7 @@ per-season duplicate that has playback history instead of quarantining it. Its
 sink calls are unchanged (only line numbers move) and runtime completeness stays
 UNPROVED.
 
-The v17 inventory re-pins `monitor.py` after `strm_exists_episode` began matching
-an episode file by its exact season/episode tag rather than a substring. Only
-line numbers of its existing sink calls move; runtime completeness stays UNPROVED.
+The v17 inventory re-pins `monitor.py`, after `strm_exists_episode` began matching
+an episode file by its exact tag rather than a substring, and every other
+episode-tag file, after their season group widened to four digits. Only line
+numbers of existing sink calls move; runtime completeness stays UNPROVED.

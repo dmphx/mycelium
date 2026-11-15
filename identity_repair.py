@@ -14,7 +14,7 @@ import tmdb
 log = logging.getLogger(__name__)
 
 _IMDB_RE = re.compile(r"\btt\d{6,10}\b", re.IGNORECASE)
-_SXXEXX_RE = re.compile(r"\bS(\d{1,3})E(\d{1,4})\b", re.IGNORECASE)
+_SXXEXX_RE = re.compile(r"\bS(\d{1,4})E(\d{1,4})\b", re.IGNORECASE)
 _X_RE = re.compile(r"\b(\d{1,3})x(\d{1,4})\b", re.IGNORECASE)
 _SEASON_DIR_RE = re.compile(r"^Season\s+(\d{1,3})$", re.IGNORECASE)
 _EP_ONLY_RE = re.compile(r"(?:^|[^a-z])E(?:pisode)?[ ._-]?(\d{1,4})(?:[^0-9]|$)", re.IGNORECASE)
