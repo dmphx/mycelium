@@ -59,6 +59,12 @@ def _series_dir(title: str, imdb_id: str | None = None) -> str | None:
     return fallback
 
 
+# The shared episode-tag contract. A substring test such as "s01e10" in a name
+# also matched S01E100-S01E109, so a lost E10 stayed "found" and was never
+# searched again while any E10x existed.
+_EPISODE_TAG_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)")
+
+
 def strm_exists_episode(title: str, season: int, episode: int,
                         imdb_id: str | None = None) -> bool:
     if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
@@ -66,15 +72,17 @@ def strm_exists_episode(title: str, season: int, episode: int,
     folder = _series_dir(title, imdb_id)
     if not folder:
         return False
-    s_ep = f"s{season:02d}e{episode:02d}"
     patterns = {
         os.path.join(folder, f"Season {season:02d}", "*.strm"),
         os.path.join(folder, f"Season {season}", "*.strm"),
     }
-    return any(
-        s_ep in os.path.basename(path).lower()
-        for pattern in patterns for path in glob.glob(pattern)
-    )
+    wanted = (int(season), int(episode))
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            m = _EPISODE_TAG_RE.search(os.path.basename(path))
+            if m and (int(m.group(1)), int(m.group(2))) == wanted:
+                return True
+    return False
 
 
 def strm_exists_movie(title: str) -> bool:
