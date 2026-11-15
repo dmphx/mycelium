@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v16-numbering-keeps-played.json'
-FIXTURE_SHA='fad8ddf5f1a4b596fefc186106a78d2cbe8d10923dad4029b285c5deb1194334'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v16-numbering-keeps-played.json')
-INVENTORY_SHA='70397b4586006ce776887d6f78d80a2276adc42655850ca24339a92ab22e9594'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v17-exact-episode-match.json'
+FIXTURE_SHA='1bfdd2b785d1ca15a8ac66cca40e3a38b0afb41bd99414cdc9c19cef5103f02d'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v17-exact-episode-match.json')
+INVENTORY_SHA='60ea2dc93dad98f1e9d90e79c1e237e429e1f705be6b2d136fe9d594e750ec64'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -645,7 +645,11 @@ def test_numbering_inventory_only_moves_episode_scheme_lines():
     prior_model=FIXTURE.with_name('destination-fence-model-v15-episode-tags.json')
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='6d89c8632f478433ce40caddabb262d372156f9f23d7dd1635f55264f46ae64c'
     assert hashlib.sha256(prior_model.read_bytes()).hexdigest()=='e9b92a8bce978cd781325cf2f2eac443c59f80904666f1787a493a066bf4eb1c'
-    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    current_path=INVENTORY.with_name('destination-path-inventory-v16-numbering-keeps-played.json')
+    current_model=FIXTURE.with_name('destination-fence-model-v16-numbering-keeps-played.json')
+    assert hashlib.sha256(current_path.read_bytes()).hexdigest()=='70397b4586006ce776887d6f78d80a2276adc42655850ca24339a92ab22e9594'
+    assert hashlib.sha256(current_model.read_bytes()).hexdigest()=='fad8ddf5f1a4b596fefc186106a78d2cbe8d10923dad4029b285c5deb1194334'
+    prior=json.loads(prior_path.read_text());current=json.loads(current_path.read_text())
     def pins(inventory):
         found={x['path']:x['sha256'] for x in inventory['audited_python_files']}
         for group in inventory['writer_groups']+inventory['reader_domains']:
@@ -664,6 +668,31 @@ def test_numbering_inventory_only_moves_episode_scheme_lines():
         return Counter((x['path'],x['function'],x['call']) for x in inventory['static_sink_calls'])
     assert calls(current)==calls(prior)
     others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='episode_scheme.py']
+    assert others(current)==others(prior)
+    strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
+    for key in ['writer_groups','reader_domains']:
+        assert strip(current[key])==strip(prior[key])
+    for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
+        assert current[key]==prior[key]
+    old_model=json.loads(prior_model.read_text());new_model=json.loads(current_model.read_text())
+    assert {k:v for k,v in new_model.items() if k!='source_inventory_sha256'}=={k:v for k,v in old_model.items() if k!='source_inventory_sha256'}
+
+
+def test_exact_episode_match_inventory_only_moves_monitor_lines():
+    prior_path=INVENTORY.with_name('destination-path-inventory-v16-numbering-keeps-played.json')
+    prior_model=FIXTURE.with_name('destination-fence-model-v16-numbering-keeps-played.json')
+    assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='70397b4586006ce776887d6f78d80a2276adc42655850ca24339a92ab22e9594'
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    before={x['path']:x['sha256'] for x in prior['audited_python_files']}
+    after={x['path']:x['sha256'] for x in current['audited_python_files']}
+    assert before.keys()==after.keys() and current['added_audited_paths']==[]
+    assert {p for p in before if before[p]!=after[p]}=={'monitor.py'}
+    assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    assert current['reviewed_source_changes']==[{'path':'monitor.py','old_sha256':before['monitor.py'],'new_sha256':after['monitor.py']}]
+    from collections import Counter
+    calls=lambda inventory:Counter((x['path'],x['function'],x['call']) for x in inventory['static_sink_calls'])
+    assert calls(current)==calls(prior)
+    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='monitor.py']
     assert others(current)==others(prior)
     strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
     for key in ['writer_groups','reader_domains']:

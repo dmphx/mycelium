@@ -6,6 +6,10 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
+- An episode whose file was lost no longer stays "found" because a later
+  episode exists: the monitor matched "S01E10" as a substring of S01E100-S01E109
+  and never searched it again. The file match is now exact, so the next series
+  refresh returns such an episode to wanted
 - Episodes numbered past 99 keep their number everywhere. Every episode-tag
   parser now reads up to four digits whole. Before, release sanity rejected
   Coronation Street S67E192 as "S67E19", pack files could land under the wrong
