@@ -56,10 +56,11 @@ def test_per_season_numbers_map_onto_the_absolute_range():
     assert episode_scheme.tmdb_episode_number("tt1", 3, 1, tmdb_client=tm) == 1
 
 
-def _item(token, season, episode, strm_path, play_count=0):
+def _item(token, season, episode, strm_path, play_count=0, last_played=None):
     return {"token": token, "imdb_id": "tt1", "media_type": "series",
             "title": f"{SHOW} S{season:02d}E{episode:02d}", "season": season,
-            "episode": episode, "strm_path": str(strm_path), "play_count": play_count}
+            "episode": episode, "strm_path": str(strm_path), "play_count": play_count,
+            "last_played": last_played}
 
 
 def test_discover_splits_duplicates_from_episodes_to_renumber():
@@ -110,7 +111,7 @@ def library(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "media_servers", types.SimpleNamespace(
         mark=lambda p: None, mark_removed=lambda p: None))
 
-    def add(token, season, episode, play_count=0):
+    def add(token, season, episode, play_count=0, last_played=None):
         season_dir = f"Season {season:02d}"
         strm = media / "series" / SHOW / season_dir / f"{SHOW} S{season:02d}E{episode:02d}.strm"
         stub = spore / "series" / SHOW / season_dir
@@ -120,7 +121,7 @@ def library(tmp_path, monkeypatch):
         strm.with_suffix(".nfo").write_text("<episodedetails/>")
         (stub / f"{strm.stem}.mkv").write_bytes(b"stub")
         (stub / f"{strm.stem}.minfo").write_text(f"token={token}\n")
-        rows[token] = _item(token, season, episode, strm, play_count)
+        rows[token] = _item(token, season, episode, strm, play_count, last_played)
         return strm
 
     return types.SimpleNamespace(media=media, spore=spore, rows=rows, add=add,
@@ -271,3 +272,64 @@ def test_single_file_tagged_per_season_is_accepted_for_its_running_number(monkey
                                        imdb_id="tt1") is None
     assert release_sanity.verify_entry(entry, "episode", season=2, episode=6,
                                        imdb_id="tt1")
+
+
+# Watched duplicates are never removed (2026-11-13: hygiene quarantined House Hunters
+# International S157E01, played twice, as the per-season twin of absolute E03).
+
+@pytest.mark.parametrize("history", [{"play_count": 2},
+                                     {"last_played": "2026-09-14 21:01:22"},
+                                     {"play_count": "unreadable"}])
+def test_discover_keeps_a_duplicate_with_playback_history(history):
+    played = {**_item("a1", 2, 1, "/m/a1.strm"), **history}
+    items = [played, _item("a4", 2, 4, "/m/a4.strm"),
+             _item("b2", 2, 2, "/m/b2.strm"), _item("b5", 2, 5, "/m/b5.strm")]
+
+    plan = episode_scheme.discover(items=items, tmdb_client=FakeTmdb())
+
+    assert [d["token"] for d in plan["duplicates"]] == ["b2"]   # unplayed twin still folds
+    kept = [s for s in plan["skipped"] if s["token"] == "a1"]
+    assert kept and kept[0]["reason"] == "duplicate has playback history"
+    assert kept[0]["twin_token"] == "a4" and kept[0]["absolute"] == 4
+
+
+def test_reconcile_never_quarantines_a_watched_duplicate(library):
+    played = library.add("a1", 2, 1, play_count=2, last_played="2026-09-14 21:01:22")
+    twin = library.add("a4", 2, 4)
+
+    result = episode_scheme.reconcile(dry_run=False, tmdb_client=FakeTmdb(),
+                                      quarantine_root=library.quarantine)
+
+    assert result["status"] == "complete" and result["duplicates_removed"] == 0
+    assert result["manifest"] is None
+    assert "a1" in library.rows and played.exists() and twin.exists()
+    assert [s["reason"] for s in result["skipped"] if s["token"] == "a1"] == [
+        "duplicate has playback history"]
+    assert not library.quarantine.exists()
+
+
+def test_reconcile_rechecks_playback_at_apply_time(library, monkeypatch):
+    dup = library.add("a1", 2, 1)
+    library.add("a4", 2, 4)
+    plan = episode_scheme.discover(tmdb_client=FakeTmdb())
+    assert [d["token"] for d in plan["duplicates"]] == ["a1"]
+    library.rows["a1"]["last_played"] = "2026-11-14 20:00:00"   # watched after discovery
+    monkeypatch.setattr(episode_scheme, "discover", lambda **kw: plan)
+
+    result = episode_scheme.reconcile(dry_run=False, tmdb_client=FakeTmdb(),
+                                      quarantine_root=library.quarantine)
+
+    assert result["duplicates_removed"] == 0 and "a1" in library.rows and dup.exists()
+    assert [s["reason"] for s in result["skipped"] if s["token"] == "a1"] == [
+        "duplicate has playback history"]
+
+
+def test_a_watched_only_copy_is_still_renumbered(library):
+    only = library.add("a2", 2, 2, play_count=3, last_played="2026-10-01 10:00:00")
+
+    result = episode_scheme.reconcile(dry_run=False, tmdb_client=FakeTmdb(),
+                                      quarantine_root=library.quarantine)
+
+    assert result["renumbered"] == 1 and library.rows["a2"]["episode"] == 5
+    assert only.with_name(f"{SHOW} S02E05.strm").exists()
+
