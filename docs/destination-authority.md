@@ -62,6 +62,7 @@ be deleted or reassigned, and only active entries can become explicitly closed o
 unknown. An unknown entry cannot be rewritten as completed. These guards preserve
 the evidence needed for model completeness even if bookkeeping SQL is mistaken.
 
-The v15 inventory re-pins `strm_generator.py` after its episode tag parser began
-reading 3-4 digit episodes whole. Only line numbers of its existing sink calls
-move; runtime completeness stays UNPROVED.
+The v15 inventory re-pins `strm_generator.py`, `cleanup.py`, `placeholder_cleanup.py`,
+`nfo_generator.py` and `app.py` after every episode-tag regex began reading 3-4 digit
+episodes whole. Only line numbers of their existing sink calls move; runtime
+completeness stays UNPROVED.

@@ -6,10 +6,12 @@ All notable changes to Mycelium are documented in this file.
 
 ### Fixed
 
-- Episodes numbered past 99 (soaps and daily shows such as Coronation Street
-  S67E192) are no longer read as their first two digits. Release sanity used
-  to reject the correct cached file as "S67E19", and a pack file could be
-  filed under the wrong episode
+- Episodes numbered past 99 keep their number everywhere. Every episode-tag
+  parser now reads up to four digits whole. Before, release sanity rejected
+  Coronation Street S67E192 as "S67E19", pack files could land under the wrong
+  episode, NFO metadata for E1001 came from E100, and cleanup's duplicate pass
+  treated E10 and E100-E109 as one episode and deleted the "duplicates"
+  (5,090 files between June and October 2026)
 - Mycelium no longer calls Plex's refresh API directly. The Spore stub-to-cached
   flip and every other targeted scan go through the host scan queue, whose
   folder guard holds scans that would trash attached NFS parts. Plex may now

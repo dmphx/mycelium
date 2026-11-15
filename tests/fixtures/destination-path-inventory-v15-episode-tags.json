@@ -7,7 +7,7 @@
       "source_files": [
         {
           "path": "app.py",
-          "sha256": "4802b071d3fbc6b82274abe5379db0e22db533b17b8ace9aaea8cc8d0b0dee00"
+          "sha256": "b4401bdcbabb94f04756f7597f60dcf0a0e788a8bc859f2d6717a9be63ccaa3b"
         },
         {
           "path": "seerr_compat.py",
@@ -135,7 +135,7 @@
       "source_files": [
         {
           "path": "cleanup.py",
-          "sha256": "960fe9053314e23fae0b3786b0b21228900c25148e41ec4e8fd6e243a48bc472"
+          "sha256": "f7be0261865e96a54bc86e2648f16b35927e3fa59fb372cc66465d1ac409f95f"
         },
         {
           "path": "maintenance.py",
@@ -203,7 +203,7 @@
       "source_files": [
         {
           "path": "nfo_generator.py",
-          "sha256": "63f095ebdb9335578099d44eb5ce41930f751974ead8cb6e667c68ecb10d772a"
+          "sha256": "805bc017715146a4ee79720e896370ae31cedd6e6a51a4323ae3e729207bab71"
         }
       ],
       "finding": "Metadata generation/backfill and TV title repair write sidecar files.",
@@ -228,7 +228,7 @@
       "source_files": [
         {
           "path": "app.py",
-          "sha256": "4802b071d3fbc6b82274abe5379db0e22db533b17b8ace9aaea8cc8d0b0dee00"
+          "sha256": "b4401bdcbabb94f04756f7597f60dcf0a0e788a8bc859f2d6717a9be63ccaa3b"
         },
         {
           "path": "catbox.py",
@@ -312,7 +312,7 @@
   "audited_python_files": [
     {
       "path": "app.py",
-      "sha256": "4802b071d3fbc6b82274abe5379db0e22db533b17b8ace9aaea8cc8d0b0dee00"
+      "sha256": "b4401bdcbabb94f04756f7597f60dcf0a0e788a8bc859f2d6717a9be63ccaa3b"
     },
     {
       "path": "app_cache.py",
@@ -348,7 +348,7 @@
     },
     {
       "path": "cleanup.py",
-      "sha256": "960fe9053314e23fae0b3786b0b21228900c25148e41ec4e8fd6e243a48bc472"
+      "sha256": "f7be0261865e96a54bc86e2648f16b35927e3fa59fb372cc66465d1ac409f95f"
     },
     {
       "path": "config.py",
@@ -508,7 +508,7 @@
     },
     {
       "path": "nfo_generator.py",
-      "sha256": "63f095ebdb9335578099d44eb5ce41930f751974ead8cb6e667c68ecb10d772a"
+      "sha256": "805bc017715146a4ee79720e896370ae31cedd6e6a51a4323ae3e729207bab71"
     },
     {
       "path": "notify.py",
@@ -528,7 +528,7 @@
     },
     {
       "path": "placeholder_cleanup.py",
-      "sha256": "adf0811df80c14abb28c0ebbbd9d59b66dc17595d58068ba61daf91f9377ed6d"
+      "sha256": "6bf4fb71dea53f7164997cb804d0dfb7db9747cab3622d20f898122f4360da7e"
     },
     {
       "path": "playback_guard.py",
@@ -800,169 +800,169 @@
     },
     {
       "path": "cleanup.py",
-      "line": 250,
+      "line": 252,
       "function": "_repair_strm",
       "call": "path.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 251,
+      "line": 253,
       "function": "_repair_strm",
       "call": "path.with_suffix('.nfo').unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 254,
+      "line": 256,
       "function": "_repair_strm",
       "call": "db.delete_virtual_item_by_strm_path"
     },
     {
       "path": "cleanup.py",
-      "line": 263,
+      "line": 265,
       "function": "_repair_strm",
       "call": "path.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 264,
+      "line": 266,
       "function": "_repair_strm",
       "call": "path.with_suffix('.nfo').unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 267,
+      "line": 269,
       "function": "_repair_strm",
       "call": "db.delete_virtual_item_by_strm_path"
     },
     {
       "path": "cleanup.py",
-      "line": 302,
+      "line": 304,
       "function": "_repair_strm",
       "call": "path.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 303,
+      "line": 305,
       "function": "_repair_strm",
       "call": "path.with_suffix('.nfo').unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 310,
+      "line": 312,
       "function": "_repair_strm",
       "call": "db.delete_virtual_item_by_strm_path"
     },
     {
       "path": "cleanup.py",
-      "line": 318,
+      "line": 320,
       "function": "_repair_strm",
       "call": "path.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 322,
+      "line": 324,
       "function": "_repair_strm",
       "call": "db.delete_virtual_item_by_strm_path"
     },
     {
       "path": "cleanup.py",
-      "line": 386,
+      "line": 388,
       "function": "_remove_duplicates",
       "call": "dup.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 390,
+      "line": 392,
       "function": "_remove_duplicates",
       "call": "dup.with_suffix('.nfo').unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 392,
+      "line": 394,
       "function": "_remove_duplicates",
       "call": "db.delete_virtual_item_by_strm_path"
     },
     {
       "path": "cleanup.py",
-      "line": 443,
+      "line": 445,
       "function": "_regenerate_wrong_files",
       "call": "atomic_write_text"
     },
     {
       "path": "cleanup.py",
-      "line": 494,
+      "line": 496,
       "function": "remove_orphan_folders",
       "call": "shutil.rmtree"
     },
     {
       "path": "cleanup.py",
-      "line": 507,
+      "line": 509,
       "function": "remove_orphan_folders",
       "call": "shutil.rmtree"
     },
     {
       "path": "cleanup.py",
-      "line": 517,
+      "line": 519,
       "function": "remove_orphan_folders",
       "call": "shutil.rmtree"
     },
     {
       "path": "cleanup.py",
-      "line": 656,
+      "line": 658,
       "function": "merge_series_duplicates",
       "call": "atomic_write_text"
     },
     {
       "path": "cleanup.py",
-      "line": 667,
+      "line": 669,
       "function": "merge_series_duplicates",
       "call": "dest.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 673,
+      "line": 675,
       "function": "merge_series_duplicates",
       "call": "strm.unlink"
     },
     {
       "path": "cleanup.py",
-      "line": 686,
+      "line": 688,
       "function": "merge_series_duplicates",
       "call": "_shutil.rmtree"
     },
     {
       "path": "cleanup.py",
-      "line": 745,
+      "line": 747,
       "function": "rename_messy_series_folders",
       "call": "folder.rename"
     },
     {
       "path": "cleanup.py",
-      "line": 875,
+      "line": 877,
       "function": "merge_movie_duplicates",
       "call": "atomic_write_text"
     },
     {
       "path": "cleanup.py",
-      "line": 884,
+      "line": 886,
       "function": "merge_movie_duplicates",
       "call": "_shutil.rmtree"
     },
     {
       "path": "cleanup.py",
-      "line": 924,
+      "line": 926,
       "function": "rename_messy_movie_folders",
       "call": "folder.rename"
     },
     {
       "path": "cleanup.py",
-      "line": 929,
+      "line": 931,
       "function": "rename_messy_movie_folders",
       "call": "old_strm.rename"
     },
     {
       "path": "cleanup.py",
-      "line": 931,
+      "line": 933,
       "function": "rename_messy_movie_folders",
       "call": "old_nfo.rename"
     },
@@ -1856,12 +1856,32 @@
   "parent_inventory_sha256": "4839957c7499673965e577a9d16be9f4568facfcb749605b5b21947f41b6eb16",
   "reviewed_source_changes": [
     {
+      "path": "app.py",
+      "old_sha256": "4802b071d3fbc6b82274abe5379db0e22db533b17b8ace9aaea8cc8d0b0dee00",
+      "new_sha256": "b4401bdcbabb94f04756f7597f60dcf0a0e788a8bc859f2d6717a9be63ccaa3b"
+    },
+    {
+      "path": "cleanup.py",
+      "old_sha256": "960fe9053314e23fae0b3786b0b21228900c25148e41ec4e8fd6e243a48bc472",
+      "new_sha256": "f7be0261865e96a54bc86e2648f16b35927e3fa59fb372cc66465d1ac409f95f"
+    },
+    {
+      "path": "nfo_generator.py",
+      "old_sha256": "63f095ebdb9335578099d44eb5ce41930f751974ead8cb6e667c68ecb10d772a",
+      "new_sha256": "805bc017715146a4ee79720e896370ae31cedd6e6a51a4323ae3e729207bab71"
+    },
+    {
+      "path": "placeholder_cleanup.py",
+      "old_sha256": "adf0811df80c14abb28c0ebbbd9d59b66dc17595d58068ba61daf91f9377ed6d",
+      "new_sha256": "6bf4fb71dea53f7164997cb804d0dfb7db9747cab3622d20f898122f4360da7e"
+    },
+    {
       "path": "strm_generator.py",
       "old_sha256": "4cc9fb1cc8abfa3b8788793a15ad3a4739a38e6a1f36d3de7fc4aa1c3d41d744",
       "new_sha256": "de3f1f0d6a96499c50803fa290b2eef2f91f3d6476483c1a6c5413e8ed29bbdf"
     }
   ],
-  "review_scope": "Episode tag parser reads 3-4 digit episodes whole (S67E192 no longer read as S67E19); no destination writer or reader change and no complete destination authority. Runtime completeness remains UNPROVED.",
+  "review_scope": "All episode-tag consumers (writer, cleanup merge and duplicate pass, placeholder cleanup, NFO metadata, library inventory) read 3-4 digit episodes whole; no destination writer or reader change and no complete destination authority. Runtime completeness remains UNPROVED.",
   "added_audited_paths": [],
   "integration_base_commit": "eba3ed8c891ef1177a621579d6abd5ea6e235363",
   "static_policy": "tools.source_inventory.sink_calls; method-name matches include false positives, not live completeness or effect authority."
