@@ -30,7 +30,7 @@ from io_utils import atomic_write_text
 _IMAGE_BASE_POSTER = "https://image.tmdb.org/t/p/w500"
 _IMAGE_BASE_BACKDROP = "https://image.tmdb.org/t/p/w1280"
 _IMAGE_BASE_STILL = "https://image.tmdb.org/t/p/w300"
-_EP_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)")
+_EP_RE = re.compile(r"[Ss](\d{1,4})[Ee](\d{1,4})(?!\d)")
 
 log = logging.getLogger(__name__)
 

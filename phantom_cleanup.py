@@ -46,7 +46,7 @@ from io_utils import atomic_write_text
 
 log = logging.getLogger(__name__)
 _SEASON_FOLDER_RE = re.compile(r"^Season (\d+)$", re.IGNORECASE)
-_EPISODE_FILE_RE = re.compile(r"S(\d{1,3})E(\d{1,4})$", re.IGNORECASE)
+_EPISODE_FILE_RE = re.compile(r"S(\d{1,4})E(\d{1,4})$", re.IGNORECASE)
 _PLACEHOLDER_TITLE_RE = re.compile(r"^(?:episode|ep\.?)\s*\d+$", re.IGNORECASE)
 _NFO_MAX_BYTES = 64 * 1024
 LEGACY_FIXED_COUNT = 24

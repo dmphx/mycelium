@@ -59,10 +59,12 @@ def _series_dir(title: str, imdb_id: str | None = None) -> str | None:
     return fallback
 
 
-# The shared episode-tag contract. A substring test such as "s01e10" in a name
-# also matched S01E100-S01E109, so a lost E10 stayed "found" and was never
-# searched again while any E10x existed.
-_EPISODE_TAG_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)")
+# Exact episode tag of a file Mycelium wrote. A substring test such as "s01e10"
+# in a name also matched S01E100-S01E109, so a lost E10 stayed "found" and was
+# never searched again while any E10x existed. Seasons may run to four digits
+# (House Hunters International S157, year seasons S2024), so the season group
+# is wider than the shared parser's and anchored on its left.
+_EPISODE_TAG_RE = re.compile(r"(?<![A-Za-z0-9])[Ss](\d{1,4})[Ee](\d{1,4})(?!\d)")
 
 
 def strm_exists_episode(title: str, season: int, episode: int,

@@ -129,13 +129,26 @@ def _episode_tag_patterns():
     return found
 
 
-def test_every_episode_tag_regex_reads_four_digit_episodes_whole():
+def test_every_episode_tag_regex_reads_long_seasons_and_episodes_whole():
     patterns = _episode_tag_patterns()
     sites = {site.split(":")[0] for site, _ in patterns}
     assert {"strm_generator.py", "cleanup.py", "placeholder_cleanup.py",
             "nfo_generator.py", "app.py"} <= sites
     for site, pattern in patterns:
         # Stems: some patterns are anchored at the end of a file stem.
-        for name, episode in [("Show S01E10", 10), ("Show S01E104", 104), ("Show S01E1001", 1001)]:
+        for name, want in [("Show S01E10", (1, 10)), ("Show S01E104", (1, 104)),
+                           ("Show S01E1001", (1, 1001)), ("Show S157E01", (157, 1)),
+                           ("Show S2024E192", (2024, 192))]:
             m = pattern.search(name)
-            assert m and int(m.group(2)) == episode, f"{site} reads {name} as {m and m.group(2)}"
+            got = m and (int(m.group(1)), int(m.group(2)))
+            assert got == want, f"{site} reads {name} as {got}"
+
+
+def test_writer_reads_long_seasons_whole(tmp_path, monkeypatch):
+    assert sg._file_episode("House.Hunters.International.S157E01.720p.mkv") == (157, 1)
+    assert sg._file_episode("Daily.Show.S2024E192.mkv") == (2024, 192)
+    monkeypatch.setattr(sg, "MEDIA_PATH", str(tmp_path))
+    info = sg._parse_info("House.Hunters.International.S157E01.720p",
+                          "House.Hunters.International.S157E01.720p.mkv")
+    assert (info["season"], info["episode"]) == (157, 1)
+    assert info["title"] == "House Hunters International"

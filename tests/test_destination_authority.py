@@ -16,9 +16,9 @@ import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
 FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v17-exact-episode-match.json'
-FIXTURE_SHA='1bfdd2b785d1ca15a8ac66cca40e3a38b0afb41bd99414cdc9c19cef5103f02d'
+FIXTURE_SHA='dc540435b77ac1f98d36ee0e99e4a875c51790c9346931efad4b75e7c56ea220'
 INVENTORY=FIXTURE.with_name('destination-path-inventory-v17-exact-episode-match.json')
-INVENTORY_SHA='60ea2dc93dad98f1e9d90e79c1e237e429e1f705be6b2d136fe9d594e750ec64'
+INVENTORY_SHA='086a67a0a43e82f759330dad192316ea3e156293677e5f70c68c3da9764f0094'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -678,7 +678,7 @@ def test_numbering_inventory_only_moves_episode_scheme_lines():
     assert {k:v for k,v in new_model.items() if k!='source_inventory_sha256'}=={k:v for k,v in old_model.items() if k!='source_inventory_sha256'}
 
 
-def test_exact_episode_match_inventory_only_moves_monitor_lines():
+def test_exact_episode_match_inventory_only_moves_lines_in_episode_tag_files():
     prior_path=INVENTORY.with_name('destination-path-inventory-v16-numbering-keeps-played.json')
     prior_model=FIXTURE.with_name('destination-fence-model-v16-numbering-keeps-played.json')
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='70397b4586006ce776887d6f78d80a2276adc42655850ca24339a92ab22e9594'
@@ -686,13 +686,14 @@ def test_exact_episode_match_inventory_only_moves_monitor_lines():
     before={x['path']:x['sha256'] for x in prior['audited_python_files']}
     after={x['path']:x['sha256'] for x in current['audited_python_files']}
     assert before.keys()==after.keys() and current['added_audited_paths']==[]
-    assert {p for p in before if before[p]!=after[p]}=={'monitor.py'}
+    changed=['app.py', 'cleanup.py', 'identity_repair.py', 'monitor.py', 'nfo_generator.py', 'phantom_cleanup.py', 'placeholder_cleanup.py', 'strm_generator.py']
+    assert {p for p in before if before[p]!=after[p]}==set(changed)
     assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
-    assert current['reviewed_source_changes']==[{'path':'monitor.py','old_sha256':before['monitor.py'],'new_sha256':after['monitor.py']}]
+    assert current['reviewed_source_changes']==[{'path':p,'old_sha256':before[p],'new_sha256':after[p]} for p in changed]
     from collections import Counter
     calls=lambda inventory:Counter((x['path'],x['function'],x['call']) for x in inventory['static_sink_calls'])
     assert calls(current)==calls(prior)
-    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='monitor.py']
+    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path'] not in changed]
     assert others(current)==others(prior)
     strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
     for key in ['writer_groups','reader_domains']:
