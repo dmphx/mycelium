@@ -61,3 +61,7 @@ Participant event identity and history are also guarded in SQLite. Entries canno
 be deleted or reassigned, and only active entries can become explicitly closed or
 unknown. An unknown entry cannot be rewritten as completed. These guards preserve
 the evidence needed for model completeness even if bookkeeping SQL is mistaken.
+
+The v15 inventory re-pins `strm_generator.py` after its episode tag parser began
+reading 3-4 digit episodes whole. Only line numbers of its existing sink calls
+move; runtime completeness stays UNPROVED.
