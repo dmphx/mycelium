@@ -27,11 +27,6 @@ The v14 inventory re-pins `phantom_cleanup.py` for the hygiene phantom
 classifier. Its one new sink is the over-cap `proposal.json` atomic write; it
 adds no writer group or reader. Runtime completeness stays UNPROVED.
 
-The v15 inventory re-pins `episode_scheme.py`: the hygiene numbering pass keeps a
-per-season duplicate that has playback history instead of quarantining it. Its
-sink calls are unchanged (only line numbers move) and runtime completeness stays
-UNPROVED.
-
 `destination_authority.py` is explicitly initialized on a disposable owned SQLite
 connection only. It models an opaque synthetic destination, not a filesystem path.
 It is not imported by startup, dispatch, db.init, import, retry, repair or scheduler.
@@ -71,3 +66,8 @@ The v15 inventory re-pins `strm_generator.py`, `cleanup.py`, `placeholder_cleanu
 `nfo_generator.py` and `app.py` after every episode-tag regex began reading 3-4 digit
 episodes whole. Only line numbers of their existing sink calls move; runtime
 completeness stays UNPROVED.
+
+The v16 inventory re-pins `episode_scheme.py`: the hygiene numbering pass keeps a
+per-season duplicate that has playback history instead of quarantining it. Its
+sink calls are unchanged (only line numbers move) and runtime completeness stays
+UNPROVED.
