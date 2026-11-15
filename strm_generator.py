@@ -30,14 +30,18 @@ _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.ts', '.
 _EP_RE = re.compile(r'[Ss](\d{1,4})[Ee](\d{1,4})(?!\d)', re.IGNORECASE)
 # Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
 # Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
+# Its widths stay 2+2: a wider form reads "1280x720" as S1280E720.
 _EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')
-# Loose season/episode naming used by anime packs, e.g. "S4 - 01".
-_EP_LOOSE_RE = re.compile(r'(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(?:[Ee][Pp]?[\s._-]*)?(\d{1,3})(?![A-Za-z0-9])')
+# Loose season/episode naming used by anime packs, e.g. "S4 - 01", "S157 - 01".
+# The episode stays 1-3 digits: four would read a pack's year ("S01.2024") as one.
+_EP_LOOSE_RE = re.compile(r'(?<![A-Za-z0-9])[Ss](\d{1,4})[\s._-]+(?:[Ee][Pp]?[\s._-]*)?(\d{1,3})(?![A-Za-z0-9])')
 # Standalone absolute episode tag with no season, e.g. "E0052", "EP283".
 # The lookbehind rejects the E of a seasonal "S01E05" (preceded by a digit).
 _ABS_RE = re.compile(r'(?<![A-Za-z0-9])E(?:P(?:ISODE)?)?[\s._-]*(\d{2,4})(?![A-Za-z0-9])', re.IGNORECASE)
-_SEASON_WORD_RE = re.compile(r'\bSeason\s+(\d{1,2})\b', re.IGNORECASE)
-_SEASON_RE = re.compile(r'\bS(\d{1,2})\b', re.IGNORECASE)
+# Season-only pack names ("Show.S157.1080p", "Show Season 2024") take the same
+# 1-4 digit seasons; the word boundary after the digits is their no-digit guard.
+_SEASON_WORD_RE = re.compile(r'\bSeason\s+(\d{1,4})\b', re.IGNORECASE)
+_SEASON_RE = re.compile(r'\bS(\d{1,4})\b', re.IGNORECASE)
 _YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
 # Strip leading site/group prefixes from torrent names before parsing:
 #   [DEVIL-TORRENTS PL]  /  rutor.info  /  www.UIndex.org  /  HIDRATORRENTS.ORG  etc.
@@ -271,7 +275,7 @@ def _safe(s: str) -> str:
 
 def _title_before_season(name: str) -> str:
     """Show title from a pack name such as "South.Park.S21.1080p.WEB-DL"."""
-    s = re.split(r'\b(?:S\d{1,2}|Season\s*\d{1,2}|Series\s*\d{1,2})\b', _clean(name),
+    s = re.split(r'\b(?:S\d{1,4}|Season\s*\d{1,4}|Series\s*\d{1,4})\b', _clean(name),
                  maxsplit=1, flags=re.IGNORECASE)[0]
     return _safe(_strip_junk(s).strip())
 
