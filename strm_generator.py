@@ -24,7 +24,9 @@ log = logging.getLogger(__name__)
 
 _VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.ts', '.m2ts', '.webm'}
 
-_EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,2})', re.IGNORECASE)
+# Episodes run past 99 on soaps and daily shows (Coronation Street S67E192). The
+# trailing guard stops a long number from being read as its first two digits.
+_EP_RE = re.compile(r'[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)', re.IGNORECASE)
 # Alternate "season x episode" naming, e.g. "12x89", "02x10", "1x06".
 # Guarded so it does not match resolutions ("1920x1080") or codecs ("x264").
 _EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{2})(?!\d)')

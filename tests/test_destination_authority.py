@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v14-hygiene-classifier.json'
-FIXTURE_SHA='8512b88eac2409f59a6c2b4e7829624c3e6f695da761caf156aa79b08a020a63'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v14-hygiene-classifier.json')
-INVENTORY_SHA='4839957c7499673965e577a9d16be9f4568facfcb749605b5b21947f41b6eb16'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v15-episode-tags.json'
+FIXTURE_SHA='94e23b0202b3923a73bd946a50ef25683669aa4f81c77ace059f931228a245f3'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v15-episode-tags.json')
+INVENTORY_SHA='e49d1c921e63ec335aff3e29acbaf77e3e30d713edab7429d8d800f871e140af'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -579,7 +579,11 @@ def test_classifier_inventory_only_updates_phantom_cleanup_and_one_proposal_writ
     prior_model=FIXTURE.with_name('destination-fence-model-v13-guarded-rescan.json')
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='e1c83dfa204ce386bcd90821cbca0c40f1afc9ab76a95a9dda525a039d05eee3'
     assert hashlib.sha256(prior_model.read_bytes()).hexdigest()=='5a2c49e7665002f19033eebd8e458d1eb1cbebefb3e32637b3b6879bfa27cd21'
-    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    current_path=INVENTORY.with_name('destination-path-inventory-v14-hygiene-classifier.json')
+    current_model=FIXTURE.with_name('destination-fence-model-v14-hygiene-classifier.json')
+    assert hashlib.sha256(current_path.read_bytes()).hexdigest()=='4839957c7499673965e577a9d16be9f4568facfcb749605b5b21947f41b6eb16'
+    assert hashlib.sha256(current_model.read_bytes()).hexdigest()=='8512b88eac2409f59a6c2b4e7829624c3e6f695da761caf156aa79b08a020a63'
+    prior=json.loads(prior_path.read_text());current=json.loads(current_path.read_text())
     def pins(inventory):
         found={x['path']:x['sha256'] for x in inventory['audited_python_files']}
         for group in inventory['writer_groups']+inventory['reader_domains']:
@@ -596,6 +600,30 @@ def test_classifier_inventory_only_updates_phantom_cleanup_and_one_proposal_writ
         return sorted((x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']==path)
     assert calls(current,'phantom_cleanup.py')==sorted(calls(prior,'phantom_cleanup.py')+[('cleanup','atomic_write_text')])
     others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='phantom_cleanup.py']
+    assert others(current)==others(prior)
+    strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
+    for key in ['writer_groups','reader_domains']:
+        assert strip(current[key])==strip(prior[key])
+    for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
+        assert current[key]==prior[key]
+    old_model=json.loads(prior_model.read_text());new_model=json.loads(current_model.read_text())
+    assert {k:v for k,v in new_model.items() if k!='source_inventory_sha256'}=={k:v for k,v in old_model.items() if k!='source_inventory_sha256'}
+
+
+def test_episode_tag_inventory_only_moves_strm_generator_lines():
+    prior_path=INVENTORY.with_name('destination-path-inventory-v14-hygiene-classifier.json')
+    prior_model=FIXTURE.with_name('destination-fence-model-v14-hygiene-classifier.json')
+    assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='4839957c7499673965e577a9d16be9f4568facfcb749605b5b21947f41b6eb16'
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    before={x['path']:x['sha256'] for x in prior['audited_python_files']}
+    after={x['path']:x['sha256'] for x in current['audited_python_files']}
+    assert before.keys()==after.keys() and current['added_audited_paths']==[]
+    assert {p for p in before if before[p]!=after[p]}=={'strm_generator.py'}
+    assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    assert current['reviewed_source_changes']==[{'path':'strm_generator.py','old_sha256':before['strm_generator.py'],'new_sha256':after['strm_generator.py']}]
+    calls=lambda inventory,path:sorted((x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']==path)
+    assert calls(current,'strm_generator.py')==calls(prior,'strm_generator.py')
+    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='strm_generator.py']
     assert others(current)==others(prior)
     strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
     for key in ['writer_groups','reader_domains']:

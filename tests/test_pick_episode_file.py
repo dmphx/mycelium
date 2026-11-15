@@ -88,6 +88,22 @@ class TestFileEpisodeParser:
         assert sg._file_episode("Show 1920x1080 x265.mkv") is None
         assert sg._file_episode("Generic Pack Name 2020.mkv") is None
 
+    def test_three_and_four_digit_episodes_are_read_whole(self):
+        # Soaps and daily shows number past 99. The tag must not be cut to its
+        # first two digits (S67E192 was read as S67E19).
+        assert sg._file_episode("Coronation.Street.S67E192.1080p.WEB.h264.mkv") == (67, 192)
+        assert sg._file_episode("The.Daily.Show.S31E105.720p.mkv") == (31, 105)
+        assert sg._file_episode("Emmerdale.S53E1001.mkv") == (53, 1001)
+        assert sg._file_episode("Show.S01E05E06.mkv") == (1, 5)
+        assert sg._file_episode("Show.S01E05.1080p.mkv") == (1, 5)
+
+    def test_parse_info_files_three_digit_episode_under_its_own_number(self):
+        info = sg._parse_info("Coronation.Street.S67E192.1080p.WEB.h264",
+                              "Coronation.Street.S67E192.1080p.WEB.h264.mkv")
+        assert info["type"] == "episode"
+        assert (info["season"], info["episode"]) == (67, 192)
+        assert info["title"] == "Coronation Street"
+
 
 class TestCrossSchemeAbsolute:
     """The 'absolute' arg lets a TVDB request match an absolute-numbered file."""

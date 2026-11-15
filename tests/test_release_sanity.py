@@ -196,6 +196,18 @@ def test_episode_single_file_wrong_episode_rejected():
     assert reason and "not S03E08" in reason
 
 
+def test_three_digit_episode_single_file_accepted():
+    # Coronation Street S67E192 was rejected as "single file tags S67E19".
+    entry = {"name": "Coronation.Street.S67E192.1080p.WEB.h264-FLX", "size": 1 * GB, "files": []}
+    assert release_sanity.verify_entry(entry, "episode", season=67, episode=192) is None
+
+
+def test_three_digit_episode_still_rejected_for_its_two_digit_prefix():
+    entry = {"name": "Coronation.Street.S67E192.1080p.WEB.h264-FLX", "size": 1 * GB, "files": []}
+    reason = release_sanity.verify_entry(entry, "episode", season=67, episode=19)
+    assert reason and "single file tags S67E192, not S67E19" in reason
+
+
 def test_season_pack_rejected_only_when_no_video():
     good = {"name": "Show S01 1080p", "size": 20 * GB,
             "files": [{"name": "Show S01E01 1080p.mkv", "size": GB}]}
