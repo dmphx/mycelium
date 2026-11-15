@@ -3510,7 +3510,7 @@ def ui_api_library_series_episodes():
     db.reconcile_wanted_episodes()
     import re as _re
     from pathlib import Path as _Path
-    _EP_RE = _re.compile(r'[Ss](\d{1,2})[Ee](\d{1,3})')
+    _EP_RE = _re.compile(r'[Ss](\d{1,2})[Ee](\d{1,4})(?!\d)')
     series_dir = _Path(cfg.MEDIA_PATH) / "series"
 
     folder_imdb = db.get_series_folder_imdb_map()

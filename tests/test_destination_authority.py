@@ -16,9 +16,9 @@ import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
 FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v15-episode-tags.json'
-FIXTURE_SHA='94e23b0202b3923a73bd946a50ef25683669aa4f81c77ace059f931228a245f3'
+FIXTURE_SHA='e9b92a8bce978cd781325cf2f2eac443c59f80904666f1787a493a066bf4eb1c'
 INVENTORY=FIXTURE.with_name('destination-path-inventory-v15-episode-tags.json')
-INVENTORY_SHA='e49d1c921e63ec335aff3e29acbaf77e3e30d713edab7429d8d800f871e140af'
+INVENTORY_SHA='6d89c8632f478433ce40caddabb262d372156f9f23d7dd1635f55264f46ae64c'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -610,20 +610,22 @@ def test_classifier_inventory_only_updates_phantom_cleanup_and_one_proposal_writ
     assert {k:v for k,v in new_model.items() if k!='source_inventory_sha256'}=={k:v for k,v in old_model.items() if k!='source_inventory_sha256'}
 
 
-def test_episode_tag_inventory_only_moves_strm_generator_lines():
+def test_episode_tag_inventory_only_moves_lines_in_the_five_episode_consumers():
     prior_path=INVENTORY.with_name('destination-path-inventory-v14-hygiene-classifier.json')
     prior_model=FIXTURE.with_name('destination-fence-model-v14-hygiene-classifier.json')
     assert hashlib.sha256(prior_path.read_bytes()).hexdigest()=='4839957c7499673965e577a9d16be9f4568facfcb749605b5b21947f41b6eb16'
     prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
     before={x['path']:x['sha256'] for x in prior['audited_python_files']}
     after={x['path']:x['sha256'] for x in current['audited_python_files']}
+    changed={'app.py','cleanup.py','nfo_generator.py','placeholder_cleanup.py','strm_generator.py'}
     assert before.keys()==after.keys() and current['added_audited_paths']==[]
-    assert {p for p in before if before[p]!=after[p]}=={'strm_generator.py'}
+    assert {p for p in before if before[p]!=after[p]}==changed
     assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
-    assert current['reviewed_source_changes']==[{'path':'strm_generator.py','old_sha256':before['strm_generator.py'],'new_sha256':after['strm_generator.py']}]
-    calls=lambda inventory,path:sorted((x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']==path)
-    assert calls(current,'strm_generator.py')==calls(prior,'strm_generator.py')
-    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path']!='strm_generator.py']
+    assert current['reviewed_source_changes']==[{'path':p,'old_sha256':before[p],'new_sha256':after[p]} for p in sorted(changed)]
+    from collections import Counter
+    calls=lambda inventory:Counter((x['path'],x['function'],x['call']) for x in inventory['static_sink_calls'])
+    assert calls(current)==calls(prior)
+    others=lambda inventory:[(x['path'],x['line'],x['function'],x['call']) for x in inventory['static_sink_calls'] if x['path'] not in changed]
     assert others(current)==others(prior)
     strip=lambda groups:[{k:v for k,v in g.items() if k!='source_files'} for g in groups]
     for key in ['writer_groups','reader_domains']:
