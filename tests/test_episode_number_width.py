@@ -152,3 +152,59 @@ def test_writer_reads_long_seasons_whole(tmp_path, monkeypatch):
                           "House.Hunters.International.S157E01.720p.mkv")
     assert (info["season"], info["episode"]) == (157, 1)
     assert info["title"] == "House Hunters International"
+
+
+def _season_only_patterns():
+    """The season-only pack regexes: S157 / Season 2024 with no episode tag."""
+    return [("_SEASON_RE", sg._SEASON_RE), ("_SEASON_WORD_RE", sg._SEASON_WORD_RE)]
+
+
+def test_season_only_pack_regexes_read_long_seasons_whole():
+    for site, pattern in _season_only_patterns():
+        for name, want in [("Show S01 1080p", 1), ("Show S157 720p", 157), ("Show S2024 WEB", 2024),
+                           ("Show Season 01", 1), ("Show Season 157", 157), ("Show Season 2024", 2024)]:
+            if "Season" in name and site == "_SEASON_RE" or "Season" not in name and site == "_SEASON_WORD_RE":
+                continue
+            m = pattern.search(name)
+            assert m and int(m.group(1)) == want, f"{site} reads {name} as {m and m.group(1)}"
+        # The word boundary is the no-digit guard: five digits are not a season.
+        assert pattern.search("Show S12345 x") is None
+        assert pattern.search("Show Season 12345 x") is None
+
+
+@pytest.mark.parametrize("torrent, title, season", [
+    ("House.Hunters.International.S157.720p.WEB-DL", "House Hunters International", 157),
+    ("The.Daily.Show.S2024.1080p.WEB.h264-GRP", "The Daily Show", 2024),
+    ("Coronation.Street.Season.67.Complete", "Coronation Street", 67),
+    ("Some.Show.Season.2024.Complete", "Some Show", 2024),
+])
+def test_season_only_pack_names_parse_as_a_series_pack(torrent, title, season):
+    info = sg._parse_info(torrent, f"{torrent}/file.mkv")
+    assert info == {"type": "series", "title": title, "season": season}
+
+
+def test_a_pack_files_episode_still_wins_over_its_long_season_folder():
+    info = sg._parse_info("House.Hunters.International.S157.720p",
+                          "House.Hunters.International.S157.720p/House.Hunters.International.S157E03.720p.mkv")
+    assert info == {"type": "episode", "title": "House Hunters International", "season": 157, "episode": 3}
+    assert sg._title_before_season("House.Hunters.International.S157.720p.WEB-DL") == "House Hunters International"
+    assert sg._title_before_season("The.Daily.Show.S2024.1080p") == "The Daily Show"
+
+
+def test_loose_anime_tag_reads_a_long_season_but_never_a_year_as_the_episode():
+    assert sg._file_episode("Anime.S157 - 01.mkv") == (157, 1)
+    assert sg._file_episode("Anime.S4 - 01.mkv") == (4, 1)
+    # A pack file carrying its year has no episode; S01 2024 is not S01E2024.
+    assert sg._file_episode("Show.S01.2024.1080p.mkv") is None
+    assert sg._parse_info("Show.S01.2024.1080p", "Show.S01.2024.1080p.mkv") == {"type": "series", "title": "Show", "season": 1}
+
+
+def test_season_x_episode_form_keeps_its_widths_so_resolutions_never_parse():
+    assert sg._file_episode("Show.12x89.mkv") == (12, 89)
+    for name in ("clip.1280x720.mkv", "clip.1920x1080.mkv", "clip.3840x2160.mkv"):
+        assert sg._file_episode(name) is None, name
+
+
+def test_a_movie_year_is_still_a_year_not_a_season():
+    assert sg._parse_info("Some.Film.2024.1080p", "Some.Film.2024.mkv") == {"type": "movie", "title": "Some Film", "year": 2024}
+    assert sg._parse_info("Film.S.2024", "Film.S.2024.mkv")["type"] == "movie"

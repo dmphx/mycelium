@@ -13,6 +13,9 @@ All notable changes to Mycelium are documented in this file.
 - Seasons numbered past 99 (House Hunters International S157, year seasons
   such as S2024) are read whole by every episode-tag parser instead of being
   missed
+- Season-only pack names with such seasons ("House.Hunters.International.S157",
+  "Show Season 2024") are filed as that season's pack instead of a movie or an
+  unknown title, and the loose anime tag ("S157 - 01") reads its season whole
 - Episodes numbered past 99 keep their number everywhere. Every episode-tag
   parser now reads up to four digits whole. Before, release sanity rejected
   Coronation Street S67E192 as "S67E19", pack files could land under the wrong

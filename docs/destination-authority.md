@@ -76,3 +76,7 @@ The v17 inventory re-pins `monitor.py`, after `strm_exists_episode` began matchi
 an episode file by its exact tag rather than a substring, and every other
 episode-tag file, after their season group widened to four digits. Only line
 numbers of existing sink calls move; runtime completeness stays UNPROVED.
+
+The v18 inventory re-pins `strm_generator.py` after the season-only pack regexes
+and the loose anime tag widened their season group to four digits. Only line
+numbers of existing sink calls move; runtime completeness stays UNPROVED.
