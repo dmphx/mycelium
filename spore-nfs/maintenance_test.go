@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -239,6 +240,12 @@ func TestMaintenanceResumeRequiresFreshNormalTree(t *testing.T) {
 		if r.URL.Path != "/spore-nfs/tree" {
 			t.Error("unexpected endpoint")
 		}
+		built, err := monotonicNanos()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("X-Spore-Tree-Built-Monotonic-Ns", strconv.FormatInt(built, 10))
 		if mode.Load() == 0 {
 			http.Error(w, "not ready", 503)
 			return

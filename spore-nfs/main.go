@@ -103,12 +103,13 @@ type entryInfo struct {
 }
 
 type tree struct {
-	mu         sync.RWMutex
-	byPath     map[string]entryInfo // path -> {token,size,cached}
-	dirs       map[string]bool      // every ancestor directory of every file
-	childMap   map[string][]string  // dir -> immediate child names (files + subdirs)
-	fetchedAt  time.Time
-	generation uint64
+	mu          sync.RWMutex
+	byPath      map[string]entryInfo // path -> {token,size,cached}
+	dirs        map[string]bool      // every ancestor directory of every file
+	childMap    map[string][]string  // dir -> immediate child names (files + subdirs)
+	fetchedAt   time.Time
+	generation  uint64
+	frozenSizes map[string]metadataSize // immutable effective metadata during maintenance
 }
 
 func newTree() *tree {
@@ -154,6 +155,13 @@ func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
 	if err != nil {
 		return err
 	}
+	var sourceAfter int64
+	if control {
+		sourceAfter, err = monotonicNanos()
+		if err != nil {
+			return err
+		}
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -161,6 +169,13 @@ func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	if control {
+		built, e := strconv.ParseInt(resp.Header.Get("X-Spore-Tree-Built-Monotonic-Ns"), 10, 64)
+		now, clockErr := monotonicNanos()
+		if e != nil || clockErr != nil || built < sourceAfter || built > now {
+			return errors.New("resume requires a tree built after this request; still fenced")
+		}
 	}
 	var out struct {
 		Entries []treeEntry `json:"entries"`
@@ -206,6 +221,14 @@ func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
 		}
 	}
 
+	if control {
+		maintenance.mu.Lock()
+		live := maintenance.mode == "resuming" && maintenance.withinBudget() && ctx.Err() == nil
+		maintenance.mu.Unlock()
+		if !live {
+			return errors.New("original resume budget expired before install")
+		}
+	}
 	t.mu.Lock()
 	t.byPath = byPath
 	t.dirs = dirs
@@ -664,6 +687,16 @@ func (fs *sporeFS) Lstat(filename string) (os.FileInfo, error) { return fs.Stat(
 // historical .fsh header as a playable movie. A later cached-state refresh can
 // restore real size and mtime; scanning does not add a provider torrent.
 func (fs *sporeFS) sizeAndMtime(p string, info entryInfo) (int64, time.Time) {
+	fs.tree.mu.RLock()
+	frozen, ok := fs.tree.frozenSizes[p]
+	fs.tree.mu.RUnlock()
+	if ok {
+		return frozen.Size, time.Unix(frozen.Mtime, 0)
+	}
+	return effectiveSizeAndMtime(info)
+}
+
+func effectiveSizeAndMtime(info entryInfo) (int64, time.Time) {
 	var headerSize int64
 	if m := fshMetaFor(info.token); m.ok {
 		headerSize = m.cdnSize

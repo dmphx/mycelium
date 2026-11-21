@@ -20,7 +20,8 @@ with kernel peer credentials; a carrier must verify the actual user namespace,
 UID mapping, container and Go process identities before using it.
 
 Send exactly one JSON object of at most 4096 bytes, then half-close the writing
-side. Duplicate/unknown keys, extra objects and invalid command fields refuse.
+side. Duplicate/unknown keys, case aliases (such as `Owner`), extra objects and invalid
+command fields refuse. Only the exact lowercase protocol keys are accepted.
 At most two root control sessions run concurrently, each bounded by 40 seconds.
 Commands are:
 
@@ -34,17 +35,32 @@ Commands are:
   Entry closes admission before draining in-flight media reads, HTTP bodies
   and complete refresh installations. The drain has a 30-second ceiling.
   Its current serving tree must be nonempty and no older than the normal tree
-  TTL at admission. Refusal after closing admission leaves it fenced.
+  TTL at admission. Effective size/mtime for every serving entry is captured once
+  after the drain, using the same FSH/availability predicate as normal NFS stat.
+  That immutable map serves both snapshots and NFS metadata for the interval;
+  expiring pre-entry FSH misses cannot change it. Refusal after closing admission
+  leaves it fenced.
 * `snapshot`: same owner and up to 256 exact unique relative `paths`. Returns
   the sorted actual serving entries, generation, fetch time, effective sizes
   and mtimes for requested paths, helper instance and a SHA256. The digest is
   over the response snapshot with its `sha256` field empty. Effective sizes use
-  the same `.fsh` and availability predicate as NFS stat. An unknown path or
+  the entry-time `.fsh` and availability predicate captured for NFS stat. An unknown path or
   expired operation refuses; there are no synthetic cached defaults.
 * `resume`: same owner only. The controller must have explicitly resumed the
   exact Python writers and proved their metadata API ready. The helper keeps
   media admission closed while it fetches a fresh tree from the exact configured
-  tree endpoint, with no redirect to another URL. A failed or empty result
+  tree endpoint, with no redirect to another URL. Resume checks the ORIGINAL
+  monotonic and UTC deadlines before any request, bounds the request by that
+  remaining budget, and rechecks before install and reopening. Expired owners
+  cannot resume or renew; recovery then needs a separately ruled action.
+  The response must carry `X-Spore-Tree-Built-Monotonic-Ns`: Python atomically
+  publishes the body with its CLOCK_MONOTONIC build-start timestamp. Go requires
+  that build to start after this resume request, so an unexpired 30-second Python
+  cache is refused rather than misrepresented as a post-repair tree. There is no
+  cache-bypass endpoint or automatic retry: the controller must account for the
+  cache TTL before an explicitly admitted resume. The carrier must prove Python
+  and Go share the container time namespace and CLOCK_MONOTONIC origin.
+  A failed, stale, unproven or empty result
   retains the frozen generation and fence. Success installs the fresh generation
   before reopening normal operation. Repeating enter never renews an owner.
 
