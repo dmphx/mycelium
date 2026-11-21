@@ -1,6 +1,6 @@
 # Local transport patch
 
-Upstream: github.com/willscott/go-nfs v0.0.4. The original MIT LICENSE is retained. UPSTREAM.json records the original file hashes and module checksum. Only conn.go differs from the copied upstream implementation; conn_concurrent_test.go adds transport regression tests.
+Upstream: github.com/willscott/go-nfs v0.0.4. The original Apache-2.0 LICENSE is retained verbatim. The initial operational proposal called this MIT; the pinned v0.0.4 artifact itself carries Apache-2.0, which governs this copy. UPSTREAM.json records the original file hashes and module checksum. Only conn.go differs from the copied upstream implementation; conn_concurrent_test.go adds transport regression tests.
 
 The patch copies a complete RPC request before dispatch, limits a connection to eight active handlers and a one MiB request frame, and serializes complete response frames through one acknowledged writer. A clean TCP read half-close drains accepted responses. Cancellation and transport errors close the socket and retire context-aware handlers. Responses retain their RPC transaction IDs and may finish out of request order.
 
