@@ -247,7 +247,7 @@
         },
         {
           "path": "spore-nfs/maintenance.go",
-          "sha256": "ca3620a3e2f247509f64133e80e518c4e6319a2d0f6907de62330d49ed911012"
+          "sha256": "5eb96278ae40c2ded755e2ce6e3997776bdf61cfdbfed973ae1c63aff47da3da"
         },
         {
           "path": "spore-nfs/maintenance_peer_linux.go",
@@ -770,19 +770,19 @@
   "static_sink_calls": [
     {
       "path": "app.py",
-      "line": 3211,
+      "line": 3213,
       "function": "_kick_off_processing",
       "call": "db.upsert_monitored_series"
     },
     {
       "path": "app.py",
-      "line": 4095,
+      "line": 4097,
       "function": "_spa_index",
       "call": "html.replace"
     },
     {
       "path": "app.py",
-      "line": 4099,
+      "line": 4101,
       "function": "_spa_index",
       "call": "html.replace"
     },
@@ -1870,7 +1870,7 @@
     {
       "path": "app.py",
       "old_sha256": "b4401bdcbabb94f04756f7597f60dcf0a0e788a8bc859f2d6717a9be63ccaa3b",
-      "new_sha256": "d2cdc3090e0e3ad35be7ddfc6da0a6bf894463c7a14b7a2f21a0753b2deefade"
+      "new_sha256": "99f272725b98b01e92eda8683bd6f45167d2f260aaf4ba481708e806c0651e7b"
     },
     {
       "path": "cleanup.py",
@@ -1911,5 +1911,6 @@
   "review_scope": "Every episode-tag regex reads 1-4 digit seasons and episodes whole, and monitor matches an episode .strm by its exact tag instead of a substring; no destination writer or reader change and no complete destination authority. Runtime completeness remains UNPROVED.",
   "added_audited_paths": [],
   "integration_base_commit": "94b583434967f8fb0070920e75b1a213a2cfa7e7",
-  "static_policy": "tools.source_inventory.sink_calls; method-name matches include false positives, not live completeness or effect authority."
+  "static_policy": "tools.source_inventory.sink_calls; method-name matches include false positives, not live completeness or effect authority.",
+  "maintenance_review_scope": "Atomic Python tree body/build-time publication; Go maintenance snapshots freeze effective size/mtime and require original budgets and a post-request tree proof. No destination writer completeness or live authority is claimed."
 }

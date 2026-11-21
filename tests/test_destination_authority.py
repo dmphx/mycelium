@@ -16,9 +16,9 @@ import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
 FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v19-metadata-maintenance.json'
-FIXTURE_SHA='05278852055995810602876fa979ff7719a4d44b09e5577ba45eb231e0f3a5fc'
+FIXTURE_SHA='9a58031fb6305d8e6fea7005441188fb2a1a6e98f9875abcb6a04923250c294b'
 INVENTORY=FIXTURE.with_name('destination-path-inventory-v19-metadata-maintenance.json')
-INVENTORY_SHA='901be005d0de024cbd73a6b47e82f77a393bdfff386877db0ee4ec6fc8f46900'
+INVENTORY_SHA='28f130a64d960fc8b7720fa7db9343dd2be00c499e17d633bd387488d5748706'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
