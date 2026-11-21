@@ -423,3 +423,22 @@ func TestMaintenanceSnapshotHashAndInstanceAreBound(t *testing.T) {
 		t.Fatal("snapshot hash/instance not bound")
 	}
 }
+
+func TestMaintenanceTransitionWaitCannotRenewBudget(t *testing.T) {
+	m, fs := maintenanceFixture(t)
+	<-m.transition
+	ctx, c := context.WithTimeout(context.Background(), time.Second)
+	defer c()
+	result := make(chan error, 1)
+	go func() {
+		result <- m.enter(ctx, fixtureOwner, 20*time.Millisecond, time.Now().Add(time.Minute), fs.tree)
+	}()
+	time.Sleep(45 * time.Millisecond)
+	m.transition <- struct{}{}
+	if err := <-result; err == nil {
+		t.Fatal("transition wait renewed the original duration")
+	}
+	if _, err := m.begin("media", false); err == nil {
+		t.Fatal("expired admission automatically resumed")
+	}
+}
