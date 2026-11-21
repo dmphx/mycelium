@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -133,5 +134,42 @@ func TestMaintenanceParserAllCaseAliasesRefused(t *testing.T) {
 		if _, err := parseMaintenanceRequest([]byte(raw)); err == nil {
 			t.Fatalf("accepted alias %s", key)
 		}
+	}
+}
+
+func TestMaintenanceResumeLockWaitExpiryPreservesGeneration(t *testing.T) {
+	m, fs := maintenanceFixture(t)
+	enterFixture(t, m, fs)
+	old := httpClient
+	t.Cleanup(func() { httpClient = old })
+	fetched := make(chan struct{})
+	httpClient = &http.Client{Transport: &maintenanceTransport{gate: m, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		built, e := monotonicNanos()
+		if e != nil {
+			return nil, e
+		}
+		h := make(http.Header)
+		h.Set("X-Spore-Tree-Built-Monotonic-Ns", strconv.FormatInt(built, 10))
+		close(fetched)
+		return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(`{"entries":[{"token":"fresh","path":"movies/Fresh.mkv","size":2097152,"cached":true}]}`))}, nil
+	})}}
+	m.monoEnd = time.Now().Add(300 * time.Millisecond)
+	fs.tree.mu.Lock()
+	result := make(chan error, 1)
+	go func() { result <- m.resume(context.Background(), fixtureOwner, fs.tree) }()
+	select {
+	case <-fetched:
+	case <-time.After(2 * time.Second):
+		fs.tree.mu.Unlock()
+		t.Fatal("resume did not reach synthetic fetch")
+	}
+	time.Sleep(400 * time.Millisecond)
+	fs.tree.mu.Unlock()
+	err := <-result
+	if err == nil || fs.tree.generation != 7 || m.mode == "normal" || len(fs.tree.frozenSizes) != 1 {
+		t.Fatalf("expired lock wait changed state: %v gen%d mode%s", err, fs.tree.generation, m.mode)
+	}
+	if _, ok := fs.tree.byPath["series/Fixture/Fixture.mkv"]; !ok {
+		t.Fatal("original serving path lost")
 	}
 }

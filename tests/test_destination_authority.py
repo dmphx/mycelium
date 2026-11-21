@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v19-metadata-maintenance.json'
-FIXTURE_SHA='9a58031fb6305d8e6fea7005441188fb2a1a6e98f9875abcb6a04923250c294b'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v19-metadata-maintenance.json')
-INVENTORY_SHA='28f130a64d960fc8b7720fa7db9343dd2be00c499e17d633bd387488d5748706'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v20-metadata-maintenance.json'
+FIXTURE_SHA='f7376948339097d9c85e170ce780c9f32505c1ef0f1a13d352a4d3dd5d9198a1'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v20-metadata-maintenance.json')
+INVENTORY_SHA='d636af9f3c952a1abfd27f801b0bf1f4a0e0e1b9d0ee8e676c700bc30d58bb10'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
