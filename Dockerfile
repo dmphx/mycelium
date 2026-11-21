@@ -13,7 +13,7 @@ WORKDIR /src
 COPY spore-nfs/go.mod spore-nfs/go.sum* ./
 COPY spore-nfs/third_party/go-nfs ./third_party/go-nfs
 RUN go mod download
-COPY spore-nfs/main.go spore-nfs/media_contract.go ./
+COPY spore-nfs/main.go spore-nfs/media_contract.go spore-nfs/maintenance.go spore-nfs/maintenance_peer_linux.go spore-nfs/maintenance_peer_other.go ./
 RUN CGO_ENABLED=0 go build -o /spore-nfs .
 
 # -- Stage 3: Python runtime ----------------------------------------------------------
