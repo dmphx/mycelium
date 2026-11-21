@@ -274,24 +274,33 @@ func (m *maintenanceGate) resume(ctx context.Context, owner string, t *tree) err
 	m.mode = "resuming"
 	m.mu.Unlock()
 	err := t.refreshWithContext(context.WithValue(ctx, controlContextKey{}, true), true)
+	if err != nil {
+		m.mu.Lock()
+		m.mode = "draining"
+		m.mu.Unlock()
+		return fmt.Errorf("fresh tree failed; still fenced: %w", err)
+	}
+	// The tree was staged, checked and installed together with reopening by
+	// commitResume. No post-commit timeout may turn an earned commit into a
+	// failure claiming that the original generation was retained.
+	return nil
+}
+
+func (m *maintenanceGate) commitResume(ctx context.Context, t, next *tree) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err != nil || !m.withinBudget() || ctx.Err() != nil {
-		m.mode = "draining"
-		return fmt.Errorf("fresh tree failed or original budget expired; still fenced: %v", err)
-	}
-	t.mu.RLock()
-	ready := len(t.byPath) > 0
-	t.mu.RUnlock()
-	if !ready {
-		m.mode = "draining"
-		return errors.New("fresh tree empty; still fenced")
-	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Check AFTER acquiring both locks: waiting for metadata readers consumes
+	// the original budget. On refusal none of the serving state is changed.
+	if m.mode != "resuming" || !m.withinBudget() || ctx.Err() != nil || len(next.byPath) == 0 {
+		return errors.New("resume commit expired or invalid; original generation retained")
+	}
+	t.byPath, t.dirs, t.childMap = next.byPath, next.dirs, next.childMap
+	t.fetchedAt = time.Now()
+	t.generation++
 	t.frozenSizes = nil
-	t.mu.Unlock()
-	m.mode = "normal"
-	m.owner = ""
+	m.mode, m.owner = "normal", ""
 	m.notify()
 	return nil
 }

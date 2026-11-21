@@ -166,7 +166,12 @@ func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	bodyClosed := false
+	defer func() {
+		if !bodyClosed {
+			resp.Body.Close()
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
@@ -222,12 +227,12 @@ func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
 	}
 
 	if control {
-		maintenance.mu.Lock()
-		live := maintenance.mode == "resuming" && maintenance.withinBudget() && ctx.Err() == nil
-		maintenance.mu.Unlock()
-		if !live {
-			return errors.New("original resume budget expired before install")
+		// Retire the response body before the atomic install/reopen decision.
+		if err := resp.Body.Close(); err != nil {
+			return err
 		}
+		bodyClosed = true
+		return maintenance.commitResume(ctx, t, &tree{byPath: byPath, dirs: dirs, childMap: childMap})
 	}
 	t.mu.Lock()
 	t.byPath = byPath

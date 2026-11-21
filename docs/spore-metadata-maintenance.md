@@ -61,8 +61,11 @@ Commands are:
   cache TTL before an explicitly admitted resume. The carrier must prove Python
   and Go share the container time namespace and CLOCK_MONOTONIC origin.
   A failed, stale, unproven or empty result
-  retains the frozen generation and fence. Success installs the fresh generation
-  before reopening normal operation. Repeating enter never renews an owner.
+  retains the frozen generation and fence. Success stages the response first, then checks the original budget AFTER
+  acquiring both admission and tree locks. Installation, frozen-size retirement
+  and reopening occur together at that decision point. Lock-wait expiry leaves
+  every original serving map and generation untouched; a later wall-clock tick
+  does not retroactively report a committed resume as a refusal. Repeating enter never renews an owner.
 
 Socket replies are structured `{ "ok": ..., "result": ..., "error": ... }`.
 A lost reply means unknown state, not permission to repeat an effect. Inspect
