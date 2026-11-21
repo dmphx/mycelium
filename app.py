@@ -1948,7 +1948,7 @@ def _cdn_url_alive(cdn_url: str) -> bool:
 _SPORE_CHUNK = 16 << 20
 
 
-_spore_tree_cache = {"body": None, "ts": 0.0}
+_spore_tree_cache = {"snapshot": None}
 _spore_tree_lock = threading.Lock()
 _SPORE_TREE_TTL = 30.0  # seconds
 
@@ -2008,17 +2008,19 @@ def spore_nfs_tree():
             mimetype="application/json",
             headers={"Retry-After": "10", "Cache-Control": "no-store"})
     import time as _t
-    body = _spore_tree_cache["body"]
-    if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
-        return app.response_class(body, mimetype="application/json")
-    with _spore_tree_lock:
-        body = _spore_tree_cache["body"]
-        if body is not None and (_t.monotonic() - _spore_tree_cache["ts"]) < _SPORE_TREE_TTL:
-            return app.response_class(body, mimetype="application/json")
-        body = _build_spore_tree_json()
-        _spore_tree_cache["body"] = body
-        _spore_tree_cache["ts"] = _t.monotonic()
-    return app.response_class(body, mimetype="application/json")
+    # Publish body and build-start proof together; separate fields permit an
+    # old body to be paired with a newer generation during concurrent rebuilds.
+    snapshot = _spore_tree_cache["snapshot"]
+    if snapshot is None or (_t.monotonic() - snapshot[1]) >= _SPORE_TREE_TTL:
+        with _spore_tree_lock:
+            snapshot = _spore_tree_cache["snapshot"]
+            if snapshot is None or (_t.monotonic() - snapshot[1]) >= _SPORE_TREE_TTL:
+                built_ns = _t.monotonic_ns()
+                body = _build_spore_tree_json()
+                snapshot = (body, _t.monotonic(), built_ns)
+                _spore_tree_cache["snapshot"] = snapshot
+    return app.response_class(snapshot[0], mimetype="application/json", headers={
+        "X-Spore-Tree-Built-Monotonic-Ns": str(snapshot[2])})
 
 
 @app.get("/spore-nfs/size/<token>")

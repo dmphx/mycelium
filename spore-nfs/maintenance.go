@@ -126,11 +126,24 @@ func (m *maintenanceGate) enter(ctx context.Context, owner string, remaining tim
 	if !m.withinBudget() {
 		return errors.New("maintenance admission expired")
 	}
-	t.mu.RLock()
+	t.mu.Lock()
 	ready := len(t.byPath) > 0 && !t.fetchedAt.IsZero() && time.Since(t.fetchedAt) <= treeTTL
-	t.mu.RUnlock()
-	if !ready {
-		return errors.New("current serving tree unready or too old")
+	if ready {
+		// Capture the effective metadata once, including pre-entry FSH misses.
+		// Expiring local caches cannot alter the admitted generation later.
+		t.frozenSizes = make(map[string]metadataSize, len(t.byPath))
+		for p, info := range t.byPath {
+			if ctx.Err() != nil || !m.withinBudget() {
+				ready = false
+				break
+			}
+			size, mtime := effectiveSizeAndMtime(info)
+			t.frozenSizes[p] = metadataSize{Path: p, Size: size, Mtime: mtime.Unix()}
+		}
+	}
+	t.mu.Unlock()
+	if !ready || !m.withinBudget() || ctx.Err() != nil {
+		return errors.New("current serving tree unready, too old or admission expired")
 	}
 	m.mode = "active"
 	m.notify()
@@ -180,12 +193,15 @@ func (m *maintenanceGate) snapshot(owner string, paths []string, fs *sporeFS) (m
 			return maintenanceSnapshot{}, errors.New("invalid or repeated metadata path")
 		}
 		seen[p] = true
-		e, ok := fs.tree.byPath[p]
+		_, ok := fs.tree.byPath[p]
 		if !ok {
 			return maintenanceSnapshot{}, errors.New("unknown metadata path")
 		}
-		size, mtime := fs.sizeAndMtime(p, e)
-		out.Sizes = append(out.Sizes, metadataSize{Path: p, Size: size, Mtime: mtime.Unix()})
+		frozen, ok := fs.tree.frozenSizes[p]
+		if !ok {
+			return maintenanceSnapshot{}, errors.New("effective metadata not frozen")
+		}
+		out.Sizes = append(out.Sizes, frozen)
 	}
 	// Hash the exact sorted snapshot, not a separately reopened source.
 	b, err := json.Marshal(out)
@@ -244,18 +260,25 @@ func (m *maintenanceGate) resume(ctx context.Context, owner string, t *tree) err
 	}
 	defer func() { m.transition <- struct{}{} }()
 	m.mu.Lock()
-	if m.mode == "normal" || m.mode == "resuming" || owner != m.owner || m.count() != 0 {
+	if m.mode == "normal" || m.mode == "resuming" || owner != m.owner || m.count() != 0 || !m.withinBudget() {
 		m.mu.Unlock()
 		return errors.New("cannot resume unknown or active owner")
 	}
+	// Clamp to the original monotonic AND wall deadlines, never a new budget.
+	end := m.monoEnd
+	if m.hardEnd.Before(end) {
+		end = m.hardEnd
+	}
+	ctx, cancel := context.WithDeadline(ctx, end)
+	defer cancel()
 	m.mode = "resuming"
 	m.mu.Unlock()
 	err := t.refreshWithContext(context.WithValue(ctx, controlContextKey{}, true), true)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err != nil {
+	if err != nil || !m.withinBudget() || ctx.Err() != nil {
 		m.mode = "draining"
-		return fmt.Errorf("fresh tree failed; still fenced: %w", err)
+		return fmt.Errorf("fresh tree failed or original budget expired; still fenced: %v", err)
 	}
 	t.mu.RLock()
 	ready := len(t.byPath) > 0
@@ -264,6 +287,9 @@ func (m *maintenanceGate) resume(ctx context.Context, owner string, t *tree) err
 		m.mode = "draining"
 		return errors.New("fresh tree empty; still fenced")
 	}
+	t.mu.Lock()
+	t.frozenSizes = nil
+	t.mu.Unlock()
 	m.mode = "normal"
 	m.owner = ""
 	m.notify()
@@ -298,6 +324,11 @@ func parseMaintenanceRequest(raw []byte) (maintenanceRequest, error) {
 		s, ok := key.(string)
 		if !ok || seen[s] {
 			return req, errors.New("duplicate control key")
+		}
+		switch s {
+		case "command", "owner", "remaining_seconds", "hard_end", "paths":
+		default:
+			return req, errors.New("noncanonical or unknown control key")
 		}
 		seen[s] = true
 		var v json.RawMessage

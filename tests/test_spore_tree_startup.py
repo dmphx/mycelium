@@ -27,7 +27,7 @@ def tree_app():
     ns = {'app': app, 'log': logging.getLogger('synthetic-spore-tree'),
           'threading': threading, '_spore_status': {}, '_spore_status_lock': threading.Lock(),
           '_spore_status_ready': threading.Event(), '_SPORE_READY_STATES': {'cached', 'completed'},
-          '_spore_tree_cache': {'body': None, 'ts': 0.0}, '_spore_tree_lock': threading.Lock(),
+          '_spore_tree_cache': {'snapshot': None}, '_spore_tree_lock': threading.Lock(),
           '_SPORE_TREE_TTL': 30.0, '_os': SimpleNamespace(environ={}),
           'db': SimpleNamespace(get_virtual_item_spore_index=lambda: [item], get_all_virtual_items=lambda: [item]),
           'torbox': SimpleNamespace(iter_torrents=provider),
@@ -43,7 +43,7 @@ def test_first_tree_waits_for_complete_initial_status_sweep(tree_app):
         assert response.status_code == 503
         assert response.headers['Retry-After'] == '10'
         assert response.headers['Cache-Control'] == 'no-store'
-        assert f.ns['_spore_tree_cache']['body'] is None
+        assert f.ns['_spore_tree_cache']['snapshot'] is None
     assert not f.calls  # Tree retries cannot trigger materialization/provider work.
     f.ns['_refresh_spore_status']()
     response = f.client.get('/spore-nfs/tree')
@@ -110,3 +110,38 @@ def test_complete_empty_sweep_is_ready_without_inventing_cached_media(tree_app):
     f.ns['_refresh_spore_status']()
     response = f.client.get('/spore-nfs/tree')
     assert response.status_code == 200 and response.json == {'entries': []}
+
+
+def test_cached_tree_keeps_original_body_build_proof(tree_app):
+    import time
+    f = tree_app
+    f.ns['_refresh_spore_status']()
+    before = time.monotonic_ns()
+    first = f.client.get('/spore-nfs/tree')
+    built = int(first.headers['X-Spore-Tree-Built-Monotonic-Ns'])
+    assert before <= built <= time.monotonic_ns()
+    f.ns['db'].get_all_virtual_items = lambda: []
+    second = f.client.get('/spore-nfs/tree')
+    assert second.data == first.data
+    assert int(second.headers['X-Spore-Tree-Built-Monotonic-Ns']) == built
+    f.ns['_spore_tree_cache']['snapshot'] = (first.data, -1000, built)
+    third = f.client.get('/spore-nfs/tree')
+    assert third.json == {'entries': []}
+    assert int(third.headers['X-Spore-Tree-Built-Monotonic-Ns']) > built
+
+
+def test_tree_proof_precedes_collection_and_is_paired_with_body(tree_app):
+    import time
+    f = tree_app
+    f.ns['_refresh_spore_status']()
+    original = f.ns['_build_spore_tree_json']
+    starts = []
+    def build():
+        starts.append(time.monotonic_ns())
+        return original()
+    f.ns['_build_spore_tree_json'] = build
+    response = f.client.get('/spore-nfs/tree')
+    body, _, built = f.ns['_spore_tree_cache']['snapshot']
+    assert built <= starts[0]
+    assert response.data == body.encode()
+    assert int(response.headers['X-Spore-Tree-Built-Monotonic-Ns']) == built
