@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -47,7 +48,7 @@ var (
 	// the initial refresh fails and an empty tree must be retried fast -- otherwise
 	// Plex could see an empty library for a full treeTTL.
 	startupRetryTTL = 10 * time.Second
-	httpClient      = &http.Client{Timeout: 30 * time.Second}
+	httpClient      = &http.Client{Timeout: 30 * time.Second, Transport: &maintenanceTransport{base: http.DefaultTransport, gate: maintenance}}
 )
 
 // Distinct mtime bands per representation so Plex notices a stub<->real flip
@@ -102,11 +103,12 @@ type entryInfo struct {
 }
 
 type tree struct {
-	mu        sync.RWMutex
-	byPath    map[string]entryInfo // path -> {token,size,cached}
-	dirs      map[string]bool      // every ancestor directory of every file
-	childMap  map[string][]string  // dir -> immediate child names (files + subdirs)
-	fetchedAt time.Time
+	mu         sync.RWMutex
+	byPath     map[string]entryInfo // path -> {token,size,cached}
+	dirs       map[string]bool      // every ancestor directory of every file
+	childMap   map[string][]string  // dir -> immediate child names (files + subdirs)
+	fetchedAt  time.Time
+	generation uint64
 }
 
 func newTree() *tree {
@@ -137,22 +139,37 @@ func (t *tree) refreshIfStale() {
 }
 
 func (t *tree) refresh() {
-	resp, err := httpClient.Get(myceliumBase + "/spore-nfs/tree")
-	if err != nil {
+	if err := t.refreshWithContext(context.Background(), false); err != nil {
 		log.Printf("tree refresh: %v", err)
-		return
+	}
+}
+
+func (t *tree) refreshWithContext(ctx context.Context, control bool) error {
+	done, err := maintenance.begin("refresh", control)
+	if err != nil {
+		return err
+	}
+	defer done()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, myceliumBase+"/spore-nfs/tree", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("tree refresh: unexpected status %d", resp.StatusCode)
-		return
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 	var out struct {
 		Entries []treeEntry `json:"entries"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		log.Printf("tree refresh decode: %v", err)
-		return
+		return err
+	}
+	if control && len(out.Entries) == 0 {
+		return errors.New("resume tree empty; current generation retained")
 	}
 
 	byPath := map[string]entryInfo{}
@@ -194,8 +211,10 @@ func (t *tree) refresh() {
 	t.dirs = dirs
 	t.childMap = childMap
 	t.fetchedAt = time.Now()
+	t.generation++
 	t.mu.Unlock()
 	log.Printf("tree refreshed: %d files, %d dirs", len(byPath), len(dirs))
+	return nil
 }
 
 func (t *tree) tokenFor(p string) (string, bool) {
@@ -358,7 +377,8 @@ func storeCDNURL(token, requestURL string) {
 }
 
 var noRedirectClient = &http.Client{
-	Timeout: 30 * time.Second,
+	Timeout:   30 * time.Second,
+	Transport: &maintenanceTransport{base: http.DefaultTransport, gate: maintenance},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
@@ -1112,6 +1132,13 @@ type sporeFile struct {
 func (f *sporeFile) Name() string { return f.name }
 
 func (f *sporeFile) Read(p []byte) (int, error) {
+	if !f.sidecar {
+		done, err := maintenance.begin("media", false)
+		if err != nil {
+			return 0, err
+		}
+		defer done()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.cached && !f.sidecar {
@@ -1280,6 +1307,16 @@ func main() {
 	t.refresh()
 
 	fs := &sporeFS{tree: t}
+	control, err := net.ListenUnix("unix", &net.UnixAddr{Name: "@spore-nfs-control-v1", Net: "unix"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer control.Close()
+	go func() {
+		if err := serveMaintenance(control, fs); err != nil {
+			log.Fatal(err)
+		}
+	}()
 	base := nfshelper.NewNullAuthHandler(fs)
 	handler := newStableHandler(base, fs)
 	handler.syncFromTree(t)
