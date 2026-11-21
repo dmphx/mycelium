@@ -85,6 +85,7 @@ func validOwner(s string) bool {
 }
 
 func (m *maintenanceGate) enter(ctx context.Context, owner string, remaining time.Duration, hard time.Time, t *tree) error {
+	started := time.Now()
 	select {
 	case <-m.transition:
 	case <-ctx.Done():
@@ -104,7 +105,7 @@ func (m *maintenanceGate) enter(ctx context.Context, owner string, remaining tim
 	}
 	m.mode = "draining"
 	m.owner = owner
-	m.monoEnd = time.Now().Add(remaining)
+	m.monoEnd = started.Add(remaining)
 	m.hardEnd = hard
 	m.notify()
 	for m.count() != 0 {
@@ -369,6 +370,7 @@ func serveMaintenance(listener *net.UnixListener, fs *sporeFS) error {
 }
 
 func handleMaintenance(c net.Conn, fs *sporeFS) {
+	accepted := time.Now()
 	c.SetDeadline(time.Now().Add(40 * time.Second))
 	raw, readErr := io.ReadAll(io.LimitReader(c, 4097))
 	if len(raw) > 4096 {
@@ -389,7 +391,7 @@ func handleMaintenance(c net.Conn, fs *sporeFS) {
 			if e != nil {
 				err = e
 			} else {
-				err = maintenance.enter(ctx, req.Owner, time.Duration(req.RemainingSeconds)*time.Second, hard, fs.tree)
+				err = maintenance.enter(ctx, req.Owner, time.Duration(req.RemainingSeconds)*time.Second-time.Since(accepted), hard, fs.tree)
 			}
 		case "snapshot":
 			result, err = maintenance.snapshot(req.Owner, req.Paths, fs)

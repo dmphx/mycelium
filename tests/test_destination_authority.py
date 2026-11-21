@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v17-exact-episode-match.json'
-FIXTURE_SHA='dc540435b77ac1f98d36ee0e99e4a875c51790c9346931efad4b75e7c56ea220'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v17-exact-episode-match.json')
-INVENTORY_SHA='086a67a0a43e82f759330dad192316ea3e156293677e5f70c68c3da9764f0094'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v18-metadata-maintenance.json'
+FIXTURE_SHA='45d8ca782f274442bf39b29f2c0d964070498427e9ad7165f23d60a8ded3b6bf'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v18-metadata-maintenance.json')
+INVENTORY_SHA='44fbb2641050473c4e3c556c36e7b9aecbe01feb3cf0fca02ea2f6383f9a83ec'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
