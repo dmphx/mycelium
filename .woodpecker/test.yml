@@ -83,6 +83,7 @@ steps:
       - ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 4 -c:v ffv1 -threads 2 -c:a pcm_s16le /tmp/mycelium-ci/synthetic.mkv
       - test "$$(stat -c %s /tmp/mycelium-ci/synthetic.mkv)" -ge 1048576
       - cd spore-nfs
+      - (cd third_party/go-nfs && go test -race -count=1 -p=4 ./...)
       - SPORE_SYNTHETIC_MOVIE=/tmp/mycelium-ci/synthetic.mkv SPORE_REASSEMBLED_MOVIE=/tmp/mycelium-ci/reassembled.mkv go test -race -count=1 -p=4 ./...
 
   - name: frontend-deps

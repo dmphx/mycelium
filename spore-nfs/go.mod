@@ -11,3 +11,6 @@ require (
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	golang.org/x/sys v0.24.0 // indirect
 )
+
+// Pin the bounded concurrent transport patch beside its upstream source and MIT license.
+replace github.com/willscott/go-nfs => ./third_party/go-nfs
