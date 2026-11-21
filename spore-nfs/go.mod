@@ -12,5 +12,5 @@ require (
 	golang.org/x/sys v0.24.0 // indirect
 )
 
-// Pin the bounded concurrent transport patch beside its upstream source and MIT license.
+// Pin the bounded concurrent transport patch beside its upstream source and Apache-2.0 license.
 replace github.com/willscott/go-nfs => ./third_party/go-nfs
