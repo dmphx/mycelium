@@ -94,7 +94,7 @@ def _identity_in_file(name, show, season, episode, title):
     expected = torrentio._normalized_words(title)
     if len(expected) < 3 or re.fullmatch(r"(?:episode \d+|tba|tbd)", expected):
         return False
-    return torrentio._episode_title_match(SimpleNamespace(name=base, title=""), title)
+    return torrentio._episode_title_match(SimpleNamespace(name=base[tags[0].end():], title=""), title)
 
 
 def prove_file(candidate, entry, *, imdb_id, show_title, season, episode, episode_title):
@@ -150,7 +150,7 @@ def prove_file(candidate, entry, *, imdb_id, show_title, season, episode, episod
         return None, "identity_refusal"
 
 
-def match_proven_file(proof, listing, item):
+def match_proven_file(proof, listing, item, *, require_id=True):
     """Resolve exactly the proved file, including after a provider id changes."""
     try:
         proof = validate_proof(proof)
@@ -164,7 +164,7 @@ def match_proven_file(proof, listing, item):
     matches = [file for file in listing["files"] if isinstance(file, dict)
                and _path(file.get("name") or file.get("short_name")) == proof["file_name"]
                and type(file.get("size")) is int and file["size"] == proof["file_size"]
-               and type(file.get("id")) is int and file["id"] > 0]
+               and (not require_id or (type(file.get("id")) is int and file["id"] > 0))]
     return matches[0] if len(matches) == 1 else None
 
 

@@ -208,9 +208,27 @@ def _cache_put(token: str, url: str, proof_binding: str | None = None) -> None:
                              (url, time.monotonic() + _URL_CACHE_TTL_SEC))
 
 
-def cache_url(token: str, url: str) -> None:
-    """Store a CDN URL in the in-memory cache (used by preload)."""
-    _cache_put(token, url)
+def cached_url(token: str) -> str | None:
+    """Read a URL only under the current virtual item's proof binding."""
+    import episode_selection
+    try:
+        binding = episode_selection.item_binding(db.get_virtual_item(token))
+    except Exception:
+        return None
+    return _cache_get(token, binding)
+
+
+def cache_url(token: str, url: str, proof_binding: str | None = None) -> bool:
+    """Preload must supply the current proof binding for a proved token."""
+    import episode_selection
+    try:
+        current = episode_selection.item_binding(db.get_virtual_item(token))
+    except Exception:
+        return False
+    if current != proof_binding:
+        return False
+    _cache_put(token, url, proof_binding)
+    return True
 
 
 def invalidate_url_cache(token: str | None = None) -> None:
@@ -474,7 +492,11 @@ def _materialize_proven_episode(token: str, item: dict, allow_readd: bool) -> st
                 or (item.get('protocol') or 'torrent') != 'torrent'
                 or (item.get('debrid_provider') or 'torbox') != 'torbox'):
             raise ValueError('proved item identity changed')
-        live = torbox.find_by_hash(proof['info_hash'])
+        live = torbox.find_by_id(item['torbox_id']) if item.get('torbox_id') else None
+        if (live and str(live.get('hash') or live.get('info_hash') or '').lower() != proof['info_hash']):
+            raise ValueError('stored torrent id changed identity')
+        if not (live and torbox._is_ready(live)):
+            live = torbox.find_by_hash(proof['info_hash'])
         if not (live and torbox._is_ready(live)):
             if not allow_readd:
                 return None

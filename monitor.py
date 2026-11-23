@@ -448,7 +448,7 @@ def _retry_episode(ep: dict) -> bool:
         listing_error = False
         if needs_proof:
             try:
-                entries = torbox.check_cached_files([s.info_hash for s in needs_proof], list_files=True)
+                entries = torbox.check_cached_files([s.info_hash for s in needs_proof], list_files=True, raise_on_error=True)
             except Exception:
                 listing_error = True
                 for item in needs_proof:

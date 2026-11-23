@@ -210,6 +210,18 @@ def spore_item_size(entry: dict, item: dict) -> int:
     size zero so Spore keeps serving the small stub instead of publishing a
     confidently wrong length.
     """
+    if item.get('episode_file_proof') is not None:
+        import episode_selection
+        try:
+            episode_selection.item_binding(item)
+            declared_hash = entry.get('hash') or entry.get('info_hash')
+            if declared_hash and str(declared_hash).lower() != item.get('info_hash'):
+                return 0
+            selected = episode_selection.match_proven_file(
+                item['episode_file_proof'], entry, item, require_id=False)
+            return selected['size'] if selected else 0
+        except (ValueError, TypeError, KeyError):
+            return 0
     files = entry.get("files") or []
     is_episode = (item.get("media_type") == "series"
                   or item.get("season") is not None
@@ -1041,6 +1053,18 @@ def _preload_requestdl_pace() -> None:
 # ── Catbox: CDN URL cache ─────────────────────────────────────────────────────
 # TorBox CDN URL ophalen en opslaan. Gedeeld door Jellyfin en Spore.
 
+def _proved_preload_file(item: dict, ready: dict, files: list) -> dict | None:
+    """A background probe uses the same exact-file proof as playback."""
+    import episode_selection
+    try:
+        episode_selection.item_binding(item)
+        if str(ready.get('hash') or ready.get('info_hash') or '').lower() != item.get('info_hash'):
+            return None
+        return episode_selection.match_proven_file(item['episode_file_proof'], {'files': files}, item)
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
     """Fetch CDN URLs for ALL tokens with this hash and update catbox URL cache + Spore stubs.
 
@@ -1057,6 +1081,7 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
             # TorBox sometimes omits the files list; force a fresh lookup
             fresh = torbox_mod.find_by_hash(info_hash, force_refresh=True)
             if fresh:
+                ready_item = fresh
                 files = fresh.get("files") or []
                 torrent_id = fresh.get("id") or torrent_id
         if not files or not torrent_id:
@@ -1074,7 +1099,13 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
             episode = vi.get("episode")
             if not token:
                 continue
-            if season is not None and episode is not None:
+            if vi.get('episode_file_proof') is not None:
+                import episode_selection
+                f = _proved_preload_file(vi, ready_item, files)
+                if f is None:
+                    continue
+                file_id = f['id']
+            elif season is not None and episode is not None:
                 # Episode in a season pack: find the specific file by SxxExx
                 f = _pick_episode_file(files, season, episode, imdb_id=vi.get("imdb_id"))
                 if not f:
@@ -1095,7 +1126,10 @@ def _cache_cdn_url(info_hash: str, ready_item: dict, title: str) -> None:
             cdn_url = _get_stream_url(torrent_id, file_id)
             if not cdn_url:
                 continue
-            _catbox.cache_url(token, cdn_url)
+            binding_kwargs = ({'proof_binding': episode_selection.item_binding(vi)}
+                              if vi.get('episode_file_proof') is not None else {})
+            if _catbox.cache_url(token, cdn_url, **binding_kwargs) is False:
+                continue
             _preload_spore(cdn_url, token)
             cached_count += 1
 
@@ -2123,6 +2157,7 @@ def probe_pending_stubs() -> dict:
             if not files or not torrent_id:
                 fresh = torbox_mod.find_by_hash(info_hash, force_refresh=True)
                 if fresh:
+                    ready = fresh
                     files = fresh.get("files") or []
                     torrent_id = fresh.get("id") or torrent_id
             if not files or not torrent_id:
@@ -2140,7 +2175,14 @@ def probe_pending_stubs() -> dict:
                     skipped += 1
                     continue
 
-                if season is not None and episode is not None:
+                if vi.get('episode_file_proof') is not None:
+                    import episode_selection
+                    f = _proved_preload_file(vi, ready, files)
+                    if f is None:
+                        skipped += 1
+                        continue
+                    file_id = f['id']
+                elif season is not None and episode is not None:
                     f = _pick_episode_file(files, season, episode,
                                            imdb_id=vi.get("imdb_id"))
                     if not f:
@@ -2165,7 +2207,11 @@ def probe_pending_stubs() -> dict:
                     skipped += 1
                     continue
 
-                _catbox.cache_url(token, cdn_url)
+                binding_kwargs = ({'proof_binding': episode_selection.item_binding(vi)}
+                                  if vi.get('episode_file_proof') is not None else {})
+                if _catbox.cache_url(token, cdn_url, **binding_kwargs) is False:
+                    skipped += 1
+                    continue
                 _preload_spore(cdn_url, token, build_fsh=False)
                 probed += 1
 
