@@ -102,6 +102,10 @@ class RestoreMountPlan:
             raise MountMismatch('every application mount needs explicit physical placement')
         helper_paths = [absolute(r.helper_root) for r in roots]
         hosts = [absolute(r.host_root) for r in roots]
+        logical_paths = [absolute(b.destination) for b in selected]
+        if any(h.is_relative_to(d) or d.is_relative_to(h)
+               for h in helper_paths for d in logical_paths):
+            raise MountMismatch('physical helper bind shadows logical namespace')
         # Overlapping roots can expose the same writable file under two aliases.
         for paths in (helper_paths, hosts):
             for i, first in enumerate(paths):

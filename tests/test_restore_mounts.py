@@ -33,6 +33,12 @@ class MountProjection(unittest.TestCase):
         self.assertEqual(p.host_path,'/mnt/pool/app/library/series/Example/Season 01/Example S01E01.nfo')
         self.assertEqual(p.helper_path,'/physical/library/series/Example/Season 01/Example S01E01.nfo')
         with self.assertRaises(MountMismatch):self.plan.validate_placement(p.logical,'pool','/mnt/pool/app/data/media/series/Example/Season 01/Example S01E01.nfo','/physical/data/media/series/Example/Season 01/Example S01E01.nfo')
+    def test_physical_helper_cannot_shadow_any_logical_destination(self):
+        for logical in ['/physical', '/physical/data', '/physical/data/library']:
+            mounts=[row('/storage/data',logical)]
+            roots=[PhysicalRoot('/storage/data','pool','/mnt/pool/app/data','/physical/data')]
+            with self.assertRaises(MountMismatch):
+                RestoreMountPlan.from_inspect(mounts,roots,logical_root=logical)
     def test_source_quarantine_still_uses_data_mount(self):
         self.assertEqual(self.plan.place('/data/quarantine/example.nfo','pool').host_path,'/mnt/pool/app/data/quarantine/example.nfo')
     def test_missing_nested_physical_root_refuses(self):
