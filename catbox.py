@@ -190,19 +190,22 @@ def _record_playback_touch(token: str) -> None:
     _touch_debounced(token)
 
 
-def _cache_get(token: str) -> str | None:
+def _cache_get(token: str, proof_binding: str | None = None) -> str | None:
     with _url_cache_lock:
         entry = _url_cache.get(token)
-        if entry and entry[1] > time.monotonic():
+        if (entry and entry[1] > time.monotonic()
+                and (entry[2] if len(entry) > 2 else None) == proof_binding):
             return entry[0]
         if entry:
             del _url_cache[token]
     return None
 
 
-def _cache_put(token: str, url: str) -> None:
+def _cache_put(token: str, url: str, proof_binding: str | None = None) -> None:
     with _url_cache_lock:
-        _url_cache[token] = (url, time.monotonic() + _URL_CACHE_TTL_SEC)
+        _url_cache[token] = ((url, time.monotonic() + _URL_CACHE_TTL_SEC, proof_binding)
+                             if proof_binding is not None else
+                             (url, time.monotonic() + _URL_CACHE_TTL_SEC))
 
 
 def cache_url(token: str, url: str) -> None:
@@ -235,13 +238,17 @@ def register(info_hash: str, magnet: str, title: str, media_type: str,
              size_gb: float | None = None, season: int | None = None,
              episode: int | None = None, year: int | None = None,
              protocol: str = "torrent", nzb_url: str | None = None,
-             usenet_id: int | None = None) -> str:
+             usenet_id: int | None = None,
+             episode_file_proof: dict | None = None) -> str:
     token = uuid.uuid4().hex[:16]
+    proof_kwargs = ({'episode_file_proof': episode_file_proof}
+                    if episode_file_proof is not None else {})
     db.insert_virtual_item(token, info_hash, magnet, title, media_type,
                             strm_path=strm_path, torbox_id=torbox_id, file_id=file_id,
                             imdb_id=imdb_id, quality=quality, source=source,
                             size_gb=size_gb, season=season, episode=episode, year=year,
-                            protocol=protocol, nzb_url=nzb_url, usenet_id=usenet_id)
+                            protocol=protocol, nzb_url=nzb_url, usenet_id=usenet_id,
+                            **proof_kwargs)
     return token
 
 
@@ -264,7 +271,12 @@ def materialize(token: str, allow_readd: bool | None = None,
 
 
 def _materialize_inner(token: str, allow_readd: bool | None = None) -> str | None:
-    cached = _cache_get(token)
+    import episode_selection
+    try:
+        proof_binding = episode_selection.item_binding(db.get_virtual_item(token))
+    except Exception:
+        return None
+    cached = _cache_get(token, proof_binding) if proof_binding is not None else _cache_get(token)
     if cached:
         _record_playback_touch(token)
         return cached
@@ -278,7 +290,7 @@ def _materialize_inner(token: str, allow_readd: bool | None = None) -> str | Non
 
     with _token_lock(token):
         # Re-check inside the lock: another thread may have succeeded or set cooldown.
-        cached = _cache_get(token)
+        cached = _cache_get(token, proof_binding) if proof_binding is not None else _cache_get(token)
         if cached:
             _record_playback_touch(token)
             return cached
@@ -286,7 +298,15 @@ def _materialize_inner(token: str, allow_readd: bool | None = None) -> str | Non
             return None
         url = _materialize_locked(token, allow_readd=allow_readd)
         if url:
-            _cache_put(token, url)
+            if proof_binding is not None:
+                try:
+                    if episode_selection.item_binding(db.get_virtual_item(token)) != proof_binding:
+                        return None
+                except Exception:
+                    return None
+                _cache_put(token, url, proof_binding)
+            else:
+                _cache_put(token, url)
             if not getattr(_materialize_context, "background", False):
                 _schedule_next_episode_preload(token)
         else:
@@ -439,6 +459,58 @@ def _rd_get_url(item: dict, rd_id: str) -> str | None:
     return pairs[0][1] if len(pairs) == 1 else None
 
 
+def _materialize_proven_episode(token: str, item: dict, allow_readd: bool) -> str | None:
+    """New proved tokens never enter legacy release/provider/file fallbacks."""
+    import episode_selection
+    import release_sanity
+    import strm_generator
+    ckey = _content_key(item)
+    try:
+        proof = episode_selection.validate_proof(item['episode_file_proof'])
+        if (proof['info_hash'] != item.get('info_hash')
+                or proof['imdb_id'] != item.get('imdb_id')
+                or proof['season'] != item.get('season') or proof['episode'] != item.get('episode')
+                or item.get('media_type') != 'series'
+                or (item.get('protocol') or 'torrent') != 'torrent'
+                or (item.get('debrid_provider') or 'torbox') != 'torbox'):
+            raise ValueError('proved item identity changed')
+        live = torbox.find_by_hash(proof['info_hash'])
+        if not (live and torbox._is_ready(live)):
+            if not allow_readd:
+                return None
+            # Re-add only the same proved torrent. No search or alternate.
+            added = torbox.add_magnet(item['magnet'], reason='catbox-proved-episode')
+            live = torbox.wait_until_ready(proof['info_hash'], timeout=ON_PLAY_READY_TIMEOUT_SEC,
+                                          torrent_id=(added or {}).get('id'))
+        if (not live or not torbox._is_ready(live)
+                or str(live.get('hash') or live.get('info_hash') or '').lower() != proof['info_hash']):
+            raise ValueError('proved torrent unavailable')
+        if release_sanity.verify_live_torrent(live, 'episode', season=proof['season'],
+                                              episode=proof['episode'], imdb_id=proof['imdb_id']):
+            raise ValueError('proved torrent sanity refused')
+        selected = episode_selection.match_proven_file(proof, live, item)
+        if selected is None:
+            raise ValueError('proved file missing or changed')
+        url = strm_generator._get_stream_url(live['id'], selected['id'])
+        if not url:
+            raise ValueError('proved file URL unavailable')
+        db.update_virtual_torbox_id(token, live['id'])
+        db.update_virtual_file_id(token, selected['id'])
+        _record_playback_touch(token)
+        if ckey:
+            db.update_playability_ok(ckey, 'torbox')
+        _metrics_inc('ok')
+        return url
+    except Exception as exc:
+        # Do not persist arbitrary provider exception text or a provider URL.
+        log.warning('Catbox: proved episode refused (%s)', type(exc).__name__)
+        _fail_put(token, _FAIL_COOLDOWN_429_SEC if isinstance(exc, torbox.RateLimited)
+                  else _FAIL_COOLDOWN_SEC)
+        if ckey:
+            db.update_playability_fail(ckey, REASON_NO_FILE)
+        return None
+
+
 def _materialize_locked(token: str, allow_readd: bool = True,
                         alternate_attempts: int = 0) -> str | None:
     item = db.get_virtual_item(token)
@@ -446,6 +518,9 @@ def _materialize_locked(token: str, allow_readd: bool = True,
         log.warning("Catbox: unknown token %s", token)
         _metrics_inc("failed")
         return None
+
+    if item.get('episode_file_proof') is not None:
+        return _materialize_proven_episode(token, item, allow_readd)
 
     ckey = _content_key(item)
     debrid_provider = (item.get("debrid_provider") or "torbox").lower()

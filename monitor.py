@@ -388,11 +388,22 @@ def _retry_episode(ep: dict) -> bool:
     db.increment_episode_attempt(ep["id"])
 
     search_override = processor._episode_search_override(imdb_id, season, episode)
+    trace = {}
     candidates = search_engine.search_candidates(
         "series", imdb_id, title, season=season, episode=episode,
         override=search_override,
-        trigger="wanted_episode", prowlarr_on_cache_miss=True)
+        trigger="wanted_episode", prowlarr_on_cache_miss=True, trace=trace)
     ckey = search_engine.content_key(imdb_id, season, episode)
+    run_id = trace.get("run_id")
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("wanted selection requires its exact search run")
+
+    def outcome(candidate, status, proof=None):
+        db.record_episode_selection(run_id, ckey, candidate.info_hash,
+                                    candidate.protocol, status, proof=proof)
+
+    for candidate in candidates:
+        outcome(candidate, "not_evaluated")
 
     # In catbox mode: write a lazy .strm for the best cached release.
     # TorBox add is deferred until first playback  -  no quota consumed here.
@@ -404,13 +415,24 @@ def _retry_episode(ep: dict) -> bool:
         def _cached_torrents(items: list) -> list:
             nonlocal sanity_rejected_cached
             torrents = [s for s in items if not s.is_usenet]
-            cache_results = search_engine.cache_map(ckey, torrents)
+            try:
+                cache_results = search_engine.cache_map(ckey, torrents)
+            except Exception:
+                for item in torrents:
+                    outcome(item, "provider_error")
+                raise
             hashes = cache_results.get("torbox", set())
             cached_before_sanity = [s for s in torrents if s.info_hash in hashes]
+            for item in torrents:
+                if item not in cached_before_sanity:
+                    outcome(item, "notcached")
             cached = release_sanity.filter_cached(
                 cached_before_sanity, kind="episode", season=season, episode=episode,
                 imdb_id=imdb_id, label=f"{title} S{season:02d}E{episode:02d}")
             sanity_rejected_cached = len(cached) < len(cached_before_sanity)
+            for item in cached_before_sanity:
+                if item not in cached:
+                    outcome(item, "file_refusal")
             return cached
 
         cached = _cached_torrents(candidates)
@@ -418,29 +440,76 @@ def _retry_episode(ep: dict) -> bool:
         require_title = _episode_requires_title_verification(
             candidates, expected_title, sanity_rejected_cached
         )
-        cached = _episode_title_verified_candidates(
-            cached, expected_title, require_title
-        )
+        legacy = _episode_title_verified_candidates(cached, expected_title, require_title)
+        # A generic pack needs positive selected-file evidence. A missing
+        # listing or the existing sanity check's fail-open result is not proof.
+        needs_proof = [s for s in cached if s.is_season_pack or s not in legacy]
+        entries = {}
+        listing_error = False
+        if needs_proof:
+            try:
+                entries = torbox.check_cached_files([s.info_hash for s in needs_proof], list_files=True)
+            except Exception:
+                listing_error = True
+                for item in needs_proof:
+                    outcome(item, "provider_error")
+        import episode_selection
+        proofs = {}
+        admitted = []
+        for item in cached:
+            proof = None
+            if item in needs_proof:
+                if listing_error:
+                    outcome(item, "provider_error")
+                    continue
+                proof, reason = episode_selection.prove_file(
+                    item, entries.get(item.info_hash.lower()), imdb_id=imdb_id,
+                    show_title=title, season=season, episode=episode,
+                    episode_title=expected_title)
+                if proof is None:
+                    outcome(item, reason)
+                    continue
+                proofs[item.info_hash] = proof
+            admitted.append(item)
+            outcome(item, "eligible", proof)
+        cached = admitted
         best = cached[0] if cached else None
         if best:
             import strm_generator
-            written = strm_generator.create_lazy_episode_strm(
-                info_hash=best.info_hash,
-                magnet=best.magnet,
-                title=title,
-                season=season,
-                episode=episode,
-                imdb_id=imdb_id,
-                quality=best.quality,
-                source=best.source,
-                size_gb=best.size_gb,
-                preload_first=False,
-            )
-            if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
-                search_engine.mark_selected(ckey, best, "torbox")
+            proof = proofs.get(best.info_hash)
+            proof_kwargs = {"episode_file_proof": proof} if proof is not None else {}
+            try:
+                written = strm_generator.create_lazy_episode_strm(
+                    info_hash=best.info_hash,
+                    magnet=best.magnet,
+                    title=title,
+                    season=season,
+                    episode=episode,
+                    imdb_id=imdb_id,
+                    quality=best.quality,
+                    source=best.source,
+                    size_gb=best.size_gb,
+                    preload_first=False,
+                    **proof_kwargs,
+                )
+            except Exception:
+                outcome(best, "writer_conflict", proof)
+                raise
+            existing = None if written else db.get_virtual_item_by_episode(imdb_id, season, episode)
+            existing_matches = bool(existing and existing.get("info_hash") == best.info_hash)
+            if existing_matches and proof is not None:
+                try:
+                    existing_matches = episode_selection.validate_proof(existing.get("episode_file_proof")) == proof
+                except (ValueError, TypeError):
+                    existing_matches = False
+            if written or existing_matches:
+                outcome(best, "selected", proof)
+                search_engine.mark_selected(ckey, best, "torbox", run_id=run_id)
                 db.mark_episode_status(imdb_id, season, episode, "found")
                 log.info("Monitor: lazy strm created for %s S%02dE%02d", title, season, episode)
                 return True
+            outcome(best, "writer_conflict", proof)
+            return False
 
         nzbs = _safe_episode_nzbs(
             candidates,
@@ -448,6 +517,9 @@ def _retry_episode(ep: dict) -> bool:
             require_title=require_title,
             label=f"{title} S{season:02d}E{episode:02d}",
         )
+        for item in candidates:
+            if item.is_usenet:
+                outcome(item, "eligible" if item in nzbs else "nzb_unusable")
         if nzbs:
             best_nzb = nzbs[0]
             try:
@@ -469,15 +541,19 @@ def _retry_episode(ep: dict) -> bool:
                     nzb_url=best_nzb.nzb_url,
                     usenet_id=(result or {}).get("id"),
                 )
-                if written or db.get_virtual_item_by_episode(imdb_id, season, episode):
-                    search_engine.mark_selected(ckey, best_nzb, "torbox-usenet")
+                existing = None if written else db.get_virtual_item_by_episode(imdb_id, season, episode)
+                if written or (existing and existing.get("info_hash") == best_nzb.info_hash):
+                    outcome(best_nzb, "selected")
+                    search_engine.mark_selected(ckey, best_nzb, "torbox-usenet", run_id=run_id)
                     db.mark_episode_status(imdb_id, season, episode, "found")
                     log.info("Monitor: lazy NZB strm created for %s S%02dE%02d",
                              title, season, episode)
                     return True
+                outcome(best_nzb, "writer_conflict")
             except torbox.RateLimited:
                 raise processor.RateLimited()
             except Exception as exc:
+                outcome(best_nzb, "provider_error")
                 log.warning("Monitor: NZB fallback failed for %s S%02dE%02d: %s",
                             title, season, episode, exc)
 
@@ -522,6 +598,13 @@ def _retry_episode(ep: dict) -> bool:
     uncached_torrents = _episode_title_verified_candidates(
         uncached_torrents, expected_title, require_title
     )
+    for item in candidates:
+        if item.is_usenet:
+            outcome(item, "eligible" if item in nzbs else "nzb_unusable")
+        elif item.info_hash not in cached_hashes:
+            outcome(item, "notcached" if item in uncached_torrents else "title_refusal")
+        else:
+            outcome(item, "eligible" if item in cached_torrents else "file_refusal")
     ordered = cached_torrents + nzbs + uncached_torrents
     if not ordered:
         log.info("Monitor: no identity-verifiable candidates for %s S%02dE%02d",
@@ -533,13 +616,16 @@ def _retry_episode(ep: dict) -> bool:
                 continue
             try:
                 torbox.add_nzb(stream.nzb_url, name=stream.title, reason="series-monitor-nzb")
-                search_engine.mark_selected(ckey, stream, "torbox-usenet")
+                outcome(stream, "selected")
+                search_engine.mark_selected(ckey, stream, "torbox-usenet", run_id=run_id)
                 log.info("Monitor: added NZB %s S%02dE%02d (%s)",
                          title, season, episode, stream.source)
                 return True
             except torbox.RateLimited:
+                outcome(stream, "provider_error")
                 raise processor.RateLimited()
             except Exception as exc:
+                outcome(stream, "provider_error")
                 if "429" in str(exc):
                     raise processor.RateLimited()
                 log.warning("Monitor: NZB add failed %s S%02dE%02d: %s",
@@ -549,7 +635,8 @@ def _retry_episode(ep: dict) -> bool:
         # Skip createtorrent if already in the TorBox library.
         existing = torbox.find_by_hash(stream.info_hash)
         if existing and torbox._is_ready(existing):
-            search_engine.mark_selected(ckey, stream, "torbox")
+            outcome(stream, "selected")
+            search_engine.mark_selected(ckey, stream, "torbox", run_id=run_id)
             log.info("Monitor: %s S%02dE%02d already in TorBox library", title, season, episode)
             return True
         try:
@@ -560,11 +647,14 @@ def _retry_episode(ep: dict) -> bool:
                          title, season, episode)
                 return False
             log.info("Monitor: added %s S%02dE%02d", title, season, episode)
-            search_engine.mark_selected(ckey, stream, "torbox")
+            outcome(stream, "selected")
+            search_engine.mark_selected(ckey, stream, "torbox", run_id=run_id)
             return True
         except torbox.RateLimited:
+            outcome(stream, "provider_error")
             raise processor.RateLimited()
         except Exception as exc:
+            outcome(stream, "provider_error")
             if processor._is_429(exc):
                 raise processor.RateLimited()
             log.warning("Monitor: failed to add %s S%02dE%02d: %s", title, season, episode, exc)

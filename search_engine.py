@@ -101,7 +101,8 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
                       override: dict | None = None,
                       trigger: str = "unknown",
                       include_prowlarr: bool = True,
-                      prowlarr_on_cache_miss: bool = False) -> list[TorrentioStream]:
+                      prowlarr_on_cache_miss: bool = False,
+                      trace: dict | None = None) -> list[TorrentioStream]:
     """Query all enabled catalogs concurrently and persist the search trace."""
     if media_type != "movie":
         override = _with_show_identity(override, imdb_id, title)
@@ -109,6 +110,8 @@ def search_candidates(media_type: str, imdb_id: str, title: str,
     ckey = content_key(imdb_id, season, episode)
     run_id = db.start_search_run(
         ckey, title, media_type, season, episode, trigger)
+    if trace is not None:
+        trace.update(run_id=run_id)
     jobs = _source_jobs(
         media_type, imdb_id, title, season, episode,
         include_prowlarr and not prowlarr_on_cache_miss)
@@ -237,10 +240,13 @@ def cache_map(content_key_value: str,
 
 
 def mark_selected(content_key_value: str, stream: TorrentioStream,
-                  provider: str | None = None) -> None:
+                  provider: str | None = None, run_id: int | None = None) -> None:
     if provider:
         db.mark_candidate_cached(content_key_value, stream.info_hash, provider)
-    db.mark_candidate_selected(content_key_value, stream.info_hash, stream.source)
+    if run_id is None:
+        db.mark_candidate_selected(content_key_value, stream.info_hash, stream.source)
+    else:
+        db.mark_candidate_selected(content_key_value, stream.info_hash, stream.source, run_id=run_id)
 
 
 def reject(content_key_value: str, info_hash: str, reason: str) -> None:

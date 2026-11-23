@@ -1388,7 +1388,8 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
                                preload_first: bool = False,
                                protocol: str = "torrent",
                                nzb_url: str | None = None,
-                               usenet_id: int | None = None) -> bool:
+                               usenet_id: int | None = None,
+                               episode_file_proof: dict | None = None) -> bool:
     """Write a Catbox virtual episode .strm WITHOUT adding to TorBox.
     For season packs: multiple episodes share the same info_hash/magnet;
     catbox.materialize picks the right file by SxxExx at playback time.
@@ -1419,6 +1420,15 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         # absolute copy as a duplicate.
         import episode_scheme
         episode = episode_scheme.tmdb_episode_number(imdb_id, season, episode)
+    proof_kwargs = {}
+    if episode_file_proof is not None:
+        import episode_selection
+        proof = episode_selection.validate_proof(episode_file_proof)
+        if (proof['info_hash'] != info_hash.lower() or proof['imdb_id'] != imdb_id
+                or proof['season'] != season or proof['episode'] != episode
+                or protocol != 'torrent'):
+            return False
+        proof_kwargs['episode_file_proof'] = proof
     if imdb_id and db.get_virtual_item_by_episode(imdb_id, season, episode):
         return False
     season_dir = f"Season {season:02d}"
@@ -1443,6 +1453,7 @@ def create_lazy_episode_strm(info_hash: str, magnet: str, title: str,
         protocol=protocol,
         nzb_url=nzb_url,
         usenet_id=usenet_id,
+        **proof_kwargs,
     )
     written = _write_strm(path, catbox.proxy_url(token), imdb_id=imdb_id)
     if not written:
