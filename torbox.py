@@ -599,7 +599,8 @@ def check_cached(hashes: list[str], timeout: int = 15) -> set[str]:
 
 
 def check_cached_files(hashes: list[str], timeout: int = 15,
-                       list_files: bool = False) -> dict[str, dict]:
+                       list_files: bool = False,
+                       raise_on_error: bool = False) -> dict[str, dict]:
     """Like check_cached(), but keeps the per-hash size/name info that
     TorBox's checkcached response already includes for free. Used to answer
     "how big is this" without add_magnet/materialize -- no torrent is added
@@ -617,7 +618,7 @@ def check_cached_files(hashes: list[str], timeout: int = 15,
         out: dict[str, dict] = {}
         for i in range(0, len(hashes), _BATCH):
             out.update(check_cached_files(hashes[i:i + _BATCH], timeout=timeout,
-                                          list_files=list_files))
+                                          list_files=list_files, raise_on_error=raise_on_error))
         return out
     url = f"{_base_url().rstrip('/')}/torrents/checkcached"
     params = {"hash": ",".join(hashes), "format": "object"}
@@ -628,8 +629,13 @@ def check_cached_files(hashes: list[str], timeout: int = 15,
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.warning("TorBox checkcached (files) failed: %s", exc)
+        if raise_on_error:
+            raise
         return {}
-    data = (resp.json() or {}).get("data") or {}
+    response = resp.json() or {}
+    if raise_on_error and response.get('success') is False:
+        raise requests.RequestException('cache listing provider refused')
+    data = response.get("data") or {}
     normalized = {h.lower(): v for h, v in data.items()}
     try:
         import db

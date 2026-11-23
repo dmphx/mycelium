@@ -19,7 +19,8 @@ supports only the strict episode-title identity route:
 - The show's provider identity must exist and match the requested IMDb id.
 - Exactly one positive-size video file must name that exact show, the complete
   requested season/episode and the expected episode title. The basename itself
-  must carry those identities; directory names cannot supply a missing title.
+  must carry those identities, with episode-title evidence after the episode tag;
+  directory and show names cannot supply a missing episode title.
 - Foreign-version identity, wrong numbers, duplicate possible files, missing
   lists, untagged files and ambiguous numbering refuse. There is no largest-file
   or top-ranked fallback, and no new uncached acquisition fallback.
@@ -54,3 +55,10 @@ Tests use synthetic files/listings. Their transport guard refuses SSH, Docker,
 provider HTTP and socket connections and has explicit refusal controls. No test
 initiates real acquisition, playback, a scan or a service operation. Source
 approval is not deployment or playback acceptance.
+
+Spore cache readers, both background preload/probe routes and advertised NFS
+sizes also use this proof. Background work cannot publish an unbound URL for a
+proved token or choose a different tagged file for its size. A stored torrent
+id is checked before the bounded hash listing, with its hash and file rechecked.
+Listing transport failures stay distinct from successful responses without a
+file listing. Selection outcomes are removed when their originating run is pruned.

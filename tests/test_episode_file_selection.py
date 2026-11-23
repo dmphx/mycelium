@@ -237,6 +237,15 @@ def test_exact_search_run_outcomes_and_choice_are_bound(tmp_path, monkeypatch, p
     assert json.loads(conn.execute("SELECT episode_file_proof FROM virtual_items").fetchone()[0]) == proof
     trace = db.get_search_trace(key)
     assert trace["run"]["id"] == later and trace["selection"] == []
+    index = db.get_virtual_item_spore_index()[0]
+    assert 'episode_file_proof' in index
+    assert index['episode_file_proof'] == json.dumps(proof, sort_keys=True)
+    assert index['imdb_id'] == 'tt0388629'
+    conn.execute("UPDATE search_runs SET started_at='2000-01-01 00:00:00' WHERE id=?",(run,))
+    conn.commit()
+    db.record_episode_selection(later,key,'b'*40,'torrent','notcached')
+    db.prune_old(14)
+    assert [r[0] for r in conn.execute('SELECT run_id FROM episode_selection_outcomes')]==[later]
     conn.close()
 
 
@@ -295,3 +304,115 @@ def test_multi_episode_file_is_not_single_episode_proof(proof_inputs, tag):
     module, kwargs, file = proof_inputs
     file['name'] = file['name'].replace('S21E1063', tag)
     assert module.prove_file(stream(), {'files': [file]}, **kwargs)[0] is None
+
+@pytest.mark.parametrize('cached', ['unbound', 'bound', 'changed_item'])
+def test_spore_cache_fast_path_requires_current_proof(proof_inputs, monkeypatch, cached):
+    import catbox, spore_server
+    module, kwargs, file = proof_inputs
+    proof, _ = module.prove_file(stream(), {'files': [file]}, **kwargs)
+    item = dict(token='spore-proof', info_hash='a'*40, imdb_id='tt0388629', season=21,
+                episode=1063, media_type='series', episode_file_proof=json.dumps(proof))
+    monkeypatch.setattr(catbox.db, 'get_virtual_item', lambda *a: item)
+    binding = module.item_binding(item)
+    catbox._cache_put(item['token'], 'https://cdn.invalid/proved',
+                      None if cached == 'unbound' else binding)
+    if cached == 'changed_item': item['episode'] = 106
+    fallback = Mock(return_value=None)
+    monkeypatch.setattr(catbox, 'materialize', fallback)
+    value = spore_server._get_cdn_url(item['token'])
+    assert value == ('https://cdn.invalid/proved' if cached == 'bound' else None)
+
+
+@pytest.mark.parametrize('route', ['cache', 'probe'])
+@pytest.mark.parametrize('changed', [False, True])
+def test_both_background_preload_routes_use_exact_proof(proof_inputs, monkeypatch, route, changed):
+    import strm_generator as sg, catbox, playback_guard
+    module, kwargs, file = proof_inputs
+    proof, _ = module.prove_file(stream(), {'files': [file]}, **kwargs)
+    item = dict(token='preload-proof', info_hash='a'*40, imdb_id='tt0388629', season=21,
+                episode=1063, media_type='series', episode_file_proof=json.dumps(proof))
+    files = [{**file, 'name': file['name'].replace('1063', '1062')}] if changed else [file]
+    ready = dict(id=5, hash='a'*40, files=files)
+    database = Mock(); database.get_virtual_items_by_hash.return_value=[item]
+    database.get_unprobed_spore_items.return_value=[item];database.load_spore_tracks.return_value=None
+    monkeypatch.setattr(sg, 'db', database)
+    monkeypatch.setattr(sg.settings, 'get', lambda *a: True)
+    monkeypatch.setattr(playback_guard, 'defer', lambda *a: False)
+    monkeypatch.setattr(sg.torbox_mod, 'find_by_hash', lambda *a, **k: ready)
+    monkeypatch.setattr(sg.torbox_mod, '_is_ready', lambda *a: True)
+    monkeypatch.setattr(sg, '_preload_throttled_for', lambda: 0)
+    monkeypatch.setattr(sg, '_preload_requestdl_pace', lambda: None)
+    urls=Mock(return_value='https://cdn.invalid/proved');cache=Mock(return_value=True);preload=Mock()
+    monkeypatch.setattr(sg, '_get_stream_url', urls);monkeypatch.setattr(catbox, 'cache_url', cache)
+    monkeypatch.setattr(sg, '_preload_spore', preload)
+    if route == 'cache': sg._cache_cdn_url('a'*40, ready, 'One Piece')
+    else: sg.probe_pending_stubs()
+    if changed:
+        urls.assert_not_called();cache.assert_not_called();preload.assert_not_called()
+    else:
+        urls.assert_called_once_with(5,7)
+        assert cache.call_args.kwargs == {'proof_binding':module.item_binding(item)}
+
+
+def test_unbound_cache_publication_cannot_label_proved_item(proof_inputs, monkeypatch):
+    import catbox
+    module, kwargs, file=proof_inputs
+    proof,_=module.prove_file(stream(),{'files':[file]},**kwargs)
+    item=dict(info_hash='a'*40,imdb_id='tt0388629',season=21,episode=1063,
+              media_type='series',episode_file_proof=json.dumps(proof))
+    monkeypatch.setattr(catbox.db,'get_virtual_item',lambda *a:item)
+    assert catbox.cache_url('public-proof','https://cdn.invalid/unproved') is False
+
+
+def test_show_prefix_cannot_supply_episode_title(proof_inputs):
+    module, kwargs, file=proof_inputs
+    kwargs['episode_title']='One Piece'
+    file['name']='One Piece S21E1063 Wrong Title.mkv'
+    assert module.prove_file(stream(),{'files':[file]},**kwargs)[0] is None
+
+
+def test_spore_size_uses_proved_file_not_larger_same_number(proof_inputs):
+    import strm_generator as sg
+    module,kwargs,file=proof_inputs
+    proof,_=module.prove_file(stream(),{'files':[file]},**kwargs)
+    item=dict(info_hash='a'*40,imdb_id='tt0388629',season=21,episode=1063,
+              media_type='series',episode_file_proof=json.dumps(proof))
+    wrong=dict(id=8,name='One Piece S21E1063 Wrong Title.mkv',size=file['size']*2)
+    assert sg.spore_item_size({'files':[wrong,file]},item)==file['size']
+    assert sg.spore_item_size({'files':[wrong]},item)==0
+    # Size-only checkcached listings need not include a provider download id.
+    assert sg.spore_item_size({'files':[{k:v for k,v in file.items() if k!='id'}]},item)==file['size']
+
+
+def test_proved_playback_uses_stored_id_before_bounded_listing(proof_inputs,monkeypatch):
+    import catbox, strm_generator as sg, release_sanity
+    module,kwargs,file=proof_inputs;proof,_=module.prove_file(stream(),{'files':[file]},**kwargs)
+    item=dict(info_hash='a'*40,imdb_id='tt0388629',season=21,episode=1063,media_type='series',
+              episode_file_proof=json.dumps(proof),torbox_id=60001)
+    live=dict(id=60001,hash='a'*40,files=[file]);lookup=Mock(return_value=None)
+    monkeypatch.setattr(catbox,'db',Mock());monkeypatch.setattr(catbox,'_record_playback_touch',Mock())
+    monkeypatch.setattr(catbox.torbox,'RateLimited',type('RateLimited',(Exception,),{}))
+    monkeypatch.setattr(catbox.torbox,'find_by_id',lambda value:live if value==60001 else None)
+    monkeypatch.setattr(catbox.torbox,'find_by_hash',lookup)
+    monkeypatch.setattr(catbox.torbox,'_is_ready',lambda *a:True)
+    monkeypatch.setattr(release_sanity,'verify_live_torrent',lambda *a,**kw:None)
+    monkeypatch.setattr(sg,'_get_stream_url',lambda *a:'https://cdn.invalid/proved')
+    assert catbox._materialize_proven_episode('proof-id',item,False)=='https://cdn.invalid/proved'
+    lookup.assert_not_called()
+    live['hash']='b'*40
+    assert catbox._materialize_proven_episode('proof-id',item,False) is None
+
+
+def test_cache_listing_wrapper_exposes_provider_error(monkeypatch):
+    import importlib.util, inspect
+    from pathlib import Path
+    spec=importlib.util.spec_from_file_location('real_listing_wrapper',Path(monitor.__file__).with_name('torbox.py'))
+    torbox=importlib.util.module_from_spec(spec);spec.loader.exec_module(torbox)
+    monkeypatch.setattr(torbox,'_base_url',lambda:'https://provider.invalid')
+    monkeypatch.setattr(torbox,'_headers',lambda:{})
+    assert 'raise_on_error' in inspect.signature(torbox.check_cached_files).parameters
+    def failure(*a,**kw):raise requests.Timeout('synthetic provider failure')
+    monkeypatch.setattr(torbox.requests,'get',failure)
+    assert torbox.check_cached_files(['a'*40],list_files=True)=={}
+    with pytest.raises(requests.RequestException):
+        torbox.check_cached_files(['a'*40],list_files=True,raise_on_error=True)

@@ -15,10 +15,10 @@ import request_execution_plans as plans
 import request_plan_refresh as refresh
 from test_request_execution_plans import env, digest
 
-FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v21-episode-selection.json'
-FIXTURE_SHA='c1ad30858a25043820ec1d20acb2d7b6349e900da9940b716f90dbdd035f7715'
-INVENTORY=FIXTURE.with_name('destination-path-inventory-v21-episode-selection.json')
-INVENTORY_SHA='0c0bd999727d17f3ddec44ac633a13ec92642cec20f2fb17d3e53c00cc96079e'
+FIXTURE=Path(__file__).parent/'fixtures/destination-fence-model-v22-episode-proof-readers.json'
+FIXTURE_SHA='b36b22ebf1f3e480c731ba88606b963df693dfd3c06b93688f5dd7675f56dedf'
+INVENTORY=FIXTURE.with_name('destination-path-inventory-v22-episode-proof-readers.json')
+INVENTORY_SHA='1f58d9fee03e549ded2a7fb01fea4c111ece421a9feb9d26af4d9f4fcaf38410'
 MODEL=json.loads(FIXTURE.read_text())
 MEMBERS=[(kind,member) for kind in ('writer','reader') for member in MODEL[kind+'s']]
 
@@ -706,12 +706,24 @@ def test_exact_episode_match_inventory_only_moves_lines_in_episode_tag_files():
 
 def test_episode_selection_inventory_adds_only_its_explicit_source_observation():
     prior_path=INVENTORY.with_name('destination-path-inventory-v20-metadata-maintenance.json')
-    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.with_name('destination-path-inventory-v21-episode-selection.json').read_text())
     before={x['path']:x['sha256'] for x in prior['audited_python_files']}
     after={x['path']:x['sha256'] for x in current['audited_python_files']}
     assert set(after)-set(before)=={'episode_selection.py'}
     changed={p for p in before if before[p]!=after[p]}
     assert changed=={'catbox.py','db.py','monitor.py','search_engine.py','strm_generator.py'}
+    assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
+        assert current[key]==prior[key]
+
+
+def test_proof_reader_inventory_changes_only_explicit_source_hashes():
+    prior_path=INVENTORY.with_name('destination-path-inventory-v21-episode-selection.json')
+    prior=json.loads(prior_path.read_text());current=json.loads(INVENTORY.read_text())
+    before={r['path']:r['sha256'] for r in prior['audited_python_files']}
+    after={r['path']:r['sha256'] for r in current['audited_python_files']}
+    assert before.keys()==after.keys() and current['added_audited_paths']==[]
+    assert {p for p in before if before[p]!=after[p]}=={'catbox.py','db.py','episode_selection.py','monitor.py','spore_server.py','strm_generator.py','torbox.py'}
     assert current['parent_inventory_sha256']==hashlib.sha256(prior_path.read_bytes()).hexdigest()
     for key in ['omitted_runtime_domains','required_before_live_authority','runtime_completeness','source_search_is_completeness_proof','model_qualification_only']:
         assert current[key]==prior[key]

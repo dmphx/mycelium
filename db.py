@@ -722,6 +722,9 @@ def prune_old(days: int = 90) -> dict[str, int]:
             except Exception as exc:
                 log.debug("prune %s failed: %s", tbl, exc)
                 out[tbl] = 0
+        # Keep per-run selection evidence only while its originating run exists.
+        cur = conn.execute("DELETE FROM episode_selection_outcomes WHERE run_id NOT IN (SELECT id FROM search_runs)")
+        out['episode_selection_outcomes'] = cur.rowcount or 0
         conn.commit()
     total = sum(out.values())
     if total:
@@ -1509,7 +1512,8 @@ def get_virtual_item_spore_index() -> list[dict]:
     """Return only fields needed by the spore status sweep."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT token, info_hash, media_type, season, episode, file_id "
+            "SELECT token, info_hash, media_type, season, episode, file_id, "
+            "imdb_id, protocol, debrid_provider, episode_file_proof "
             "FROM virtual_items"
         ).fetchall()
         return [dict(r) for r in rows]

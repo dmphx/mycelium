@@ -81,7 +81,7 @@ def _get_cdn_url(token: str, allow_readd: bool = False) -> str | None:
     """
     try:
         import catbox
-        url = catbox._cache_get(token)
+        url = catbox.cached_url(token)
         if url:
             return url
         return catbox.materialize(token, allow_readd=allow_readd)
