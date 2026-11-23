@@ -33,12 +33,24 @@ class MountProjection(unittest.TestCase):
         self.assertEqual(p.host_path,'/mnt/pool/app/library/series/Example/Season 01/Example S01E01.nfo')
         self.assertEqual(p.helper_path,'/physical/library/series/Example/Season 01/Example S01E01.nfo')
         with self.assertRaises(MountMismatch):self.plan.validate_placement(p.logical,'pool','/mnt/pool/app/data/media/series/Example/Season 01/Example S01E01.nfo','/physical/data/media/series/Example/Season 01/Example S01E01.nfo')
-    def test_physical_helper_cannot_shadow_any_logical_destination(self):
-        for logical in ['/physical', '/physical/data', '/physical/data/library']:
-            mounts=[row('/storage/data',logical)]
-            roots=[PhysicalRoot('/storage/data','pool','/mnt/pool/app/data','/physical/data')]
-            with self.assertRaises(MountMismatch):
-                RestoreMountPlan.from_inspect(mounts,roots,logical_root=logical)
+    def factory_overlap(self, logical):
+        mounts=[row('/storage/data',logical)]
+        roots=[PhysicalRoot('/storage/data','pool','/mnt/pool/app/data','/physical/data')]
+        with self.assertRaises(MountMismatch):
+            RestoreMountPlan.from_inspect(mounts,roots,logical_root=logical)
+    def helper_overlap(self, logical):
+        # Direct construction must not bypass the helper-side defence.
+        plan=RestoreMountPlan(logical,(Bind('/storage/data',logical,True),),
+                              (PhysicalRoot('/storage/data','pool','/mnt/pool/app/data','/physical/data'),))
+        observed=[row('/storage/data',logical,False),row('/mnt/pool/app/data','/physical/data',True)]
+        with self.assertRaises(MountMismatch):plan.validate_helper_mounts(observed)
+        with self.assertRaises(MountMismatch):plan.worker_mounts()
+    def test_factory_physical_descendant_refuses(self):self.factory_overlap('/physical')
+    def test_factory_physical_equal_refuses(self):self.factory_overlap('/physical/data')
+    def test_factory_physical_ancestor_refuses(self):self.factory_overlap('/physical/data/library')
+    def test_helper_physical_descendant_refuses(self):self.helper_overlap('/physical')
+    def test_helper_physical_equal_refuses(self):self.helper_overlap('/physical/data')
+    def test_helper_physical_ancestor_refuses(self):self.helper_overlap('/physical/data/library')
     def test_source_quarantine_still_uses_data_mount(self):
         self.assertEqual(self.plan.place('/data/quarantine/example.nfo','pool').host_path,'/mnt/pool/app/data/quarantine/example.nfo')
     def test_missing_nested_physical_root_refuses(self):
