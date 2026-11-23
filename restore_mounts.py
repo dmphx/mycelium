@@ -21,6 +21,13 @@ def absolute(value):
     return p
 
 
+def reject_physical_shadow(logical_binds, physical_roots):
+    if any(absolute(r.helper_root).is_relative_to(b.destination)
+           or absolute(b.destination).is_relative_to(r.helper_root)
+           for r in physical_roots for b in logical_binds):
+        raise MountMismatch('physical helper bind shadows logical namespace')
+
+
 @dataclass(frozen=True, order=True)
 class Bind:
     source: str
@@ -102,10 +109,7 @@ class RestoreMountPlan:
             raise MountMismatch('every application mount needs explicit physical placement')
         helper_paths = [absolute(r.helper_root) for r in roots]
         hosts = [absolute(r.host_root) for r in roots]
-        logical_paths = [absolute(b.destination) for b in selected]
-        if any(h.is_relative_to(d) or d.is_relative_to(h)
-               for h in helper_paths for d in logical_paths):
-            raise MountMismatch('physical helper bind shadows logical namespace')
+        reject_physical_shadow(selected, roots)
         # Overlapping roots can expose the same writable file under two aliases.
         for paths in (helper_paths, hosts):
             for i, first in enumerate(paths):
@@ -126,6 +130,7 @@ class RestoreMountPlan:
             raise MountMismatch('live application mount projection changed')
 
     def worker_mounts(self, readonly_data=False):
+        reject_physical_shadow(self.application_binds, self.physical_roots)
         # Read-only logical views are intentional. Effects use physical binds.
         logical = [Bind(b.source, b.destination, False, b.propagation) for b in self.application_binds]
         physical = [Bind(r.host_root, r.helper_root, not readonly_data) for r in self.physical_roots]
@@ -134,6 +139,7 @@ class RestoreMountPlan:
         return tuple(logical + physical + auxiliary)
 
     def validate_helper_mounts(self, mounts, readonly_data=False, allowed_tmpfs=()):
+        reject_physical_shadow(self.application_binds, self.physical_roots)
         actual = []
         seen_tmpfs = set()
         for row in mounts:
