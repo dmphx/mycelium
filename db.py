@@ -388,6 +388,17 @@ CREATE TABLE IF NOT EXISTS search_runs (
 CREATE INDEX IF NOT EXISTS idx_search_runs_content_time
     ON search_runs(content_key, started_at DESC);
 
+CREATE TABLE IF NOT EXISTS episode_selection_outcomes (
+    run_id INTEGER NOT NULL,
+    content_key TEXT NOT NULL,
+    info_hash TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    file_proof TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
+    PRIMARY KEY (run_id, info_hash, protocol)
+);
+
 CREATE TABLE IF NOT EXISTS source_query_stats (
     source          TEXT    PRIMARY KEY,
     query_count     INTEGER NOT NULL DEFAULT 0,
@@ -548,6 +559,7 @@ def _migrate() -> None:
             ("nzb_url", "TEXT"),
             ("usenet_id", "INTEGER"),
             ("identity_checked_at", "TEXT"),
+            ("episode_file_proof", "TEXT"),
         ]:
             if col not in vi_cols:
                 try:
@@ -1333,7 +1345,8 @@ def insert_virtual_item(token: str, info_hash: str, magnet: str, title: str,
                          season: int | None = None, episode: int | None = None,
                          year: int | None = None, protocol: str = "torrent",
                          nzb_url: str | None = None,
-                         usenet_id: int | None = None) -> int:
+                         usenet_id: int | None = None,
+                         episode_file_proof: dict | None = None) -> int:
     """Insert a virtual item.
 
     For torrents (protocol='torrent'): `magnet` holds the magnet URI and
@@ -1346,16 +1359,26 @@ def insert_virtual_item(token: str, info_hash: str, magnet: str, title: str,
     torbox.add_nzb. `usenet_id` is the TorBox usenet download row id, set
     once the download completes.
     """
+    proof_json = None
+    if episode_file_proof is not None:
+        import episode_selection
+        import json
+        proof = episode_selection.validate_proof(episode_file_proof)
+        if (proof['info_hash'] != info_hash.lower() or proof['imdb_id'] != imdb_id
+                or proof['season'] != season or proof['episode'] != episode
+                or media_type != 'series' or protocol != 'torrent'):
+            raise ValueError('virtual item/episode file proof mismatch')
+        proof_json = json.dumps(proof, sort_keys=True)
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO virtual_items
                (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
                 imdb_id, quality, source, size_gb, season, episode, year,
-                protocol, nzb_url, usenet_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                protocol, nzb_url, usenet_id, episode_file_proof)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (token, info_hash, magnet, title, media_type, strm_path, torbox_id, file_id,
              imdb_id, quality, source, size_gb, season, episode, year,
-             protocol, nzb_url, usenet_id),
+             protocol, nzb_url, usenet_id, proof_json),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
@@ -3622,14 +3645,18 @@ def finish_search_run(run_id: int, status: str, sources: dict,
 
 
 def mark_latest_search_choice(content_key: str, info_hash: str,
-                              source: str | None) -> None:
+                              source: str | None, run_id: int | None = None) -> None:
     with _connect() as conn:
-        conn.execute(
-            """UPDATE search_runs SET chosen_hash=?, chosen_source=?
-               WHERE id=(SELECT id FROM search_runs WHERE content_key=?
-                         ORDER BY id DESC LIMIT 1)""",
-            (info_hash.lower(), source, content_key),
-        )
+        if run_id is None:
+            conn.execute(
+                """UPDATE search_runs SET chosen_hash=?, chosen_source=?
+                   WHERE id=(SELECT id FROM search_runs WHERE content_key=?
+                             ORDER BY id DESC LIMIT 1)""",
+                (info_hash.lower(), source, content_key),
+            )
+        else:
+            conn.execute('UPDATE search_runs SET chosen_hash=?, chosen_source=? WHERE id=? AND content_key=?',
+                         (info_hash.lower(), source, run_id, content_key))
         conn.commit()
 
 
@@ -3714,7 +3741,7 @@ def mark_candidate_cached(content_key: str, info_hash: str,
 
 
 def mark_candidate_selected(content_key: str, info_hash: str,
-                            source: str | None = None) -> None:
+                            source: str | None = None, run_id: int | None = None) -> None:
     with _connect() as conn:
         conn.execute(
             """UPDATE release_candidates SET state='selected', reject_reason=NULL,
@@ -3723,7 +3750,38 @@ def mark_candidate_selected(content_key: str, info_hash: str,
             (content_key, info_hash.lower()),
         )
         conn.commit()
-    mark_latest_search_choice(content_key, info_hash, source)
+    if run_id is None:
+        mark_latest_search_choice(content_key, info_hash, source)
+    else:
+        mark_latest_search_choice(content_key, info_hash, source, run_id=run_id)
+
+
+def record_episode_selection(run_id: int, content_key: str, info_hash: str,
+                             protocol: str, outcome: str, proof: dict | None = None) -> None:
+    """Finite reason codes and validated file metadata only, never provider URLs/errors."""
+    import episode_selection
+    import json
+    import re
+    if (type(run_id) is not int or run_id <= 0 or outcome not in episode_selection.OUTCOMES
+            or protocol not in ('torrent', 'usenet')
+            or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', info_hash)):
+        raise ValueError('episode selection outcome values')
+    body = None
+    if proof is not None:
+        value = episode_selection.validate_proof(proof)
+        if value['info_hash'] != info_hash.lower() or content_key != f"{value['imdb_id']}:S{value['season']:02d}E{value['episode']:02d}":
+            raise ValueError('selection proof/content mismatch')
+        body = json.dumps(value, sort_keys=True)
+    with _connect() as conn:
+        if conn.execute('SELECT 1 FROM search_runs WHERE id=? AND content_key=?', (run_id, content_key)).fetchone() is None:
+            raise ValueError('selection run/content mismatch')
+        conn.execute('''INSERT INTO episode_selection_outcomes
+                     (run_id,content_key,info_hash,protocol,outcome,file_proof)
+                     VALUES (?,?,?,?,?,?) ON CONFLICT(run_id,info_hash,protocol)
+                     DO UPDATE SET outcome=excluded.outcome,file_proof=excluded.file_proof,
+                     updated_at=strftime('%Y-%m-%d %H:%M:%S','now')''',
+                     (run_id, content_key, info_hash.lower(), protocol, outcome, body))
+        conn.commit()
 
 
 def reject_release_candidate(content_key: str, info_hash: str,
@@ -3791,12 +3849,19 @@ def get_search_trace(content_key: str) -> dict:
                         rank_order ASC LIMIT 30""",
             (content_key,),
         ).fetchall()
+        selection = conn.execute(
+            '''SELECT info_hash,protocol,outcome,file_proof,updated_at
+               FROM episode_selection_outcomes WHERE run_id=? AND content_key=?
+               ORDER BY info_hash,protocol''',
+            (run['id'] if run else -1, content_key),
+        ).fetchall()
     run_dict = dict(run) if run else None
     if run_dict:
         for key in ("sources_json", "counts_json"):
             raw = run_dict.pop(key, None)
             run_dict[key[:-5]] = json.loads(raw) if raw else {}
-    return {"run": run_dict, "candidates": [dict(r) for r in candidates]}
+    return {"run": run_dict, "candidates": [dict(r) for r in candidates],
+            "selection": [dict(r) for r in selection]}
 
 
 def record_identity_repair(token: str, old_imdb_id: str | None,

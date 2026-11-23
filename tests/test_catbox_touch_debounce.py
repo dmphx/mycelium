@@ -33,6 +33,9 @@ def _clear_touch_cache():
 @pytest.fixture
 def writes(monkeypatch):
     seen = []
+    # Cache hits now read the item's proof binding. This fixture represents
+    # a legacy token, without opening the real application database.
+    monkeypatch.setattr(catbox.db, "get_virtual_item", lambda token: {"token": token})
     monkeypatch.setattr(catbox.db, "touch_virtual_item", lambda t: seen.append(t))
     return seen
 
